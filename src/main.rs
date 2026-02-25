@@ -8,10 +8,10 @@ mod search;
 mod types;
 
 use clap::Parser;
-use cli::{Cli, CollectionCmd, Command};
+use cli::{output, Cli, CollectionCmd, Command};
 use config::{collection_db_path, Config};
 use error::Result;
-use types::Collection;
+use types::{Collection, SearchMode};
 
 fn main() {
     if let Err(e) = run() {
@@ -27,10 +27,30 @@ fn run() -> Result<()> {
         Command::Status => handle_status(),
         Command::Update { collection, force } => handle_update(collection, force),
         Command::Embed { collection, force } => handle_embed(collection, force),
-        Command::Search { .. } => {
-            eprintln!("search: not yet implemented (Phase 3)");
-            Ok(())
-        }
+        Command::Search {
+            query,
+            mode,
+            limit,
+            min_score,
+            collections,
+            all,
+            full,
+            json,
+            csv,
+            md,
+            files,
+        } => handle_search(
+            query.join(" "),
+            mode,
+            if all { 100_000 } else { limit },
+            min_score,
+            collections,
+            full,
+            json,
+            csv,
+            md,
+            files,
+        ),
         Command::Get { .. } | Command::MultiGet { .. } | Command::Ls { .. } => {
             eprintln!("not yet implemented");
             Ok(())
@@ -130,6 +150,73 @@ fn handle_update(collection: Option<String>, force: bool) -> Result<()> {
             added, updated, deactivated
         );
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_search(
+    query: String,
+    mode: String,
+    limit: usize,
+    min_score: Option<f64>,
+    collection_filter: Vec<String>,
+    full: bool,
+    json: bool,
+    csv: bool,
+    md: bool,
+    files: bool,
+) -> Result<()> {
+    let search_mode: SearchMode = mode
+        .parse()
+        .map_err(|e| error::Error::Other(e))?;
+
+    if !matches!(search_mode, SearchMode::Bm25) {
+        eprintln!("search --mode {mode}: not yet implemented (Phase 4/5). Using bm25.");
+    }
+
+    let config = Config::load()?;
+    let cols: Vec<_> = if collection_filter.is_empty() {
+        // Auto-detect from CWD, fall back to all collections.
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(col) = config::detect_collection(&config.collections, &cwd) {
+            vec![col]
+        } else {
+            config.collections.iter().collect()
+        }
+    } else {
+        collection_filter
+            .iter()
+            .filter_map(|name| config.get_collection(name))
+            .collect()
+    };
+
+    // Open DBs for targeted collections.
+    let dbs: Vec<db::CollectionDb> = cols
+        .iter()
+        .map(|c| db::CollectionDb::open(&c.name, &collection_db_path(&c.name)))
+        .collect::<Result<Vec<_>>>()?;
+
+    let req = search::fan_out::SearchRequest {
+        query: &query,
+        limit,
+        min_score,
+    };
+
+    let results = search::fan_out::bm25(&dbs, &req)?;
+
+    let fmt = if json {
+        output::Format::Json
+    } else if csv {
+        output::Format::Csv
+    } else if md {
+        output::Format::Markdown
+    } else if files {
+        output::Format::Files
+    } else {
+        output::Format::Pretty
+    };
+
+    output::print_results(&results, fmt, full);
     Ok(())
 }
 
