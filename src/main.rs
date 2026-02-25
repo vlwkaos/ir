@@ -107,7 +107,7 @@ fn handle_status() -> Result<()> {
     Ok(())
 }
 
-fn handle_update(collection: Option<String>, _force: bool) -> Result<()> {
+fn handle_update(collection: Option<String>, force: bool) -> Result<()> {
     let config = Config::load()?;
     let cols: Vec<_> = match &collection {
         Some(name) => {
@@ -121,8 +121,14 @@ fn handle_update(collection: Option<String>, _force: bool) -> Result<()> {
 
     for col in cols {
         let db_path = collection_db_path(&col.name);
-        let _db = db::CollectionDb::open(&col.name, &db_path)?;
-        println!("update: '{}' — indexing not yet implemented (Phase 2)", col.name);
+        let db = db::CollectionDb::open(&col.name, &db_path)?;
+        println!("updating '{}'…", col.name);
+        let opts = index::UpdateOptions { force };
+        let (added, updated, deactivated) = index::update(&db, col, &opts)?;
+        println!(
+            "  {} added, {} updated, {} deactivated",
+            added, updated, deactivated
+        );
     }
     Ok(())
 }
