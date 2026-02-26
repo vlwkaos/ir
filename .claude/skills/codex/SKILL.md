@@ -58,6 +58,56 @@ Return format:
 - After every `codex` command, use `AskUserQuestion` to confirm next steps or decide whether to resume.
 - When resuming: `echo "new prompt" | codex exec resume --last 2>/dev/null`
 
+## Tapping Into a Previous Session
+
+When the user wants to read what codex explored/decided in a prior session, extract the transcript:
+
+```bash
+# Find latest session (or nth-latest with tail -N | head -1)
+LATEST=$(ls -t ~/.codex/sessions/*/*/*.jsonl 2>/dev/null | head -1)
+echo "Session: $LATEST"
+python3 - "$LATEST" <<'EOF'
+import json, sys, textwrap
+
+path = sys.argv[1]
+with open(path) as f:
+    items = [json.loads(l) for l in f]
+
+for item in items:
+    t = item.get("type")
+    p = item.get("payload", item)
+
+    if t == "response_item":
+        kind = p.get("type")
+        role = p.get("role")
+
+        if kind == "message" and role == "assistant":
+            for c in p.get("content", []):
+                if c.get("type") == "output_text" and c.get("text"):
+                    print(f"\n[assistant]\n{textwrap.fill(c['text'], 100)}")
+
+        elif kind == "function_call":
+            args = p.get("arguments", "{}")
+            try:
+                cmd = json.loads(args).get("cmd", args)
+            except Exception:
+                cmd = args
+            print(f"\n[exec] {cmd[:200]}")
+
+        elif kind == "function_call_output":
+            for out in p.get("output", []):
+                if out.get("type") == "text":
+                    print(f"[out] {out['text'][:300]}")
+EOF
+```
+
+To narrow to a specific session by date: `ls ~/.codex/sessions/2026/02/26/*.jsonl`
+
+After reading, use `Read` on the session file directly for more depth, or feed a summary to codex with:
+```bash
+echo "Context from last session: <summary>. Now: <new task>" | codex exec --skip-git-repo-check resume --last 2>/dev/null
+```
+
 ## Critical Evaluation of Codex Output
 
 Codex is powered by OpenAI models with their own knowledge cutoffs. Treat as a **colleague, not an authority**.
