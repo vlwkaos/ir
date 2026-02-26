@@ -1,6 +1,6 @@
 // Vector search: embed query → kNN via sqlite-vec → join documents.
 
-use crate::db::{vectors, CollectionDb};
+use crate::db::{CollectionDb, vectors};
 use crate::error::Result;
 use crate::llm::embedding::Embedder;
 use crate::types::SearchResult;
@@ -21,11 +21,10 @@ pub fn search(
     let mut all: Vec<SearchResult> = dbs
         .iter()
         .flat_map(|db| {
-            vectors::search(db.conn(), &query_emb, &db.name, req.limit * 2)
-                .unwrap_or_else(|e| {
-                    eprintln!("warn: vector search on '{}' failed: {e}", db.name);
-                    vec![]
-                })
+            vectors::search(db.conn(), &query_emb, &db.name, req.limit * 2).unwrap_or_else(|e| {
+                eprintln!("warn: vector search on '{}' failed: {e}", db.name);
+                vec![]
+            })
         })
         .collect();
 
@@ -33,7 +32,7 @@ pub fn search(
         all.retain(|r| r.score >= min);
     }
 
-    all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    SearchResult::sort_desc(&mut all);
     all.truncate(req.limit);
     Ok(all)
 }

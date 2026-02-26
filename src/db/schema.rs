@@ -18,15 +18,3 @@ pub fn init(conn: &Connection, collection_name: &str) -> Result<()> {
     )?;
     Ok(())
 }
-
-#[allow(dead_code)]
-pub fn get_version(conn: &Connection) -> Result<i64> {
-    let version: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    Ok(version.and_then(|v| v.parse().ok()).unwrap_or(0))
-}

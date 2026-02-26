@@ -72,13 +72,6 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Batch retrieve documents by glob pattern
-    #[command(name = "multi-get")]
-    MultiGet {
-        pattern: String,
-        #[arg(long)]
-        json: bool,
-    },
     /// Manage collections
     Collection {
         #[command(subcommand)]
@@ -86,17 +79,24 @@ pub enum Command {
     },
     /// Show index health
     Status,
-    /// List indexed files
-    Ls {
-        #[arg(short = 'c', long = "collection")]
-        collection: Option<String>,
-    },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum CollectionCmd {
     /// Register a collection
-    Add { name: String, path: String },
+    Add {
+        name: String,
+        path: String,
+        /// Glob patterns to include (default: **/*.md)
+        #[arg(long)]
+        glob: Vec<String>,
+        /// Glob patterns to exclude
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Short description
+        #[arg(long)]
+        description: Option<String>,
+    },
     /// Remove a collection (keeps DB file by default)
     Rm {
         name: String,

@@ -4,17 +4,14 @@ use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct IndexDiff {
-    pub to_add: Vec<String>,    // rel_paths new to the DB
-    pub to_update: Vec<String>, // rel_paths whose content hash changed
+    pub to_add: Vec<String>,        // rel_paths new to the DB
+    pub to_update: Vec<String>,     // rel_paths whose content hash changed
     pub to_deactivate: Vec<String>, // rel_paths no longer on disk
 }
 
 /// Given a map of {rel_path → content_hash} from the filesystem scan and
 /// a map of {rel_path → stored_hash} from the DB, produce the diff.
-pub fn compute(
-    scanned: &HashMap<String, String>,
-    stored: &HashMap<String, String>,
-) -> IndexDiff {
+pub fn compute(scanned: &HashMap<String, String>, stored: &HashMap<String, String>) -> IndexDiff {
     let mut to_add = Vec::new();
     let mut to_update = Vec::new();
     let mut to_deactivate = Vec::new();
@@ -46,7 +43,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn h(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -84,7 +84,11 @@ mod tests {
     #[test]
     fn mixed_diff() {
         let scanned = h(&[("add.md", "h1"), ("update.md", "h_new"), ("keep.md", "hk")]);
-        let stored = h(&[("update.md", "h_old"), ("keep.md", "hk"), ("remove.md", "hr")]);
+        let stored = h(&[
+            ("update.md", "h_old"),
+            ("keep.md", "hk"),
+            ("remove.md", "hr"),
+        ]);
         let d = compute(&scanned, &stored);
         assert_eq!(d.to_add, vec!["add.md"]);
         assert_eq!(d.to_update, vec!["update.md"]);

@@ -139,12 +139,7 @@ fn line_break_score(line: &str) -> f64 {
 
 /// Find the best split position within BREAK_WINDOW_CHARS before target_end.
 /// Falls back to a char boundary at target_end if no break points found.
-fn best_break(
-    doc: &str,
-    break_points: &[(usize, f64)],
-    start: usize,
-    target_end: usize,
-) -> usize {
+fn best_break(doc: &str, break_points: &[(usize, f64)], start: usize, target_end: usize) -> usize {
     let window_start = target_end.saturating_sub(BREAK_WINDOW_CHARS).max(start);
     let window_size = (target_end - window_start) as f64;
 
@@ -195,7 +190,10 @@ pub fn extract_title(doc: &str, path_hint: &str) -> String {
                 break;
             }
             // Match `title: value` or `name: value`
-            if let Some(rest) = line.strip_prefix("title:").or_else(|| line.strip_prefix("name:")) {
+            if let Some(rest) = line
+                .strip_prefix("title:")
+                .or_else(|| line.strip_prefix("name:"))
+            {
                 let val = rest.trim().trim_matches('"').trim_matches('\'');
                 if !val.is_empty() {
                     fm_title = Some(val.to_string());
@@ -245,7 +243,11 @@ mod tests {
         let line = "word ".repeat(100); // 500 chars
         let doc = (line + "\n").repeat(10); // 5010 chars > 3600 (chunk_size)
         let chunks = chunk_document(&doc);
-        assert!(chunks.len() > 1, "expected multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() > 1,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
         // Each chunk should be non-empty
         for c in &chunks {
             assert!(!c.text.is_empty());

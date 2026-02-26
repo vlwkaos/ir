@@ -27,13 +27,7 @@ pub fn insert(conn: &Connection, hash_seq: &str, embedding: &[f32]) -> Result<()
 }
 
 /// Record chunk metadata so embed knows what's already done.
-pub fn mark_embedded(
-    conn: &Connection,
-    hash: &str,
-    seq: i64,
-    pos: i64,
-    model: &str,
-) -> Result<()> {
+pub fn mark_embedded(conn: &Connection, hash: &str, seq: i64, pos: i64, model: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at)
@@ -45,7 +39,11 @@ pub fn mark_embedded(
 
 /// kNN search: find the `limit` closest vectors to `query_embedding`.
 /// Returns (hash_seq, distance) pairs sorted by distance asc.
-pub fn knn(conn: &Connection, query_embedding: &[f32], limit: usize) -> Result<Vec<VecSearchResult>> {
+pub fn knn(
+    conn: &Connection,
+    query_embedding: &[f32],
+    limit: usize,
+) -> Result<Vec<VecSearchResult>> {
     let blob = to_bytes(query_embedding);
     let sql = "
         SELECT hash_seq, distance
@@ -62,7 +60,8 @@ pub fn knn(conn: &Connection, query_embedding: &[f32], limit: usize) -> Result<V
         })
     })?;
 
-    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 /// Full vector search: kNN → join documents → deduplicate by path.
@@ -123,7 +122,7 @@ pub fn search(
         }
     }
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    SearchResult::sort_desc(&mut results);
     Ok(results)
 }
 
@@ -176,9 +175,11 @@ mod tests {
         let conn = open_test_db();
         mark_embedded(&conn, "abc123", 0, 0, "test-model").unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM content_vectors WHERE hash='abc123'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM content_vectors WHERE hash='abc123'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1);
     }

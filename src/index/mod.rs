@@ -15,9 +15,25 @@ pub struct UpdateOptions {
     pub force: bool,
 }
 
+pub fn new_progress_bar(len: u64) -> ProgressBar {
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    pb
+}
+
 /// Scan, diff, and update the FTS index for a collection.
 /// Returns (added, updated, deactivated) counts.
-pub fn update(db: &CollectionDb, collection: &Collection, opts: &UpdateOptions) -> Result<(usize, usize, usize)> {
+pub fn update(
+    db: &CollectionDb,
+    collection: &Collection,
+    opts: &UpdateOptions,
+) -> Result<(usize, usize, usize)> {
     let conn = db.conn();
 
     // 1. Load current DB state: {rel_path → hash}
@@ -32,24 +48,20 @@ pub fn update(db: &CollectionDb, collection: &Collection, opts: &UpdateOptions) 
     }
     let stored: HashMap<String, String> = {
         let mut stmt = conn.prepare("SELECT path, hash FROM documents WHERE active = 1")?;
-        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
-            .filter_map(|r| r.ok())
-            .collect()
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
     };
 
     // 2. Scan filesystem
     let scanned_files = scanner::scan(collection)?;
-    let pb = ProgressBar::new(scanned_files.len() as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
-        )
-        .unwrap()
-        .progress_chars("=>-"),
-    );
+    let pb = new_progress_bar(scanned_files.len() as u64);
 
     // 3. Hash scanned files: {rel_path → (hash, content_bytes)}
-    let mut scanned: HashMap<String, (String, Vec<u8>)> = HashMap::with_capacity(scanned_files.len());
+    let mut scanned: HashMap<String, (String, Vec<u8>)> =
+        HashMap::with_capacity(scanned_files.len());
     for f in &scanned_files {
         let content = std::fs::read(&f.abs_path)?;
         let hash = hasher::hash_bytes(&content);
@@ -62,7 +74,8 @@ pub fn update(db: &CollectionDb, collection: &Collection, opts: &UpdateOptions) 
         .map(|(path, (hash, _))| (path.clone(), hash.clone()))
         .collect();
     let d = diff::compute(&hash_only, &stored);
-    let (n_add, n_update, n_deactivate) = (d.to_add.len(), d.to_update.len(), d.to_deactivate.len());
+    let (n_add, n_update, n_deactivate) =
+        (d.to_add.len(), d.to_update.len(), d.to_deactivate.len());
 
     pb.set_length((n_add + n_update + n_deactivate) as u64);
 

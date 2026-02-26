@@ -8,8 +8,8 @@ mod search;
 mod types;
 
 use clap::Parser;
-use cli::{output, Cli, CollectionCmd, Command};
-use config::{collection_db_path, Config};
+use cli::{Cli, CollectionCmd, Command, output};
+use config::{Config, collection_db_path};
 use error::Result;
 use types::{Collection, SearchMode};
 
@@ -51,7 +51,7 @@ fn run() -> Result<()> {
             md,
             files,
         ),
-        Command::Get { .. } | Command::MultiGet { .. } | Command::Ls { .. } => {
+        Command::Get { .. } => {
             eprintln!("not yet implemented");
             Ok(())
         }
@@ -61,14 +61,14 @@ fn run() -> Result<()> {
 fn handle_collection(cmd: CollectionCmd) -> Result<()> {
     let mut config = Config::load()?;
     match cmd {
-        CollectionCmd::Add { name, path } => {
+        CollectionCmd::Add { name, path, glob, exclude, description } => {
             let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone().into());
             config.add_collection(Collection {
                 name: name.clone(),
                 path: resolved.to_string_lossy().into_owned(),
-                globs: vec![],
-                excludes: vec![],
-                description: None,
+                globs: glob,
+                excludes: exclude,
+                description,
             })?;
             config.save()?;
             println!("added collection '{name}'");
@@ -98,7 +98,11 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
                 println!("no collections configured");
             } else {
                 for c in &config.collections {
-                    println!("{:<20} {}", c.name, c.path);
+                    if let Some(desc) = &c.description {
+                        println!("{:<20} {}  # {}", c.name, c.path, desc);
+                    } else {
+                        println!("{:<20} {}", c.name, c.path);
+                    }
                 }
             }
         }
@@ -119,10 +123,7 @@ fn handle_status() -> Result<()> {
         } else {
             String::new()
         };
-        println!(
-            "  {:<20} {:<12} {}  {}",
-            col.name, status, col.path, size
-        );
+        println!("  {:<20} {:<12} {}  {}", col.name, status, col.path, size);
     }
     Ok(())
 }
@@ -166,9 +167,7 @@ fn handle_search(
     md: bool,
     files: bool,
 ) -> Result<()> {
-    let search_mode: SearchMode = mode
-        .parse()
-        .map_err(error::Error::Other)?;
+    let search_mode: SearchMode = mode.parse().map_err(error::Error::Other)?;
 
     let config = Config::load()?;
     let cols: Vec<_> = if collection_filter.is_empty() {
@@ -192,12 +191,20 @@ fn handle_search(
 
     let results = match search_mode {
         SearchMode::Bm25 => {
-            let req = search::fan_out::SearchRequest { query: &query, limit, min_score };
+            let req = search::fan_out::SearchRequest {
+                query: &query,
+                limit,
+                min_score,
+            };
             search::fan_out::bm25(&dbs, &req)?
         }
         SearchMode::Vector => {
             let embedder = llm::embedding::Embedder::load_default()?;
-            let req = search::vector::VecSearchRequest { query: &query, limit, min_score };
+            let req = search::vector::VecSearchRequest {
+                query: &query,
+                limit,
+                min_score,
+            };
             search::vector::search(&embedder, &dbs, &req)?
         }
         SearchMode::Hybrid => {
@@ -209,8 +216,16 @@ fn handle_search(
             let reranker = llm::reranker::Reranker::load_default()
                 .map_err(|e| eprintln!("note: reranker unavailable: {e}"))
                 .ok();
-            let hs = search::hybrid::HybridSearch { embedder, expander, reranker };
-            let req = search::hybrid::HybridRequest { query: &query, limit, min_score };
+            let hs = search::hybrid::HybridSearch {
+                embedder,
+                expander,
+                reranker,
+            };
+            let req = search::hybrid::HybridRequest {
+                query: &query,
+                limit,
+                min_score,
+            };
             hs.search(&dbs, &req)?
         }
     };
@@ -251,8 +266,7 @@ fn handle_embed(collection: Option<String>, force: bool) -> Result<()> {
         let db = db::CollectionDb::open(&col.name, &db_path)?;
         println!("embedding '{}'…", col.name);
         let opts = index::embed::EmbedOptions { force };
-        let (docs, chunks) =
-            index::embed::embed(&db, &embedder, &opts, llm::models::EMBEDDING)?;
+        let (docs, chunks) = index::embed::embed(&db, &embedder, &opts, llm::models::EMBEDDING)?;
         println!("  {} documents, {} chunks embedded", docs, chunks);
     }
     Ok(())

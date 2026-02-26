@@ -88,7 +88,11 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { data_dir, limit, mode }
+    Args {
+        data_dir,
+        limit,
+        mode,
+    }
 }
 
 // ── Dataset types ─────────────────────────────────────────────────────────────
@@ -181,7 +185,7 @@ fn index_corpus(conn: &Connection, docs: &[CorpusDoc]) -> Result<()> {
 
     for doc in docs {
         let text = doc_text(doc);
-        let hash = hasher::hash_str(&format!("{}:{}", doc.id, text));
+        let hash = hasher::hash_bytes(format!("{}:{}", doc.id, text).as_bytes());
 
         conn.execute(
             "INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?1, ?2, ?3)",
@@ -207,7 +211,7 @@ fn embed_corpus(conn: &Connection, docs: &[CorpusDoc], embedder: &Embedder) -> R
         }
 
         let text = doc_text(doc);
-        let hash = hasher::hash_str(&format!("{}:{}", doc.id, text));
+        let hash = hasher::hash_bytes(format!("{}:{}", doc.id, text).as_bytes());
 
         let already: i64 = conn
             .query_row(
@@ -225,7 +229,13 @@ fn embed_corpus(conn: &Connection, docs: &[CorpusDoc], embedder: &Embedder) -> R
             let emb = embedder.embed_doc(&doc.title, &chunk.text)?;
             let hash_seq = format!("{hash}_{}", chunk.seq);
             vectors::insert(conn, &hash_seq, &emb)?;
-            vectors::mark_embedded(conn, &hash, chunk.seq as i64, chunk.pos as i64, models::EMBEDDING)?;
+            vectors::mark_embedded(
+                conn,
+                &hash,
+                chunk.seq as i64,
+                chunk.pos as i64,
+                models::EMBEDDING,
+            )?;
         }
     }
     println!("  embedding {}/{}", total, total);
@@ -262,7 +272,7 @@ fn dcg(ranked: &[String], relevant: &HashMap<String, u32>, k: usize) -> f64 {
 
 fn ideal_dcg(relevant: &HashMap<String, u32>, k: usize) -> f64 {
     let mut scores: Vec<f64> = relevant.values().map(|&s| s as f64).collect();
-    scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     scores
         .iter()
         .take(k)
@@ -275,7 +285,11 @@ fn recall_at_k(ranked: &[String], relevant: &HashMap<String, u32>, k: usize) -> 
     if relevant.is_empty() {
         return 0.0;
     }
-    let hits = ranked.iter().take(k).filter(|id| relevant.contains_key(*id)).count();
+    let hits = ranked
+        .iter()
+        .take(k)
+        .filter(|id| relevant.contains_key(*id))
+        .count();
     hits as f64 / relevant.len() as f64
 }
 
@@ -286,11 +300,20 @@ fn bm25_search(conn: &Connection, query: &str, limit: usize) -> Vec<SearchResult
     if fts_query.is_empty() {
         return vec![];
     }
-    let q = fts::BM25Query { fts_query, collection: "nfcorpus", limit };
+    let q = fts::BM25Query {
+        fts_query,
+        collection: "nfcorpus",
+        limit,
+    };
     fts::search(conn, &q).unwrap_or_default()
 }
 
-fn vector_search(conn: &Connection, query: &str, limit: usize, embedder: &Embedder) -> Vec<SearchResult> {
+fn vector_search(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    embedder: &Embedder,
+) -> Vec<SearchResult> {
     let emb = match embedder.embed_query(query) {
         Ok(e) => e,
         Err(e) => {
@@ -305,7 +328,12 @@ fn vector_search(conn: &Connection, query: &str, limit: usize, embedder: &Embedd
 /// Grid search below confirms any α in [0.70, 0.95] beats pure vector (0.3866) on nDCG@10.
 const SCORE_FUSION_ALPHA: f64 = 0.80;
 
-fn hybrid_search(conn: &Connection, query: &str, limit: usize, embedder: &Embedder) -> Vec<SearchResult> {
+fn hybrid_search(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    embedder: &Embedder,
+) -> Vec<SearchResult> {
     // Score-based linear fusion: α·vec + (1-α)·bm25
     // Empirically beats both individual modes on NFCorpus (see tune_score_fusion output).
     score_fusion(conn, query, limit, embedder, SCORE_FUSION_ALPHA)
@@ -313,17 +341,28 @@ fn hybrid_search(conn: &Connection, query: &str, limit: usize, embedder: &Embedd
 
 /// Score-based linear fusion: combined_score = α*vec_score + (1-α)*bm25_score.
 /// Union of results from both retrieval lists, merged by path.
-fn score_fusion(conn: &Connection, query: &str, limit: usize, embedder: &Embedder, alpha: f64) -> Vec<SearchResult> {
+fn score_fusion(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    embedder: &Embedder,
+    alpha: f64,
+) -> Vec<SearchResult> {
     let bm25_results = bm25_search(conn, query, limit * 3);
     let vec_results = vector_search(conn, query, limit * 3, embedder);
 
     let mut scores: HashMap<String, (f64, f64, SearchResult)> = HashMap::new(); // path → (bm25, vec, result)
 
     for r in &bm25_results {
-        scores.entry(r.path.clone()).or_insert((0.0, 0.0, r.clone())).0 = r.score;
+        scores
+            .entry(r.path.clone())
+            .or_insert((0.0, 0.0, r.clone()))
+            .0 = r.score;
     }
     for r in &vec_results {
-        let entry = scores.entry(r.path.clone()).or_insert((0.0, 0.0, r.clone()));
+        let entry = scores
+            .entry(r.path.clone())
+            .or_insert((0.0, 0.0, r.clone()));
         entry.1 = r.score;
     }
 
@@ -335,7 +374,7 @@ fn score_fusion(conn: &Connection, query: &str, limit: usize, embedder: &Embedde
         })
         .collect();
 
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    SearchResult::sort_desc(&mut merged);
     merged.truncate(limit);
     merged
 }
@@ -360,7 +399,9 @@ struct EvalResult {
 fn evaluate_bm25(conn: &Connection, queries: &[Query], qrels: &Qrels, k: usize) -> EvalResult {
     let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
     for q in queries {
-        let Some(relevant) = qrels.get(&q.id) else { continue };
+        let Some(relevant) = qrels.get(&q.id) else {
+            continue;
+        };
         let results = bm25_search(conn, &q.text, k);
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
         total_ndcg += ndcg_at_k(&ranked, relevant, k);
@@ -375,10 +416,18 @@ fn evaluate_bm25(conn: &Connection, queries: &[Query], qrels: &Qrels, k: usize) 
     }
 }
 
-fn evaluate_vector(conn: &Connection, queries: &[Query], qrels: &Qrels, k: usize, embedder: &Embedder) -> EvalResult {
+fn evaluate_vector(
+    conn: &Connection,
+    queries: &[Query],
+    qrels: &Qrels,
+    k: usize,
+    embedder: &Embedder,
+) -> EvalResult {
     let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
     for q in queries {
-        let Some(relevant) = qrels.get(&q.id) else { continue };
+        let Some(relevant) = qrels.get(&q.id) else {
+            continue;
+        };
         let results = vector_search(conn, &q.text, k, embedder);
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
         total_ndcg += ndcg_at_k(&ranked, relevant, k);
@@ -393,10 +442,18 @@ fn evaluate_vector(conn: &Connection, queries: &[Query], qrels: &Qrels, k: usize
     }
 }
 
-fn evaluate_hybrid(conn: &Connection, queries: &[Query], qrels: &Qrels, k: usize, embedder: &Embedder) -> EvalResult {
+fn evaluate_hybrid(
+    conn: &Connection,
+    queries: &[Query],
+    qrels: &Qrels,
+    k: usize,
+    embedder: &Embedder,
+) -> EvalResult {
     let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
     for q in queries {
-        let Some(relevant) = qrels.get(&q.id) else { continue };
+        let Some(relevant) = qrels.get(&q.id) else {
+            continue;
+        };
         let results = hybrid_search(conn, &q.text, k, embedder);
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
         total_ndcg += ndcg_at_k(&ranked, relevant, k);
@@ -412,7 +469,13 @@ fn evaluate_hybrid(conn: &Connection, queries: &[Query], qrels: &Qrels, k: usize
 }
 
 /// Grid search over score-fusion alpha values and report best.
-fn tune_score_fusion(conn: &Connection, queries: &[Query], qrels: &Qrels, k: usize, embedder: &Embedder) {
+fn tune_score_fusion(
+    conn: &Connection,
+    queries: &[Query],
+    qrels: &Qrels,
+    k: usize,
+    embedder: &Embedder,
+) {
     println!("\n── Score-fusion tuning (α*vec + (1-α)*bm25) ──────────────────");
     println!("{:<8}  {:>10}  {:>12}", "alpha", "nDCG@10", "Recall@10");
     println!("{}", "─".repeat(36));
@@ -423,7 +486,9 @@ fn tune_score_fusion(conn: &Connection, queries: &[Query], qrels: &Qrels, k: usi
     for &alpha in &alphas {
         let (mut total_ndcg, mut total_recall, mut n) = (0.0f64, 0.0f64, 0usize);
         for q in queries {
-            let Some(relevant) = qrels.get(&q.id) else { continue };
+            let Some(relevant) = qrels.get(&q.id) else {
+                continue;
+            };
             let results = score_fusion(conn, &q.text, k, embedder, alpha);
             let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
             total_ndcg += ndcg_at_k(&ranked, relevant, k);
@@ -438,7 +503,10 @@ fn tune_score_fusion(conn: &Connection, queries: &[Query], qrels: &Qrels, k: usi
         }
     }
     println!("{}", "─".repeat(36));
-    println!("best: alpha={:.2} → nDCG@10={:.4}, Recall@10={:.4}", best.2, best.0, best.1);
+    println!(
+        "best: alpha={:.2} → nDCG@10={:.4}, Recall@10={:.4}",
+        best.2, best.0, best.1
+    );
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -476,7 +544,10 @@ fn main() -> Result<()> {
     let qrels = load_qrels(&qrels_path)?;
 
     // Only evaluate queries that have test judgments
-    let queries: Vec<Query> = all_queries.into_iter().filter(|q| qrels.contains_key(&q.id)).collect();
+    let queries: Vec<Query> = all_queries
+        .into_iter()
+        .filter(|q| qrels.contains_key(&q.id))
+        .collect();
     println!("  {} queries with test judgments\n", queries.len());
 
     println!("indexing corpus into in-memory DB (BM25)...");
@@ -492,13 +563,19 @@ fn main() -> Result<()> {
     index_corpus(&conn, &corpus)?;
     println!("  done\n");
 
-    let needs_embedder = matches!(args.mode, EvalMode::Vector | EvalMode::Hybrid | EvalMode::All);
+    let needs_embedder = matches!(
+        args.mode,
+        EvalMode::Vector | EvalMode::Hybrid | EvalMode::All
+    );
 
     let embedder_opt: Option<Embedder> = if needs_embedder {
         match Embedder::load_default() {
             Ok(emb) => {
                 println!("embedding model loaded");
-                println!("embedding corpus ({} docs, may take several minutes)...", corpus.len());
+                println!(
+                    "embedding corpus ({} docs, may take several minutes)...",
+                    corpus.len()
+                );
                 embed_corpus(&conn, &corpus, &emb)?;
                 println!("  done\n");
                 Some(emb)
@@ -507,7 +584,7 @@ fn main() -> Result<()> {
                 eprintln!(
                     "warning: embedding model not found ({e})\n\
                      Vector and Hybrid modes will be skipped.\n\
-                     Place '{}' in ~/local-models/ to enable them.\n",
+                     Set IR_EMBEDDING_MODEL (or QMD_EMBEDDING_MODEL) for '{}', or add a model directory to IR_MODEL_DIRS.\n",
                     models::EMBEDDING
                 );
                 None
@@ -548,7 +625,10 @@ fn main() -> Result<()> {
 
     // Results table
     println!("\n── NFCorpus evaluation (k={k}) ────────────────────────────────");
-    println!("{:<10}  {:>10}  {:>12}  {:>10}", "mode", "nDCG@10", "Recall@10", "queries");
+    println!(
+        "{:<10}  {:>10}  {:>12}  {:>10}",
+        "mode", "nDCG@10", "Recall@10", "queries"
+    );
     println!("{}", "─".repeat(50));
     for r in &results {
         println!(
@@ -559,7 +639,13 @@ fn main() -> Result<()> {
     println!("{}", "─".repeat(50));
 
     // Summary
-    let get = |mode: &str| results.iter().find(|r| r.mode == mode).map(|r| r.ndcg).unwrap_or(0.0);
+    let get = |mode: &str| {
+        results
+            .iter()
+            .find(|r| r.mode == mode)
+            .map(|r| r.ndcg)
+            .unwrap_or(0.0)
+    };
     let bm25_ndcg = get("bm25");
     let vec_ndcg = get("vector");
     let hybrid_ndcg = get("hybrid");
@@ -569,8 +655,16 @@ fn main() -> Result<()> {
         let beats_vec = vec_ndcg == 0.0 || hybrid_ndcg > vec_ndcg;
 
         if beats_bm25 && beats_vec {
-            let bm25_delta = if bm25_ndcg > 0.0 { (hybrid_ndcg - bm25_ndcg) / bm25_ndcg * 100.0 } else { 0.0 };
-            let vec_delta = if vec_ndcg > 0.0 { (hybrid_ndcg - vec_ndcg) / vec_ndcg * 100.0 } else { 0.0 };
+            let bm25_delta = if bm25_ndcg > 0.0 {
+                (hybrid_ndcg - bm25_ndcg) / bm25_ndcg * 100.0
+            } else {
+                0.0
+            };
+            let vec_delta = if vec_ndcg > 0.0 {
+                (hybrid_ndcg - vec_ndcg) / vec_ndcg * 100.0
+            } else {
+                0.0
+            };
             println!(
                 "hybrid beats bm25 (+{:.1}%) and vector (+{:.1}%) on nDCG@10",
                 bm25_delta, vec_delta,

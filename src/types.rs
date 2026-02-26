@@ -23,6 +23,12 @@ pub struct SearchResult {
     pub doc_id: String,
 }
 
+impl SearchResult {
+    pub fn sort_desc(results: &mut [Self]) {
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchMode {
     Bm25,

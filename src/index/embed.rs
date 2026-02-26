@@ -1,11 +1,10 @@
 // Embedding pipeline: load un-embedded documents → chunk → embed → store.
 // Runs after `ir update`. Safe to re-run: skips already-embedded hashes.
 
-use crate::db::{vectors, CollectionDb};
+use crate::db::{CollectionDb, vectors};
 use crate::error::Result;
-use crate::index::chunker;
+use crate::index::{chunker, new_progress_bar};
 use crate::llm::embedding::Embedder;
-use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::Connection;
 
 pub struct EmbedOptions {
@@ -41,16 +40,12 @@ pub fn embed(
     // Content-addressed: multiple paths can share the same hash. Dedup so we don't
     // attempt to insert the same hash_seq twice (which would violate vectors_vec PK).
     let mut seen = std::collections::HashSet::new();
-    let pending: Vec<_> = pending.into_iter().filter(|(_, _, hash, _)| seen.insert(hash.clone())).collect();
+    let pending: Vec<_> = pending
+        .into_iter()
+        .filter(|(_, _, hash, _)| seen.insert(hash.clone()))
+        .collect();
 
-    let pb = ProgressBar::new(pending.len() as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
-        )
-        .unwrap()
-        .progress_chars("=>-"),
-    );
+    let pb = new_progress_bar(pending.len() as u64);
 
     let mut total_chunks = 0usize;
 
@@ -61,8 +56,7 @@ pub fn embed(
         if opts.force {
             // Collect seqs before deleting content_vectors (sqlite-vec can't LIKE on PK).
             let seqs: Vec<i64> = {
-                let mut stmt =
-                    conn.prepare("SELECT seq FROM content_vectors WHERE hash = ?1")?;
+                let mut stmt = conn.prepare("SELECT seq FROM content_vectors WHERE hash = ?1")?;
                 stmt.query_map([hash], |r| r.get(0))?
                     .filter_map(|r| r.ok())
                     .collect()
@@ -119,7 +113,8 @@ fn load_unembedded(conn: &Connection) -> Result<Vec<(String, String, String, Str
             row.get::<_, String>(3)?,
         ))
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn load_all_active(conn: &Connection) -> Result<Vec<(String, String, String, String)>> {
@@ -139,7 +134,8 @@ fn load_all_active(conn: &Connection) -> Result<Vec<(String, String, String, Str
             row.get::<_, String>(3)?,
         ))
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 /// Remove content_vectors (and their vectors) for hashes no longer in active documents.
@@ -187,7 +183,8 @@ mod tests {
     fn open_test_db() -> Connection {
         crate::db::ensure_sqlite_vec();
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../db/schema.sql")).unwrap();
+        conn.execute_batch(include_str!("../db/schema.sql"))
+            .unwrap();
         conn
     }
 
@@ -274,7 +271,11 @@ mod tests {
         assert!(chunks >= 1);
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM content_vectors WHERE hash=?1", [hash], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM content_vectors WHERE hash=?1",
+                [hash],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(count >= 1);
     }

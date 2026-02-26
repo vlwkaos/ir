@@ -93,7 +93,10 @@ mod tests {
     fn bare_terms_become_prefix_and() {
         let q = build_query("rust memory");
         assert!(q.contains("\"rust\"*"), "expected prefix match for 'rust'");
-        assert!(q.contains("\"memory\"*"), "expected prefix match for 'memory'");
+        assert!(
+            q.contains("\"memory\"*"),
+            "expected prefix match for 'memory'"
+        );
         assert!(q.contains(" AND "), "terms should be ANDed");
     }
 
@@ -120,11 +123,17 @@ mod tests {
         // A bare term containing `"` must not break FTS5 query syntax.
         // read_term stops at whitespace, so `rust"lang` becomes a single token.
         let q = build_query("rust\"lang");
-        assert!(q.contains("\"rust\"\"lang\"*"), "inner quote must be doubled: {q}");
+        assert!(
+            q.contains("\"rust\"\"lang\"*"),
+            "inner quote must be doubled: {q}"
+        );
 
         // Same for negated terms.
         let q2 = build_query("-bad\"actor");
-        assert!(q2.contains("NOT \"bad\"\"actor\""), "negated inner quote must be doubled: {q2}");
+        assert!(
+            q2.contains("NOT \"bad\"\"actor\""),
+            "negated inner quote must be doubled: {q2}"
+        );
     }
 
     #[test]
@@ -157,18 +166,15 @@ pub fn search(conn: &Connection, q: &BM25Query) -> Result<Vec<SearchResult>> {
     ";
 
     let mut stmt = conn.prepare_cached(sql)?;
-    let rows = stmt.query_map(
-        rusqlite::params![fts, q.limit as i64],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, f64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-            ))
-        },
-    )?;
+    let rows = stmt.query_map(rusqlite::params![fts, q.limit as i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, f64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
 
     let mut results = Vec::new();
     for row in rows {

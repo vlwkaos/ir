@@ -8,7 +8,7 @@
 // Score-fusion α=0.80 (mid-range of 0.70–0.95 plateau) selected on BEIR/NFCorpus.
 // See src/bin/eval.rs for the evaluation harness.
 
-use crate::db::{fts, vectors, CollectionDb};
+use crate::db::{CollectionDb, fts, vectors};
 use crate::error::Result;
 use crate::llm::{
     embedding::Embedder,
@@ -38,11 +38,7 @@ pub struct HybridSearch {
 const SCORE_FUSION_VEC_ALPHA: f64 = 0.80;
 
 impl HybridSearch {
-    pub fn search(
-        &self,
-        dbs: &[CollectionDb],
-        req: &HybridRequest,
-    ) -> Result<Vec<SearchResult>> {
+    pub fn search(&self, dbs: &[CollectionDb], req: &HybridRequest) -> Result<Vec<SearchResult>> {
         // 1. BM25 probe for strong-signal shortcut.
         let probe_results = bm25_across(dbs, req.query, req.limit);
         if is_strong_signal(&probe_results) {
@@ -109,7 +105,7 @@ fn score_fusion_two_list(
         })
         .collect();
 
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    SearchResult::sort_desc(&mut merged);
     merged.truncate(req.limit * 2);
     Ok(merged)
 }
@@ -124,9 +120,9 @@ fn rrf_with_expander(
     req: &HybridRequest,
     probe_results: Vec<SearchResult>,
 ) -> Result<Vec<SearchResult>> {
-    let sub_queries = expander.expand(req.query).unwrap_or_else(|_| {
-        crate::llm::expander::fallback(req.query)
-    });
+    let sub_queries = expander
+        .expand(req.query)
+        .unwrap_or_else(|_| crate::llm::expander::fallback(req.query));
 
     let mut ranked_lists: Vec<RankedList> = Vec::new();
 
@@ -158,7 +154,10 @@ fn rrf_with_expander(
     // Include probe only if no lex sub-query was generated (guards against double-counting).
     let has_lex = sub_queries.iter().any(|s| s.kind == SubQueryKind::Lex);
     if !has_lex && !probe_results.is_empty() {
-        ranked_lists.push(RankedList { results: probe_results, weight: 1.0 });
+        ranked_lists.push(RankedList {
+            results: probe_results,
+            weight: 1.0,
+        });
     }
 
     if ranked_lists.is_empty() {
@@ -177,7 +176,11 @@ fn bm25_across(dbs: &[CollectionDb], query: &str, limit: usize) -> Vec<SearchRes
     }
     dbs.iter()
         .flat_map(|db| {
-            let q = fts::BM25Query { fts_query: fts_query.clone(), collection: &db.name, limit };
+            let q = fts::BM25Query {
+                fts_query: fts_query.clone(),
+                collection: &db.name,
+                limit,
+            };
             fts::search(db.conn(), &q).unwrap_or_else(|e| {
                 eprintln!("warn: bm25 search on '{}' failed: {e}", db.name);
                 vec![]
@@ -246,7 +249,7 @@ fn rerank(
         .cloned()
         .chain(rest.iter().cloned())
         .collect();
-    all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    SearchResult::sort_desc(&mut all);
     all.truncate(limit);
     Ok(all)
 }
@@ -257,11 +260,9 @@ fn fetch_doc_text(dbs: &[CollectionDb], hash: &str, collection: &str) -> Option<
 }
 
 fn fetch_content(conn: &Connection, hash: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT doc FROM content WHERE hash = ?1",
-        [hash],
-        |row| row.get(0),
-    )
+    conn.query_row("SELECT doc FROM content WHERE hash = ?1", [hash], |row| {
+        row.get(0)
+    })
     .ok()
 }
 
@@ -283,7 +284,10 @@ mod tests {
 
         // Top ≥ 0.85 but gap < 0.15 → not strong
         let r1 = vec![make(0.90), make(0.82)];
-        assert!(!is_strong_signal(&r1), "gap of 0.08 should not be strong signal");
+        assert!(
+            !is_strong_signal(&r1),
+            "gap of 0.08 should not be strong signal"
+        );
 
         // Top ≥ 0.85 and gap ≥ 0.15 → strong
         let r2 = vec![make(0.92), make(0.70)];
@@ -291,7 +295,10 @@ mod tests {
 
         // Top < 0.85 → not strong
         let r3 = vec![make(0.80), make(0.50)];
-        assert!(!is_strong_signal(&r3), "score below 0.85 should not be strong signal");
+        assert!(
+            !is_strong_signal(&r3),
+            "score below 0.85 should not be strong signal"
+        );
     }
 
     #[test]

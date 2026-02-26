@@ -8,14 +8,13 @@ pub fn hash_bytes(data: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-#[allow(dead_code)]
-pub fn hash_str(s: &str) -> String {
-    hash_bytes(s.as_bytes())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hash_str(s: &str) -> String {
+        hash_bytes(s.as_bytes())
+    }
 
     #[test]
     fn deterministic() {

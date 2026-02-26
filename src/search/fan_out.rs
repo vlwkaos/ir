@@ -4,7 +4,7 @@
 // Note: rayon parallelism requires Send; rusqlite::Connection is !Send.
 // Future: use connection pool or spawn threads with Arc<Mutex<Connection>>.
 
-use crate::db::{fts, CollectionDb};
+use crate::db::{CollectionDb, fts};
 use crate::error::Result;
 use crate::types::SearchResult;
 
@@ -60,35 +60,65 @@ mod tests {
 
     #[test]
     fn sorts_by_score_desc() {
-        let req = SearchRequest { query: "q", limit: 10, min_score: None };
-        let out = merge_and_filter(vec![vec![make("c", "a.md", 0.5), make("c", "b.md", 0.9)]], &req).unwrap();
+        let req = SearchRequest {
+            query: "q",
+            limit: 10,
+            min_score: None,
+        };
+        let out = merge_and_filter(
+            vec![vec![make("c", "a.md", 0.5), make("c", "b.md", 0.9)]],
+            &req,
+        )
+        .unwrap();
         assert_eq!(out[0].path, "b.md");
         assert_eq!(out[1].path, "a.md");
     }
 
     #[test]
     fn applies_min_score() {
-        let req = SearchRequest { query: "q", limit: 10, min_score: Some(0.6) };
-        let out = merge_and_filter(vec![vec![make("c", "a.md", 0.9), make("c", "b.md", 0.3)]], &req).unwrap();
+        let req = SearchRequest {
+            query: "q",
+            limit: 10,
+            min_score: Some(0.6),
+        };
+        let out = merge_and_filter(
+            vec![vec![make("c", "a.md", 0.9), make("c", "b.md", 0.3)]],
+            &req,
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].path, "a.md");
     }
 
     #[test]
     fn respects_limit() {
-        let req = SearchRequest { query: "q", limit: 3, min_score: None };
-        let docs: Vec<_> = (0..10).map(|i| make("c", &format!("{i}.md"), 0.5)).collect();
+        let req = SearchRequest {
+            query: "q",
+            limit: 3,
+            min_score: None,
+        };
+        let docs: Vec<_> = (0..10)
+            .map(|i| make("c", &format!("{i}.md"), 0.5))
+            .collect();
         let out = merge_and_filter(vec![docs], &req).unwrap();
         assert_eq!(out.len(), 3);
     }
 
     #[test]
     fn merges_multiple_collections() {
-        let req = SearchRequest { query: "q", limit: 10, min_score: None };
+        let req = SearchRequest {
+            query: "q",
+            limit: 10,
+            min_score: None,
+        };
         let out = merge_and_filter(
-            vec![vec![make("col_a", "x.md", 0.7)], vec![make("col_b", "y.md", 0.9)]],
+            vec![
+                vec![make("col_a", "x.md", 0.7)],
+                vec![make("col_b", "y.md", 0.9)],
+            ],
             &req,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].collection, "col_b");
     }
@@ -101,7 +131,7 @@ fn merge_and_filter(
     let mut merged: Vec<SearchResult> = result_sets.into_iter().flatten().collect();
 
     // Sort by score descending.
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    SearchResult::sort_desc(&mut merged);
 
     // Apply min_score filter.
     if let Some(min) = req.min_score {

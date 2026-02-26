@@ -47,7 +47,7 @@ pub fn fuse(lists: &[RankedList], limit: usize) -> Vec<SearchResult> {
         })
         .collect();
 
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    SearchResult::sort_desc(&mut merged);
     merged.truncate(limit);
     merged
 }
@@ -96,13 +96,21 @@ mod tests {
         let out = fuse(&[list1, list2], 10);
         let shared = out.iter().find(|r| r.path == "shared.md").unwrap();
         let only1 = out.iter().find(|r| r.path == "only1.md").unwrap();
-        assert!(shared.score > only1.score, "shared doc should have higher score");
+        assert!(
+            shared.score > only1.score,
+            "shared doc should have higher score"
+        );
     }
 
     #[test]
     fn fuse_respects_limit() {
-        let results: Vec<_> = (0..20).map(|i| make_result(&format!("{i}.md"), 0.9)).collect();
-        let list = RankedList { results, weight: 1.0 };
+        let results: Vec<_> = (0..20)
+            .map(|i| make_result(&format!("{i}.md"), 0.9))
+            .collect();
+        let list = RankedList {
+            results,
+            weight: 1.0,
+        };
         let out = fuse(&[list], 5);
         assert_eq!(out.len(), 5);
     }

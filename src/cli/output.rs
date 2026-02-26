@@ -58,7 +58,10 @@ fn pretty(results: &[SearchResult], full: bool) {
 }
 
 fn json(results: &[SearchResult]) {
-    println!("{}", serde_json::to_string_pretty(results).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(results).unwrap_or_default()
+    );
 }
 
 fn csv_fmt(results: &[SearchResult]) {
@@ -85,7 +88,8 @@ fn escape_csv(s: &str) -> String {
 
 fn markdown(results: &[SearchResult]) {
     for r in results {
-        println!("- [{title}]({path}) `{score:.3}` {doc_id}",
+        println!(
+            "- [{title}]({path}) `{score:.3}` {doc_id}",
             title = r.title,
             path = r.path,
             score = r.score,
