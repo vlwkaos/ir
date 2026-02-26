@@ -8,6 +8,34 @@ pub fn hash_bytes(data: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+#[allow(dead_code)]
 pub fn hash_str(s: &str) -> String {
     hash_bytes(s.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic() {
+        assert_eq!(hash_bytes(b"hello"), hash_bytes(b"hello"));
+    }
+
+    #[test]
+    fn differs_on_different_input() {
+        assert_ne!(hash_bytes(b"hello"), hash_bytes(b"world"));
+    }
+
+    #[test]
+    fn hash_str_matches_hash_bytes() {
+        assert_eq!(hash_str("hello"), hash_bytes(b"hello"));
+    }
+
+    #[test]
+    fn output_is_64_char_hex() {
+        let h = hash_str("test");
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }
