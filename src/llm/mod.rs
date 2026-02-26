@@ -6,7 +6,6 @@
 //   2. ~/.cache/ir/models/    (ir-specific cache)
 //   3. ~/.cache/qmd/models/   (reuse qmd downloads)
 
-pub mod cache;
 pub mod embedding;
 pub mod expander;
 pub mod reranker;
@@ -14,6 +13,10 @@ pub mod reranker;
 pub use llama_cpp_2::llama_backend::LlamaBackend;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+// LlamaBackend is an empty struct — Send + Sync by default. Store once per process.
+static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 
 /// Known model filenames.
 pub mod models {
@@ -43,11 +46,17 @@ pub fn model_search_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Initialize the llama.cpp backend. Call once per process; safe to call multiple times.
-pub fn init_backend() -> crate::error::Result<LlamaBackend> {
-    LlamaBackend::init().map_err(|e: llama_cpp_2::LlamaCppError| {
+/// Initialize the process-global llama.cpp backend. Safe to call from multiple models.
+/// Returns a &'static reference; the backend lives for the lifetime of the process.
+pub fn init_backend() -> crate::error::Result<&'static LlamaBackend> {
+    // Fast path: already initialized.
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let b = LlamaBackend::init().map_err(|e: llama_cpp_2::LlamaCppError| {
         crate::error::Error::Other(e.to_string())
-    })
+    })?;
+    Ok(BACKEND.get_or_init(|| b))
 }
 
 /// L2-normalize a float vector in place. No-op if magnitude is zero.
@@ -64,6 +73,7 @@ pub fn to_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 /// Deserialize little-endian bytes to f32 vec.
+#[allow(dead_code)]
 pub fn from_bytes(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))

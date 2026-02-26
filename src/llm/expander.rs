@@ -15,16 +15,12 @@ use llama_cpp_2::{
     model::{params::LlamaModelParams, AddBos, LlamaModel},
     sampling::LlamaSampler,
 };
+// Note: grammar-constrained sampling (GBNF) is intentionally not used here.
+// llama_grammar_reject_candidates has an assertion failure with this llama.cpp version
+// when applied to the qmd-query-expansion model. Free-form sampling + parse + fallback
+// is equivalent since the model is fine-tuned to produce the correct format.
 use std::num::NonZeroU32;
 use std::path::Path;
-
-// GBNF grammar: each line must be "lex: ...\n", "vec: ...\n", or "hyde: ...\n"
-const GRAMMAR: &str = r#"
-root   ::= sub-query+
-sub-query ::= type ": " content "\n"
-type   ::= "lex" | "vec" | "hyde"
-content ::= [^\n]+
-"#;
 
 const MAX_OUTPUT_TOKENS: usize = 300;
 const CONTEXT_SIZE: u32 = 2048;
@@ -43,7 +39,7 @@ pub enum SubQueryKind {
 }
 
 pub struct Expander {
-    backend: LlamaBackend,
+    backend: &'static LlamaBackend,
     model: LlamaModel,
 }
 
@@ -123,11 +119,9 @@ impl Expander {
         ctx.decode(&mut batch)
             .map_err(|e| Error::Other(format!("decode prompt: {e}")))?;
 
-        // Grammar-constrained sampler: temperature 0.7, top_k 20, top_p 0.8.
-        let grammar = LlamaSampler::grammar(&self.model, GRAMMAR, "root")
-            .map_err(|e| Error::Other(format!("grammar sampler: {e}")))?;
+        // Free-form sampler: temperature 0.7, top_k 20, top_p 0.8.
+        // Grammar constraint omitted — see module note above.
         let mut sampler = LlamaSampler::chain_simple([
-            grammar,
             LlamaSampler::temp(0.7),
             LlamaSampler::top_k(20),
             LlamaSampler::top_p(0.8, 1),

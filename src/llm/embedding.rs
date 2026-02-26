@@ -18,7 +18,7 @@ pub const EMBEDDING_DIM: usize = 768;
 const CONTEXT_SIZE: u32 = 1024;
 
 pub struct Embedder {
-    backend: LlamaBackend,
+    backend: &'static LlamaBackend,
     model: LlamaModel,
 }
 
@@ -62,6 +62,9 @@ impl Embedder {
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(CONTEXT_SIZE))
+            // ! encoder requires n_ubatch >= n_tokens; set equal to ctx so chunks never exceed it
+            .with_n_batch(CONTEXT_SIZE)
+            .with_n_ubatch(CONTEXT_SIZE)
             .with_n_threads_batch(n_threads)
             .with_embeddings(true);
 
