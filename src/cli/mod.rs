@@ -2,7 +2,6 @@
 // docs: https://docs.rs/clap/latest/clap/_derive/index.html
 
 pub mod output;
-pub mod progress;
 
 use clap::{Parser, Subcommand};
 

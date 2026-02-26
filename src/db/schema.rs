@@ -19,6 +19,7 @@ pub fn init(conn: &Connection, collection_name: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn get_version(conn: &Connection) -> Result<i64> {
     let version: Option<String> = conn
         .query_row(

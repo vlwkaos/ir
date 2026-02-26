@@ -13,26 +13,6 @@ pub struct Collection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Document {
-    pub id: i64,
-    pub collection: String,
-    pub path: String,
-    pub title: String,
-    pub hash: String,
-    pub created_at: String,
-    pub modified_at: String,
-    pub active: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Chunk {
-    pub hash: String,
-    pub seq: i64,
-    pub pos: i64,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub collection: String,
     pub path: String,
