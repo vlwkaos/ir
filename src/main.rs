@@ -170,10 +170,6 @@ fn handle_search(
         .parse()
         .map_err(|e| error::Error::Other(e))?;
 
-    if matches!(search_mode, SearchMode::Hybrid) {
-        eprintln!("note: --mode hybrid not yet implemented (Phase 5). Using vector.");
-    }
-
     let config = Config::load()?;
     let cols: Vec<_> = if collection_filter.is_empty() {
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -196,21 +192,28 @@ fn handle_search(
 
     let results = match search_mode {
         SearchMode::Bm25 => {
-            let req = search::fan_out::SearchRequest {
-                query: &query,
-                limit,
-                min_score,
-            };
+            let req = search::fan_out::SearchRequest { query: &query, limit, min_score };
             search::fan_out::bm25(&dbs, &req)?
         }
-        SearchMode::Vector | SearchMode::Hybrid => {
+        SearchMode::Vector => {
             let embedder = llm::embedding::Embedder::load_default()?;
-            let req = search::vector::VecSearchRequest {
-                query: &query,
-                limit,
-                min_score,
-            };
+            let req = search::vector::VecSearchRequest { query: &query, limit, min_score };
             search::vector::search(&embedder, &dbs, &req)?
+        }
+        SearchMode::Hybrid => {
+            let embedder = llm::embedding::Embedder::load_default()?;
+            // Expander and reranker are optional: degrade gracefully if models missing.
+            let expander = llm::expander::Expander::load_default().ok();
+            let reranker = llm::reranker::Reranker::load_default().ok();
+            if expander.is_none() {
+                eprintln!("note: expander model not found — using query as-is");
+            }
+            if reranker.is_none() {
+                eprintln!("note: reranker model not found — skipping reranking");
+            }
+            let hs = search::hybrid::HybridSearch { embedder, expander, reranker };
+            let req = search::hybrid::HybridRequest { query: &query, limit, min_score };
+            hs.search(&dbs, &req)?
         }
     };
 
