@@ -10,7 +10,8 @@ Local semantic search engine for markdown knowledge bases. Rust port of [qmd](ht
 - **Per-collection SQLite** — independent WAL journals, isolated backup, zero cross-collection contention
 - **Content-addressed storage** — identical files deduplicated by SHA-256 within a collection
 - **FTS5 injection-safe** — all user input escaped before FTS5 query construction
-- **Metal GPU** — llama.cpp with Metal on macOS; CUDA/CPU elsewhere
+- **Metal GPU** — all layers offloaded to Metal on macOS by default; `IR_GPU_LAYERS=N` to override
+- **Auto-download** — models fetched from HuggingFace Hub on first use; `HF_HUB_OFFLINE=1` to disable
 
 ## Installation
 
@@ -22,23 +23,45 @@ Requires Rust 1.80+. On macOS, links llama.cpp with Metal automatically.
 
 ## Models
 
-Place GGUF files in `~/local-models/` (or `~/.cache/ir/models/`, `~/.cache/qmd/models/`):
+Models are downloaded automatically from HuggingFace Hub on first use and cached in `~/.cache/huggingface/`. No manual setup required.
 
-| Model | File | Required for |
+| Model | HF Repo | Required for |
 |---|---|---|
-| [EmbeddingGemma 300M](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) | `embeddinggemma-300M-Q8_0.gguf` | `ir embed`, vector search, hybrid |
-| [Qwen3-Reranker 0.6B](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B-GGUF) | `qwen3-reranker-0.6b-q8_0.gguf` | hybrid reranking (optional) |
-| [qmd-query-expansion 1.7B](https://huggingface.co/tobi/qmd-query-expansion) | `qmd-query-expansion-1.7B-q4_k_m.gguf` | hybrid query expansion (optional) |
+| [EmbeddingGemma 300M](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) | `ggml-org/embeddinggemma-300M-GGUF` | `ir embed`, vector search, hybrid |
+| [Qwen3-Reranker 0.6B](https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF) | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` | hybrid reranking (optional) |
+| [qmd-query-expansion 1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | `tobil/qmd-query-expansion-1.7B` | hybrid query expansion (optional) |
 
 BM25 search works without any models.
+
+To use local models instead, point to a directory or individual files:
+
+```bash
+export IR_MODEL_DIRS="$HOME/my-models"          # ':'-separated list
+export IR_EMBEDDING_MODEL="$HOME/my-models/embeddinggemma-300M-Q8_0.gguf"
+export IR_RERANKER_MODEL="$HOME/my-models/qwen3-reranker-0.6b-q8_0.gguf"
+export IR_EXPANDER_MODEL="$HOME/my-models/qmd-query-expansion-1.7B-q4_k_m.gguf"
+```
+
+Local search order: env overrides → `IR_MODEL_DIRS` → `~/local-models/` → `~/.cache/ir/models/` → `~/.cache/qmd/models/`. If no local file is found, auto-download kicks in. Set `HF_HUB_OFFLINE=1` to disable network access.
+
+Compatibility aliases: `QMD_EMBEDDING_MODEL`, `QMD_RERANKER_MODEL`, `QMD_EXPANDER_MODEL`, `QMD_MODEL_DIRS`.
+
+### GPU
+
+All model layers are offloaded to Metal by default on macOS. To override:
+
+```bash
+IR_GPU_LAYERS=0 ir search "query"   # force CPU
+IR_GPU_LAYERS=32 ir search "query"  # partial offload
+```
 
 ## Usage
 
 ### Add a collection
 
 ```bash
-ir collection add notes --path ~/notes --globs "**/*.md"
-ir collection add code  --path ~/code  --globs "**/*.rs" "**/*.md"
+ir collection add notes ~/notes
+ir collection add code  ~/code
 ```
 
 ### Index and embed
@@ -156,7 +179,7 @@ BM25 is close because Bun is fast and SQLite does the work. Vector search is 6.8
 ```bash
 cargo build                  # debug build
 cargo build --release        # release build
-cargo test                   # unit tests (52 passing, no models required)
+cargo test                   # unit tests (55 passing, no models required)
 cargo test -- --ignored      # model-dependent tests (requires models)
 cargo run --bin eval -- --data test-data/nfcorpus --mode all
 ```
