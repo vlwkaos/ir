@@ -12,14 +12,27 @@
 // Scoring uses quadratic distance decay toward the target position:
 //   final = break_score * (1 - (norm_dist^2) * 0.7)
 
-const CHARS_PER_TOKEN: usize = 4;
-const CHUNK_SIZE_TOKENS: usize = 900;
-const CHUNK_OVERLAP_TOKENS: usize = 135; // 15%
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-const CHUNK_SIZE_CHARS: usize = CHUNK_SIZE_TOKENS * CHARS_PER_TOKEN;
-const CHUNK_OVERLAP_CHARS: usize = CHUNK_OVERLAP_TOKENS * CHARS_PER_TOKEN;
+const CHARS_PER_TOKEN: usize = 4;
+const DEFAULT_CHUNK_SIZE_TOKENS: usize = 900;
+const CHUNK_OVERLAP_PERCENT: usize = 15;
 /// Window before the target end position in which to search for a break point.
 const BREAK_WINDOW_CHARS: usize = 800;
+static CHUNK_SIZE_OVERRIDE_TOKENS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_chunk_size_tokens_override(tokens: Option<usize>) {
+    CHUNK_SIZE_OVERRIDE_TOKENS.store(tokens.unwrap_or(0), Ordering::Relaxed);
+}
+
+pub fn chunk_size_tokens() -> usize {
+    let v = CHUNK_SIZE_OVERRIDE_TOKENS.load(Ordering::Relaxed);
+    if v > 0 { v } else { DEFAULT_CHUNK_SIZE_TOKENS }
+}
+
+fn chunk_overlap_tokens(chunk_size_tokens: usize) -> usize {
+    ((chunk_size_tokens * CHUNK_OVERLAP_PERCENT) + 50) / 100
+}
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -30,7 +43,10 @@ pub struct Chunk {
 }
 
 pub fn chunk_document(doc: &str) -> Vec<Chunk> {
-    if doc.len() <= CHUNK_SIZE_CHARS {
+    let chunk_size_chars = chunk_size_tokens() * CHARS_PER_TOKEN;
+    let chunk_overlap_chars = chunk_overlap_tokens(chunk_size_tokens()) * CHARS_PER_TOKEN;
+
+    if doc.len() <= chunk_size_chars {
         return vec![Chunk {
             seq: 0,
             pos: 0,
@@ -43,7 +59,7 @@ pub fn chunk_document(doc: &str) -> Vec<Chunk> {
     let mut start = 0usize;
 
     while start < doc.len() {
-        let target_end = (start + CHUNK_SIZE_CHARS).min(doc.len());
+        let target_end = (start + chunk_size_chars).min(doc.len());
 
         let end = if target_end == doc.len() {
             doc.len()
@@ -63,7 +79,7 @@ pub fn chunk_document(doc: &str) -> Vec<Chunk> {
         }
 
         // Next chunk starts with overlap before where this one ended.
-        start = end.saturating_sub(CHUNK_OVERLAP_CHARS);
+        start = end.saturating_sub(chunk_overlap_chars);
         // Snap to a valid char boundary.
         while start < end && !doc.is_char_boundary(start) {
             start += 1;

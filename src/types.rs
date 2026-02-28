@@ -25,7 +25,11 @@ pub struct SearchResult {
 
 impl SearchResult {
     pub fn sort_desc(results: &mut [Self]) {
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 }
 

@@ -5,11 +5,11 @@
 // Cache key: sha256(query + "\0" + doc_hash) → cached f64 score
 
 use crate::error::{Error, Result};
-use crate::llm::{LlamaBackend, gpu_layers, models};
+use crate::llm::{LlamaBackend, model_load_params, models};
 use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_batch::LlamaBatch,
-    model::{AddBos, LlamaModel, params::LlamaModelParams},
+    model::{AddBos, LlamaModel},
 };
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -28,12 +28,8 @@ pub struct Reranker {
 impl Reranker {
     pub fn load(model_path: &Path) -> Result<Self> {
         let backend = crate::llm::init_backend()?;
-        let model = LlamaModel::load_from_file(
-            &backend,
-            model_path,
-            &LlamaModelParams::default().with_n_gpu_layers(gpu_layers()),
-        )
-        .map_err(|e| Error::Other(format!("load reranker: {e}")))?;
+        let model = LlamaModel::load_from_file(&backend, model_path, &model_load_params())
+            .map_err(|e| Error::Other(format!("load reranker: {e}")))?;
 
         // Resolve "Yes" and "No" token IDs from the model vocabulary.
         let yes_tokens = model
@@ -76,6 +72,7 @@ impl Reranker {
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(CONTEXT_SIZE))
+            .with_offload_kqv(false)
             .with_n_threads(n_threads)
             .with_n_threads_batch(n_threads);
 

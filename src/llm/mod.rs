@@ -15,12 +15,15 @@ pub mod expander;
 pub mod reranker;
 
 pub use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::{LlamaBackendDeviceType, list_llama_ggml_backend_devices};
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 // LlamaBackend is an empty struct — Send + Sync by default. Store once per process.
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+static LOGS_INIT: OnceLock<()> = OnceLock::new();
 
 /// Known model filenames.
 pub mod models {
@@ -64,6 +67,46 @@ pub fn gpu_layers() -> u32 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(if cfg!(target_os = "macos") { 99 } else { 0 })
+}
+
+/// Build model-load params with runtime defaults.
+///
+/// If `IR_GPU_LAYERS=0` (or `IR_FORCE_CPU_BACKEND=1`), pin to CPU backend devices.
+pub fn model_load_params() -> LlamaModelParams {
+    let gpu_layers = gpu_layers();
+    let base = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
+
+    if !should_force_cpu_backend() {
+        return base;
+    }
+
+    let cpu_devices: Vec<usize> = list_llama_ggml_backend_devices()
+        .into_iter()
+        .filter(|d| d.device_type == LlamaBackendDeviceType::Cpu)
+        .map(|d| d.index)
+        .collect();
+
+    if cpu_devices.is_empty() {
+        return base;
+    }
+
+    match LlamaModelParams::default()
+        .with_n_gpu_layers(gpu_layers)
+        .with_devices(&cpu_devices)
+    {
+        Ok(pinned) => pinned,
+        Err(_) => base,
+    }
+}
+
+fn should_force_cpu_backend() -> bool {
+    match std::env::var("IR_FORCE_CPU_BACKEND") {
+        Ok(raw) => {
+            let v = raw.to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => gpu_layers() == 0,
+    }
 }
 
 /// Environment variables for model resolution.
@@ -166,6 +209,8 @@ fn push_unique(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
 /// Initialize the process-global llama.cpp backend. Safe to call from multiple models.
 /// Returns a &'static reference; the backend lives for the lifetime of the process.
 pub fn init_backend() -> crate::error::Result<&'static LlamaBackend> {
+    init_llama_logs();
+
     // Fast path: already initialized.
     if let Some(b) = BACKEND.get() {
         return Ok(b);
@@ -173,6 +218,21 @@ pub fn init_backend() -> crate::error::Result<&'static LlamaBackend> {
     let b = LlamaBackend::init()
         .map_err(|e: llama_cpp_2::LlamaCppError| crate::error::Error::Other(e.to_string()))?;
     Ok(BACKEND.get_or_init(|| b))
+}
+
+fn init_llama_logs() {
+    LOGS_INIT.get_or_init(|| {
+        let logs_enabled = matches!(
+            std::env::var("IR_LLAMA_LOGS")
+                .unwrap_or_else(|_| "0".to_string())
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        llama_cpp_2::send_logs_to_tracing(
+            llama_cpp_2::LogOptions::default().with_logs_enabled(logs_enabled),
+        );
+    });
 }
 
 /// L2-normalize a float vector in place. No-op if magnitude is zero.

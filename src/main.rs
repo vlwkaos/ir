@@ -61,7 +61,13 @@ fn run() -> Result<()> {
 fn handle_collection(cmd: CollectionCmd) -> Result<()> {
     let mut config = Config::load()?;
     match cmd {
-        CollectionCmd::Add { name, path, glob, exclude, description } => {
+        CollectionCmd::Add {
+            name,
+            path,
+            glob,
+            exclude,
+            description,
+        } => {
             let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone().into());
             config.add_collection(Collection {
                 name: name.clone(),
