@@ -1,6 +1,6 @@
 [package]
 name = "ir"
-version = "0.3.0"
+version = "0.3.1-pre"
 edition = "2024"
 
 [features]
