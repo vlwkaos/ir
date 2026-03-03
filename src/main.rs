@@ -192,7 +192,7 @@ fn handle_search(
 
     let dbs: Vec<db::CollectionDb> = cols
         .iter()
-        .map(|c| db::CollectionDb::open(&c.name, &collection_db_path(&c.name)))
+        .map(|c| db::CollectionDb::open_readonly(&c.name, &collection_db_path(&c.name)))
         .collect::<Result<Vec<_>>>()?;
 
     let results = match search_mode {

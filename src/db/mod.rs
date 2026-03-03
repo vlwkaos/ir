@@ -35,7 +35,7 @@ pub struct CollectionDb {
 }
 
 impl CollectionDb {
-    /// Open (or create) a collection DB at the given path.
+    /// Open (or create) a collection DB at the given path with read-write access.
     pub fn open(name: impl Into<String>, db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -54,6 +54,32 @@ impl CollectionDb {
         schema::init(&conn, &name)?;
 
         Ok(Self { name, conn })
+    }
+
+    /// Open an existing collection DB immutable/read-only.
+    /// Uses `immutable=1` URI mode to bypass WAL/shm entirely — safe in read-only filesystems
+    /// and sandboxed environments where write access to the data directory is unavailable.
+    pub fn open_readonly(name: impl Into<String>, db_path: &Path) -> Result<Self> {
+        ensure_sqlite_vec();
+
+        // ! immutable=1 bypasses WAL read-mark writes (shm file) — required when the
+        // ! calling process lacks write access to the collections directory (e.g. sandbox).
+        let uri = format!(
+            "file://{}?immutable=1",
+            db_path.to_string_lossy().replace(' ', "%20")
+        );
+
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+
+        conn.execute_batch("PRAGMA cache_size = -64000;")?;
+
+        Ok(Self {
+            name: name.into(),
+            conn,
+        })
     }
 
     pub fn conn(&self) -> &Connection {
