@@ -1,5 +1,5 @@
 // Qwen3-Reranker 0.6B cross-encoder scoring.
-// Format: "Query: {query}\nDocument: {doc}\nRelevant:"
+// Format: ChatML with system instruction + <Instruct>/<Query>/<Document> tags.
 // Scores by softmax of logits for "Yes" vs "No" tokens at the last position.
 //
 // Cache key: sha256(query + "\0" + doc_hash) → cached f64 score
@@ -64,7 +64,18 @@ impl Reranker {
             doc
         };
 
-        let prompt = format!("Query: {query}\nDocument: {doc_truncated}\nRelevant:");
+        let prompt = format!(
+            "<|im_start|>system\n\
+             Judge whether the Document meets the requirements based on the Query and the Instruct provided. \
+             Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n\
+             <|im_start|>user\n\
+             <Instruct>: Given a web search query, retrieve relevant passages that answer the query\n\
+             <Query>: {query}\n\
+             <Document>: {doc_truncated}<|im_end|>\n\
+             <|im_start|>assistant\n\
+             <think>\n\
+             </think>\n"
+        );
 
         let n_threads = std::thread::available_parallelism()
             .map(|n| n.get() as i32)
@@ -83,7 +94,7 @@ impl Reranker {
 
         let tokens = self
             .model
-            .str_to_token(&prompt, AddBos::Always)
+            .str_to_token(&prompt, AddBos::Never) // ! ChatML starts with <|im_start|>; extra BOS confuses model
             .map_err(|e| Error::Other(format!("tokenize: {e}")))?;
 
         if tokens.is_empty() {

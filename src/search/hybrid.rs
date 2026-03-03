@@ -1,7 +1,7 @@
 // Hybrid search pipeline:
 //   1. BM25 probe → strong-signal shortcut (skip expansion if top score ≥ 0.85, gap ≥ 0.15)
 //   2a. With query expander: lex/vec/hyde sub-queries → RRF fusion (k=60)
-//   2b. Without expander: score-based fusion (0.70·vec + 0.30·bm25) — empirically optimal
+//   2b. Without expander: score-based fusion (0.80·vec + 0.20·bm25) — empirically optimal
 //       on NFCorpus (nDCG@10: score-fusion 0.393 > vector-only 0.387 > RRF 0.372)
 //   3. LLM reranking (top 20) → final score = fused×0.4 + rerank×0.6
 //
@@ -180,6 +180,7 @@ fn bm25_across(dbs: &[CollectionDb], query: &str, limit: usize) -> Vec<SearchRes
                 fts_query: fts_query.clone(),
                 collection: &db.name,
                 limit,
+                title_weight: None,
             };
             fts::search(db.conn(), &q).unwrap_or_else(|e| {
                 eprintln!("warn: bm25 search on '{}' failed: {e}", db.name);

@@ -6,6 +6,7 @@ use crate::error::Result;
 use crate::llm::to_bytes;
 use crate::types::SearchResult;
 use rusqlite::Connection;
+use std::collections::HashMap;
 
 pub struct VecSearchResult {
     pub hash_seq: String, // "{hash}_{seq}"
@@ -37,6 +38,9 @@ pub fn mark_embedded(conn: &Connection, hash: &str, seq: i64, pos: i64, model: &
     Ok(())
 }
 
+// sqlite-vec enforces a hard kNN limit of 4096; exceeding it returns 0 rows silently.
+pub const KNN_MAX: usize = 4096;
+
 /// kNN search: find the `limit` closest vectors to `query_embedding`.
 /// Returns (hash_seq, distance) pairs sorted by distance asc.
 pub fn knn(
@@ -44,6 +48,7 @@ pub fn knn(
     query_embedding: &[f32],
     limit: usize,
 ) -> Result<Vec<VecSearchResult>> {
+    let k = limit.min(KNN_MAX);
     let blob = to_bytes(query_embedding);
     let sql = "
         SELECT hash_seq, distance
@@ -53,7 +58,7 @@ pub fn knn(
         ORDER BY distance
     ";
     let mut stmt = conn.prepare_cached(sql)?;
-    let rows = stmt.query_map(rusqlite::params![blob, limit as i64], |row| {
+    let rows = stmt.query_map(rusqlite::params![blob, k as i64], |row| {
         Ok(VecSearchResult {
             hash_seq: row.get(0)?,
             distance: row.get(1)?,
@@ -64,51 +69,66 @@ pub fn knn(
         .map_err(Into::into)
 }
 
-/// Full vector search: kNN → join documents → deduplicate by path.
+/// Full vector search: kNN → batch document lookup → deduplicate by path.
 pub fn search(
     conn: &Connection,
     query_embedding: &[f32],
     collection: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
-    // Over-fetch to deduplicate (multiple chunks per doc)
+    // Over-fetch to deduplicate (multiple chunks per doc).
     let raw = knn(conn, query_embedding, limit * 4)?;
     if raw.is_empty() {
         return Ok(vec![]);
     }
 
-    let mut results: Vec<SearchResult> = Vec::new();
-
+    // kNN results are sorted by distance asc; first occurrence of each hash is its best chunk.
+    let mut hash_order: Vec<(&str, f64)> = Vec::new();
+    let mut seen_hashes: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for r in &raw {
-        // hash_seq = "{hash}_{seq}"
         let hash = match r.hash_seq.rsplit_once('_') {
             Some((h, _)) => h,
             None => &r.hash_seq,
         };
+        if seen_hashes.insert(hash) {
+            hash_order.push((hash, r.distance));
+        }
+    }
 
-        // Look up the active document for this hash.
-        let row: Option<(String, String)> = conn
-            .query_row(
-                "SELECT d.path, d.title FROM documents d
-                  WHERE d.hash = ?1 AND d.active = 1
-                  LIMIT 1",
-                [hash],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .ok();
+    // Single query to fetch all document metadata for matched hashes.
+    let placeholders = hash_order.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT hash, path, title FROM documents WHERE hash IN ({placeholders}) AND active = 1"
+    );
+    let hashes: Vec<&str> = hash_order.iter().map(|(h, _)| *h).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let hash_meta: HashMap<String, (String, String)> = stmt
+        .query_map(rusqlite::params_from_iter(hashes.iter().copied()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
 
-        if let Some((path, title)) = row {
-            // Deduplicate: keep best (lowest distance) per path.
-            let score = 1.0 - r.distance; // cosine distance → similarity
-            if let Some(existing) = results.iter_mut().find(|x| x.path == path) {
-                if score > existing.score {
-                    existing.score = score;
+    // Build result list, deduplicating by path with O(1) lookup.
+    let mut results: Vec<SearchResult> = Vec::new();
+    let mut path_idx: HashMap<String, usize> = HashMap::new();
+
+    for (hash, distance) in &hash_order {
+        if let Some((path, title)) = hash_meta.get(*hash) {
+            let score = 1.0 - distance;
+            if let Some(&idx) = path_idx.get(path) {
+                if score > results[idx].score {
+                    results[idx].score = score;
                 }
             } else {
+                path_idx.insert(path.clone(), results.len());
                 results.push(SearchResult {
                     collection: collection.to_string(),
-                    path,
-                    title,
+                    path: path.clone(),
+                    title: title.clone(),
                     score,
                     snippet: None,
                     hash: hash.to_string(),
@@ -116,7 +136,6 @@ pub fn search(
                 });
             }
         }
-
         if results.len() >= limit {
             break;
         }

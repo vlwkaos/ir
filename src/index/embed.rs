@@ -61,10 +61,12 @@ pub fn embed(
                     .filter_map(|r| r.ok())
                     .collect()
             };
-            for seq in &seqs {
+            if !seqs.is_empty() {
+                let hash_seqs: Vec<String> = seqs.iter().map(|s| format!("{hash}_{s}")).collect();
+                let ph = hash_seqs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 conn.execute(
-                    "DELETE FROM vectors_vec WHERE hash_seq = ?1",
-                    [format!("{hash}_{seq}")],
+                    &format!("DELETE FROM vectors_vec WHERE hash_seq IN ({ph})"),
+                    rusqlite::params_from_iter(hash_seqs.iter().map(|s| s.as_str())),
                 )?;
             }
             conn.execute("DELETE FROM content_vectors WHERE hash = ?1", [hash])?;
@@ -140,7 +142,6 @@ fn load_all_active(conn: &Connection) -> Result<Vec<(String, String, String, Str
 
 /// Remove content_vectors (and their vectors) for hashes no longer in active documents.
 fn cleanup_orphaned(conn: &Connection) -> Result<()> {
-    // Find orphaned hashes in content_vectors.
     let orphaned: Vec<String> = {
         let sql = "
             SELECT DISTINCT cv.hash
@@ -155,22 +156,36 @@ fn cleanup_orphaned(conn: &Connection) -> Result<()> {
             .collect()
     };
 
-    for hash in &orphaned {
-        // Get seqs before deleting from content_vectors.
-        let seqs: Vec<i64> = {
-            let mut stmt = conn.prepare("SELECT seq FROM content_vectors WHERE hash = ?1")?;
-            stmt.query_map([hash], |r| r.get(0))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-        for seq in seqs {
-            conn.execute(
-                "DELETE FROM vectors_vec WHERE hash_seq = ?1",
-                [format!("{hash}_{seq}")],
-            )?;
-        }
-        conn.execute("DELETE FROM content_vectors WHERE hash = ?1", [hash])?;
+    if orphaned.is_empty() {
+        return Ok(());
     }
+
+    // Collect all hash_seqs to delete in one query.
+    let hash_seqs: Vec<String> = {
+        let ph = orphaned.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT hash, seq FROM content_vectors WHERE hash IN ({ph})");
+        let mut stmt = conn.prepare(&sql)?;
+        stmt.query_map(
+            rusqlite::params_from_iter(orphaned.iter().map(|s| s.as_str())),
+            |r| Ok(format!("{}_{}", r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )?
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    if !hash_seqs.is_empty() {
+        let ph = hash_seqs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        conn.execute(
+            &format!("DELETE FROM vectors_vec WHERE hash_seq IN ({ph})"),
+            rusqlite::params_from_iter(hash_seqs.iter().map(|s| s.as_str())),
+        )?;
+    }
+
+    let ph = orphaned.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    conn.execute(
+        &format!("DELETE FROM content_vectors WHERE hash IN ({ph})"),
+        rusqlite::params_from_iter(orphaned.iter().map(|s| s.as_str())),
+    )?;
 
     Ok(())
 }

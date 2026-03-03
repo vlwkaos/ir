@@ -42,7 +42,7 @@ fn run() -> Result<()> {
         } => handle_search(
             query.join(" "),
             mode,
-            if all { 100_000 } else { limit },
+            if all { crate::db::vectors::KNN_MAX } else { limit },
             min_score,
             collections,
             full,

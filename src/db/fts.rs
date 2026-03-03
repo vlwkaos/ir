@@ -83,6 +83,8 @@ pub struct BM25Query<'a> {
     pub fts_query: String,
     pub collection: &'a str,
     pub limit: usize,
+    /// Override title column weight in bm25(). None = use default (1.0).
+    pub title_weight: Option<f64>,
 }
 
 #[cfg(test)]
@@ -153,19 +155,41 @@ pub fn search(conn: &Connection, q: &BM25Query) -> Result<Vec<SearchResult>> {
         return Ok(vec![]);
     }
 
-    // filepath weighted 10x higher than body, per qmd's bm25(documents_fts, 10.0, 1.0, 1.0)
-    let sql = "
-        SELECT d.path, d.title, bm25(documents_fts, 10.0, 1.0, 1.0) AS score,
+    // ! FTS5 bm25() args must be SQL literals — dynamic SQL required for non-default title_weight.
+    if let Some(tw) = q.title_weight {
+        let sql = format!(
+            "SELECT d.path, d.title, bm25(documents_fts, 10.0, {tw}, 1.0) AS score,
                d.hash, snippet(documents_fts, 2, '<b>', '</b>', '...', 32) AS snip
         FROM documents_fts
         JOIN documents d ON documents_fts.rowid = d.id
         WHERE documents_fts MATCH ?1
           AND d.active = 1
         ORDER BY score ASC
-        LIMIT ?2
-    ";
+        LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        return collect_search_rows(&mut stmt, fts, q);
+    }
 
-    let mut stmt = conn.prepare_cached(sql)?;
+    // filepath weighted 10x higher than body, title 1x.
+    let mut stmt = conn.prepare_cached(
+        "SELECT d.path, d.title, bm25(documents_fts, 10.0, 1.0, 1.0) AS score,
+               d.hash, snippet(documents_fts, 2, '<b>', '</b>', '...', 32) AS snip
+        FROM documents_fts
+        JOIN documents d ON documents_fts.rowid = d.id
+        WHERE documents_fts MATCH ?1
+          AND d.active = 1
+        ORDER BY score ASC
+        LIMIT ?2",
+    )?;
+    collect_search_rows(&mut stmt, fts, q)
+}
+
+fn collect_search_rows(
+    stmt: &mut rusqlite::Statement<'_>,
+    fts: &str,
+    q: &BM25Query<'_>,
+) -> Result<Vec<SearchResult>> {
     let rows = stmt.query_map(rusqlite::params![fts, q.limit as i64], |row| {
         Ok((
             row.get::<_, String>(0)?,

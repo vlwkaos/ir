@@ -67,6 +67,8 @@ struct Args {
     chunk_size_tokens: Option<usize>,
     max_docs: Option<usize>,
     max_queries: Option<usize>,
+    rrf_no_expander: bool,
+    title_weight: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -105,6 +107,8 @@ fn parse_args() -> Args {
     let mut chunk_size_tokens: Option<usize> = None;
     let mut max_docs: Option<usize> = None;
     let mut max_queries: Option<usize> = None;
+    let mut rrf_no_expander = false;
+    let mut title_weight = 1.0f64;
 
     let mut i = 1;
     while i < args.len() {
@@ -279,6 +283,15 @@ fn parse_args() -> Args {
                     max_queries = Some(args[i].parse().expect("--max-queries must be a number"));
                 }
             }
+            "--rrf-no-expander" => {
+                rrf_no_expander = true;
+            }
+            "--title-weight" => {
+                i += 1;
+                if i < args.len() {
+                    title_weight = args[i].parse().expect("--title-weight must be a number");
+                }
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: eval [--data DIR] [--limit K] [--mode bm25|vector|hybrid|all] \
@@ -288,7 +301,8 @@ fn parse_args() -> Args {
                      [--expander] [--expander-fusion rrf|score] [--rrf-k K] \
                      [--rrf-lex-weight W] [--rrf-vec-weight W] [--rrf-hyde-weight W] \
                      [--prf] [--prf-weight W] [--prf-docs N] [--prf-terms N] \
-                     [--tune-alpha] [--tune-rerank] [--chunk-size TOKENS] [--max-docs N] [--max-queries N]"
+                     [--tune-alpha] [--tune-rerank] [--chunk-size TOKENS] [--max-docs N] [--max-queries N] \
+                     [--rrf-no-expander] [--title-weight W]"
                 );
                 std::process::exit(0);
             }
@@ -324,6 +338,8 @@ fn parse_args() -> Args {
         chunk_size_tokens,
         max_docs,
         max_queries,
+        rrf_no_expander,
+        title_weight,
     }
 }
 
@@ -484,16 +500,18 @@ fn ensure_vector_dimension(conn: &Connection, dim: usize) -> Result<()> {
 }
 
 fn embed_corpus(conn: &Connection, docs: &[CorpusDoc], embedder: &Embedder) -> Result<()> {
-    let total = docs.len();
-    for (i, doc) in docs.iter().enumerate() {
-        let done = i + 1;
-        if done % 100 == 0 || done == total {
-            println!("  embedding {done}/{total}");
-        }
+    // Collect all pending docs first, then embed in a single batch (one Metal context).
+    // ! Per-doc batching creates/destroys thousands of GPU contexts and exhausts the Metal heap.
+    struct PendingDoc {
+        hash: String,
+        title: String,
+        chunks: Vec<ir::index::chunker::Chunk>,
+    }
 
+    let mut pending: Vec<PendingDoc> = Vec::new();
+    for doc in docs {
         let text = doc_text(doc);
         let hash = hasher::hash_bytes(format!("{}:{}", doc.id, text).as_bytes());
-
         let already: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM content_vectors WHERE hash = ?1",
@@ -504,19 +522,37 @@ fn embed_corpus(conn: &Connection, docs: &[CorpusDoc], embedder: &Embedder) -> R
         if already > 0 {
             continue;
         }
+        pending.push(PendingDoc {
+            hash,
+            title: doc.title.clone(),
+            chunks: chunker::chunk_document(&text),
+        });
+    }
 
-        let chunks = chunker::chunk_document(&text);
-        let inputs: Vec<(String, String)> = chunks
-            .iter()
-            .map(|chunk| (doc.title.clone(), chunk.text.clone()))
-            .collect();
-        let embeddings = embedder.embed_doc_batch(&inputs)?;
-        for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
-            let hash_seq = format!("{hash}_{}", chunk.seq);
+    if pending.is_empty() {
+        println!("  all embeddings cached");
+        return Ok(());
+    }
+
+    let total_chunks: usize = pending.iter().map(|d| d.chunks.len()).sum();
+    println!("  embedding {} chunks from {} documents...", total_chunks, pending.len());
+
+    let inputs: Vec<(String, String)> = pending
+        .iter()
+        .flat_map(|d| d.chunks.iter().map(|c| (d.title.clone(), c.text.clone())))
+        .collect();
+
+    let all_embeddings = embedder.embed_doc_batch(&inputs)?;
+
+    let mut emb_iter = all_embeddings.iter();
+    for doc in &pending {
+        for chunk in &doc.chunks {
+            let emb = emb_iter.next().expect("embedding count mismatch");
+            let hash_seq = format!("{}_{}", doc.hash, chunk.seq);
             vectors::insert(conn, &hash_seq, emb)?;
             vectors::mark_embedded(
                 conn,
-                &hash,
+                &doc.hash,
                 chunk.seq as i64,
                 chunk.pos as i64,
                 models::EMBEDDING,
@@ -566,7 +602,7 @@ fn dcg(ranked: &[String], relevant: &HashMap<String, u32>, k: usize) -> f64 {
         .enumerate()
         .map(|(i, doc_id)| {
             let rel = *relevant.get(doc_id).unwrap_or(&0) as f64;
-            rel / (i as f64 + 2.0).log2()
+            (2.0_f64.powf(rel) - 1.0) / (i as f64 + 2.0).log2()
         })
         .sum()
 }
@@ -578,7 +614,7 @@ fn ideal_dcg(relevant: &HashMap<String, u32>, k: usize) -> f64 {
         .iter()
         .take(k)
         .enumerate()
-        .map(|(i, &rel)| rel / (i as f64 + 2.0).log2())
+        .map(|(i, &rel)| (2.0_f64.powf(rel) - 1.0) / (i as f64 + 2.0).log2())
         .sum()
 }
 
@@ -596,15 +632,16 @@ fn recall_at_k(ranked: &[String], relevant: &HashMap<String, u32>, k: usize) -> 
 
 // ── Search ────────────────────────────────────────────────────────────────────
 
-fn bm25_search(conn: &Connection, query: &str, limit: usize) -> Vec<SearchResult> {
+fn bm25_search(conn: &Connection, query: &str, limit: usize, title_weight: f64) -> Vec<SearchResult> {
     let fts_query = fts::build_query(query);
     if fts_query.is_empty() {
         return vec![];
     }
     let q = fts::BM25Query {
         fts_query,
-        collection: "nfcorpus",
+        collection: "eval",
         limit,
+        title_weight: if title_weight == 1.0 { None } else { Some(title_weight) },
     };
     fts::search(conn, &q).unwrap_or_default()
 }
@@ -614,7 +651,7 @@ fn vector_search_from_embedding(
     embedding: &[f32],
     limit: usize,
 ) -> Vec<SearchResult> {
-    vectors::search(conn, embedding, "nfcorpus", limit).unwrap_or_default()
+    vectors::search(conn, embedding, "eval", limit).unwrap_or_default()
 }
 
 const DEFAULT_SCORE_FUSION_ALPHA: f64 = 0.80;
@@ -653,6 +690,8 @@ struct HybridConfig {
     rrf_k: f64,
     rrf_weights: RrfWeights,
     prf: Option<PrfConfig>,
+    rrf_no_expander: bool,
+    title_weight: f64,
 }
 
 struct HybridRun {
@@ -675,7 +714,7 @@ fn hybrid_search(
     cfg: &HybridConfig,
 ) -> HybridRun {
     let fetch_n = limit * 3;
-    let bm25_results = bm25_search(conn, query, fetch_n);
+    let bm25_results = bm25_search(conn, query, fetch_n, cfg.title_weight);
     let vec_results = vector_search_from_embedding(conn, query_embedding, fetch_n);
 
     let alpha = if cfg.adaptive_alpha {
@@ -703,9 +742,27 @@ fn hybrid_search(
                 &bm25_results,
                 &vec_results,
             )
+        } else if cfg.rrf_no_expander {
+            rrf_fuse_weighted(
+                &[
+                    (vec_results.clone(), cfg.rrf_weights.vec),
+                    (bm25_results.clone(), cfg.rrf_weights.lex),
+                ],
+                cfg.rrf_k,
+                limit,
+            )
         } else {
             score_fusion_from_lists(&bm25_results, &vec_results, limit, alpha)
         }
+    } else if cfg.rrf_no_expander {
+        rrf_fuse_weighted(
+            &[
+                (vec_results.clone(), cfg.rrf_weights.vec),
+                (bm25_results.clone(), cfg.rrf_weights.lex),
+            ],
+            cfg.rrf_k,
+            limit,
+        )
     } else {
         score_fusion_from_lists(&bm25_results, &vec_results, limit, alpha)
     };
@@ -777,7 +834,7 @@ fn expanded_fusion(
                 };
 
                 let results = match sub.kind {
-                    SubQueryKind::Lex => bm25_search(conn, &sub.text, fetch_n),
+                    SubQueryKind::Lex => bm25_search(conn, &sub.text, fetch_n, cfg.title_weight),
                     SubQueryKind::Vec | SubQueryKind::Hyde => {
                         if let Ok(embedding) = embedder.embed_query(&sub.text) {
                             vector_search_from_embedding(conn, &embedding, fetch_n)
@@ -809,7 +866,7 @@ fn expanded_fusion(
                 };
                 match sub.kind {
                     SubQueryKind::Lex => {
-                        let mut results = bm25_search(conn, &sub.text, fetch_n);
+                        let mut results = bm25_search(conn, &sub.text, fetch_n, cfg.title_weight);
                         results.iter_mut().for_each(|r| r.score *= weight);
                         bm25_pool.extend(results);
                     }
@@ -1095,7 +1152,7 @@ fn apply_prf(
         return base_results.to_vec();
     };
 
-    let prf_results = bm25_search(conn, &expanded_query, limit * 3);
+    let prf_results = bm25_search(conn, &expanded_query, limit * 3, 1.0);
     let primary_weight = (1.0 - prf.weight).clamp(0.0, 1.0);
     let secondary_weight = prf.weight.clamp(0.0, 1.0);
     fuse_linear(
@@ -1191,7 +1248,7 @@ fn evaluate_bm25(conn: &Connection, queries: &[Query], qrels: &Qrels, k: usize) 
         let Some(relevant) = qrels.get(&q.id) else {
             continue;
         };
-        let results = bm25_search(conn, &q.text, k);
+        let results = bm25_search(conn, &q.text, k, 1.0);
         let ranked: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
         total_ndcg += ndcg_at_k(&ranked, relevant, k);
         total_recall += recall_at_k(&ranked, relevant, k);
@@ -1471,6 +1528,20 @@ fn main() -> Result<()> {
         )));
     }
 
+    let corpus_name = args
+        .data_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("corpus")
+        .to_string();
+
+    // If cache_db was not explicitly set, derive from corpus name.
+    let cache_db = if args.cache_db == PathBuf::from("test-data/nfcorpus-eval.sqlite") {
+        PathBuf::from(format!("test-data/{corpus_name}-eval.sqlite"))
+    } else {
+        args.cache_db.clone()
+    };
+
     let corpus_path = args.data_dir.join("corpus.jsonl");
     let queries_path = args.data_dir.join("queries.jsonl");
     let qrels_path = args.data_dir.join("qrels/test.tsv");
@@ -1479,11 +1550,8 @@ fn main() -> Result<()> {
         if !p.exists() {
             eprintln!(
                 "error: {} not found.\n\
-                 Download with:\n  \
-                 mkdir -p test-data && \\\n  \
-                 curl -L https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/nfcorpus.zip \
-                 -o test-data/nfcorpus.zip && \\\n  \
-                 cd test-data && unzip nfcorpus.zip",
+                 Download BEIR datasets from:\n  \
+                 https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/",
                 p.display()
             );
             std::process::exit(1);
@@ -1520,7 +1588,7 @@ fn main() -> Result<()> {
         chunker::set_chunk_size_tokens_override(Some(chunk_size));
         println!("chunk size override: {chunk_size} tokens");
     }
-    println!("cache DB: {}", args.cache_db.display());
+    println!("cache DB: {}", cache_db.display());
     if let Some(pooling) = args.pooling {
         println!("embedding pooling override: {:?}", pooling);
     }
@@ -1557,19 +1625,19 @@ fn main() -> Result<()> {
     }
     println!();
 
-    println!("indexing corpus into cache DB...");
+    println!("indexing corpus into cache DB ({})...", cache_db.display());
     ir::db::ensure_sqlite_vec();
-    if let Some(parent) = args.cache_db.parent() {
+    if let Some(parent) = cache_db.parent() {
         std::fs::create_dir_all(parent).map_err(Error::Io)?;
     }
-    let conn = Connection::open(&args.cache_db)?;
+    let conn = Connection::open(&cache_db)?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous  = NORMAL;
          PRAGMA cache_size   = -64000;
          PRAGMA foreign_keys = ON;",
     )?;
-    schema::init(&conn, "nfcorpus")?;
+    schema::init(&conn, &corpus_name)?;
     index_corpus(&conn, &corpus)?;
     println!("  done\n");
 
@@ -1682,6 +1750,8 @@ fn main() -> Result<()> {
         } else {
             None
         },
+        rrf_no_expander: args.rrf_no_expander,
+        title_weight: args.title_weight,
     };
 
     let k = args.limit;

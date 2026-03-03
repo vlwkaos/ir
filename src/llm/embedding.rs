@@ -2,6 +2,7 @@
 // EmbeddingGemma asymmetric format:
 //   query: "task: search result | query: {text}"
 //   doc:   "title: {title} | text: {text}"
+//   pooling: model default (mean — from GGUF metadata)
 // BGE-M3 dense mode:
 //   query: "Represent this sentence: {text}"
 //   doc:   raw text (no title/text prefix)
@@ -265,7 +266,8 @@ fn profile_for_model_path(model_path: &Path) -> EmbeddingProfile {
 
 fn default_pooling_for_profile(profile: EmbeddingProfile) -> Option<EmbeddingPooling> {
     match profile {
-        EmbeddingProfile::EmbeddingGemma => Some(EmbeddingPooling::Last),
+        // ! EmbeddingGemma GGUF metadata defaults to mean pooling — Last override breaks scores
+        EmbeddingProfile::EmbeddingGemma => None,
         EmbeddingProfile::BgeM3 => Some(EmbeddingPooling::Cls),
         EmbeddingProfile::Generic => None,
     }

@@ -1,4 +1,4 @@
-// Document chunker: 900-token chunks with 15% overlap and break-point scoring.
+// Document chunker: 512-token chunks with 15% overlap and break-point scoring.
 // Ported from qmd's chunkDocument() in store.ts.
 //
 // Token approximation: 4 chars ≈ 1 token (same as qmd).
@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const CHARS_PER_TOKEN: usize = 4;
-const DEFAULT_CHUNK_SIZE_TOKENS: usize = 900;
+const DEFAULT_CHUNK_SIZE_TOKENS: usize = 512;
 const CHUNK_OVERLAP_PERCENT: usize = 15;
 /// Window before the target end position in which to search for a break point.
 const BREAK_WINDOW_CHARS: usize = 800;
