@@ -173,26 +173,28 @@ def optimize_expander(lm, model_name: str, train_data, dev_data, resume: bool):
     log.info("[expand/%s] starting — %d train examples", model_name, len(train_data))
     t0 = time.time()
 
-    with dspy.context(lm=lm):
+    # Use ChatAdapter: small models don't reliably produce DSPy's JSON format,
+    # which causes MIPROv2's instruction-generation step to fail.
+    # BootstrapFewShot is simpler (no instruction-generation LLM calls) and
+    # works well with small models.
+    with dspy.context(lm=lm, adapter=dspy.ChatAdapter()):
         program = ExpanderProgram()
-        # auto="light" controls num_candidates+num_trials internally (DSPy 3.x);
-        # cannot combine with explicit num_trials/max_bootstrapped_demos
-        optimizer = dspy.MIPROv2(
+        optimizer = dspy.BootstrapFewShot(
             metric=expansion_format_metric,
-            num_threads=4,
-            auto="light",
+            max_bootstrapped_demos=3,
+            max_labeled_demos=3,
         )
-        log.info("[expand/%s] MIPROv2 compile — this will take several minutes", model_name)
+        log.info("[expand/%s] BootstrapFewShot compile...", model_name)
         optimized = optimizer.compile(program, trainset=train_data)
 
     optimized.save(str(out_path))
     log.info("[expand/%s] saved checkpoint → %s (%.0fs)", model_name, out_path, time.time() - t0)
 
-    with dspy.context(lm=lm):
-        log.info("[expand/%s] evaluating on %d dev examples...", model_name, min(50, len(dev_data)))
+    with dspy.context(lm=lm, adapter=dspy.ChatAdapter()):
+        log.info("[expand/%s] evaluating on %d dev examples...", model_name, min(10, len(dev_data)))
         scores = [
             expansion_format_metric(ex, optimized(query=ex.query))
-            for ex in dev_data[:50]
+            for ex in dev_data[:10]
         ]
     log.info("[expand/%s] dev format-score: %.1f%% (%d/%d)",
              model_name, 100 * sum(scores) / len(scores), sum(scores), len(scores))
@@ -212,7 +214,7 @@ def optimize_reranker(lm, model_name: str, train_data, dev_data, resume: bool):
     log.info("[rerank/%s] starting — %d train examples", model_name, len(train_data))
     t0 = time.time()
 
-    with dspy.context(lm=lm):
+    with dspy.context(lm=lm, adapter=dspy.ChatAdapter()):
         program = RerankerProgram()
         optimizer = dspy.BootstrapFewShot(
             metric=rerank_accuracy_metric,
@@ -225,11 +227,11 @@ def optimize_reranker(lm, model_name: str, train_data, dev_data, resume: bool):
     optimized.save(str(out_path))
     log.info("[rerank/%s] saved checkpoint → %s (%.0fs)", model_name, out_path, time.time() - t0)
 
-    with dspy.context(lm=lm):
-        log.info("[rerank/%s] evaluating on %d dev examples...", model_name, min(50, len(dev_data)))
+    with dspy.context(lm=lm, adapter=dspy.ChatAdapter()):
+        log.info("[rerank/%s] evaluating on %d dev examples...", model_name, min(10, len(dev_data)))
         scores = [
             rerank_accuracy_metric(ex, optimized(query=ex.query, document=ex.document))
-            for ex in dev_data[:50]
+            for ex in dev_data[:10]
         ]
     log.info("[rerank/%s] dev accuracy: %.1f%% (%d/%d)",
              model_name, 100 * sum(scores) / len(scores), sum(scores), len(scores))
@@ -291,7 +293,11 @@ def main():
         model_id, model_name = models[model_key]
         log.info("─── model: %s ───", model_id)
 
-        lm = dspy.LM(model_id, api_base="http://localhost:11434", temperature=0.7)
+        # ! timeout=60s per call — qwen3.5 thinking mode generates unlimited tokens without it
+        # think=False disables Qwen3.5 reasoning mode via Ollama's options API
+        lm = dspy.LM(model_id, api_base="http://localhost:11434", temperature=0.7,
+                     timeout=60, max_tokens=256,
+                     think=False)
 
         # Smoke-test: verify model is listed in ollama before a long run
         import urllib.request

@@ -102,10 +102,49 @@ IR_QWEN_MODEL=~/local-models/Qwen3.5-2B-Q4_K_M.gguf \
 
 ### Results
 
-_To be filled after Phase 2 + benchmark runs._
+Benchmark runs B and C completed (Phase 2 / DSPy skipped — Rust integration tested directly).
+
+#### NFCorpus (3,633 docs · 323 queries)
 
 | Run | nDCG@10 | vs baseline | Notes |
 |-----|---------|-------------|-------|
-| A (baseline) | 0.4032 | — | |
-| B (0.8B) | — | — | |
-| C (2B) | — | — | |
+| A (baseline) | 0.4032 | — | qmd-1.7B + Qwen3-Reranker-0.6B |
+| B (0.8B) | 0.3959 | −0.0073 (−1.8%) | Qwen3.5-0.8B-Q8_0, unified |
+| C (2B) | 0.3956 | −0.0076 (−1.9%) | Qwen3.5-2B-Q4_K_M, unified |
+
+#### SciFact (5,183 docs · 300 queries)
+
+| Run | nDCG@10 | vs baseline | Notes |
+|-----|---------|-------------|-------|
+| A (baseline) | 0.7873 | — | |
+| B (0.8B) | 0.7873 | 0 | identical — dataset near ceiling |
+| C (2B) | 0.7873 | 0 | identical |
+
+**Decision: keep current trio** (qmd-1.7B + Qwen3-Reranker-0.6B). Neither Qwen3.5 size
+matches baseline on NFCorpus. SciFact is too easy to discriminate models (vector alone: 0.785).
+
+Notable: 2B shows no improvement over 0.8B despite 2× size — reranking quality is not the
+bottleneck; expansion quality or BM25 probe threshold matters more.
+
+---
+
+## Daemon mode
+
+**Problem**: `ir search` cold-starts 3–7s per query due to model loading every invocation
+(embedder 300M + expander 1.7B + reranker 0.6B = ~2.3B params, no cross-invocation caching).
+
+**Solution**: `ir daemon start` — loads trio once with Metal, listens on Unix socket
+(`~/.config/ir/daemon.sock`). `ir search` auto-detects and routes through daemon; falls back
+to direct on connection failure.
+
+```bash
+ir daemon start      # foreground; models loaded once, Metal enabled
+ir daemon status
+ir daemon stop
+ir search "query" -c kgeditor   # auto-routes through daemon if running
+```
+
+**DB handling**: daemon opens fresh WAL read-only connections per query (not `immutable=1`),
+so live `ir index` / `ir embed` updates are visible immediately without restart.
+
+**Model stack**: trio (nDCG@10=0.4032), Metal on by default (macOS). Override: `IR_GPU_LAYERS=0`.
