@@ -1,5 +1,6 @@
 /target
 /test-data/
+/logs/
 
 # Research artifacts — generated data, optimizer outputs, downloaded datasets
 research/artifacts/
