@@ -1,7 +1,10 @@
 [package]
 name = "ir"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
+description = "Local markdown semantic search with hybrid BM25+vector retrieval and LLM reranking"
+license = "MIT"
+repository = "https://github.com/vlwkaos/ir"
 
 [features]
 default = ["llama-metal", "llama-openmp"]
