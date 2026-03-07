@@ -21,16 +21,16 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use ir::db::{fts, schema, vectors};
-use ir::error::{Error, Result};
-use ir::index::{chunker, hasher};
-use ir::llm::{
+use ir_search::db::{fts, schema, vectors};
+use ir_search::error::{Error, Result};
+use ir_search::index::{chunker, hasher};
+use ir_search::llm::{
     embedding::{Embedder, EmbeddingPooling},
     expander::{Expander, SubQueryKind},
     models,
     reranker::Reranker,
 };
-use ir::types::SearchResult;
+use ir_search::types::SearchResult;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -560,7 +560,7 @@ fn embed_corpus(conn: &Connection, docs: &[CorpusDoc], embedder: &Embedder) -> R
     struct PendingDoc {
         hash: String,
         title: String,
-        chunks: Vec<ir::index::chunker::Chunk>,
+        chunks: Vec<ir_search::index::chunker::Chunk>,
     }
 
     let mut pending: Vec<PendingDoc> = Vec::new();
@@ -922,7 +922,7 @@ fn expanded_fusion(
 ) -> Vec<SearchResult> {
     let sub_queries = expander
         .expand(query)
-        .unwrap_or_else(|_| ir::llm::expander::fallback(query));
+        .unwrap_or_else(|_| ir_search::llm::expander::fallback(query));
     let fetch_n = limit * 3;
 
     match cfg.expander_fusion {
@@ -1821,7 +1821,7 @@ fn main() -> Result<()> {
     println!();
 
     println!("indexing corpus into cache DB ({})...", cache_db.display());
-    ir::db::ensure_sqlite_vec();
+    ir_search::db::ensure_sqlite_vec();
     if let Some(parent) = cache_db.parent() {
         std::fs::create_dir_all(parent).map_err(Error::Io)?;
     }
