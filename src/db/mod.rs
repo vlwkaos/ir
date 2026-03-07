@@ -66,55 +66,6 @@ impl CollectionDb {
         Ok(Self { name, conn })
     }
 
-    /// Open an existing collection DB immutable/read-only.
-    /// Uses `immutable=1` URI mode to bypass WAL/shm entirely — safe in read-only filesystems
-    /// and sandboxed environments where write access to the data directory is unavailable.
-    pub fn open_readonly(name: impl Into<String>, db_path: &Path) -> Result<Self> {
-        ensure_sqlite_vec();
-
-        // ! immutable=1 bypasses WAL read-mark writes (shm file) — required when the
-        // ! calling process lacks write access to the collections directory (e.g. sandbox).
-        let uri = format!(
-            "file://{}?immutable=1",
-            uri_encode_path(&db_path.to_string_lossy())
-        );
-
-        let conn = Connection::open_with_flags(
-            uri,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )?;
-
-        conn.execute_batch("PRAGMA cache_size = -64000;")?;
-
-        Ok(Self {
-            name: name.into(),
-            conn,
-        })
-    }
-
-    /// Open an existing collection DB as WAL read-only.
-    /// Unlike `open_readonly`, this does NOT use `immutable=1`, so it sees live writes
-    /// from concurrent indexers. Use this in long-running processes (e.g. daemon) where
-    /// write access to the collections directory is available.
-    pub fn open_wal_readonly(name: impl Into<String>, db_path: &Path) -> Result<Self> {
-        ensure_sqlite_vec();
-
-        let conn = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA cache_size   = -64000;",
-        )?;
-
-        Ok(Self {
-            name: name.into(),
-            conn,
-        })
-    }
-
     /// Open an existing collection DB with read-write access (no schema init).
     /// Use for search paths that need cache writes.
     pub fn open_rw(name: impl Into<String>, db_path: &Path) -> Result<Self> {
@@ -195,20 +146,6 @@ pub fn put_rerank_scores(conn: &Connection, entries: &[(String, f64)]) {
     let _ = tx.commit();
 }
 
-/// Percent-encode characters that break SQLite URI parsing: `%`, `?`, `#`, and space.
-fn uri_encode_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len() + 8);
-    for b in path.bytes() {
-        match b {
-            b'%' => out.push_str("%25"),
-            b'?' => out.push_str("%3F"),
-            b'#' => out.push_str("%23"),
-            b' ' => out.push_str("%20"),
-            _ => out.push(b as char),
-        }
-    }
-    out
-}
 
 fn configure(conn: &Connection) -> Result<()> {
     conn.execute_batch(
