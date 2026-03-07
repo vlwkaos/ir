@@ -1,5 +1,5 @@
 // Hybrid search pipeline:
-//   1. BM25 probe → strong-signal shortcut (skip expansion if top score ≥ 0.85, gap ≥ 0.15)
+//   1. BM25 probe → strong-signal shortcut (skip expansion if top score ≥ 0.85, gap ≥ 0.10)
 //   2a. With query expander: lex/vec/hyde sub-queries → RRF fusion (k=60)
 //   2b. Without expander: score-based fusion (0.80·vec + 0.20·bm25) — empirically optimal
 //       on NFCorpus (nDCG@10: score-fusion 0.393 > vector-only 0.387 > RRF 0.372)
@@ -20,32 +20,39 @@ use crate::search::rrf::{self, RankedList};
 use crate::types::SearchResult;
 use rusqlite::Connection;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::time::Instant;
-
-fn timing_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("IR_TIMING")
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
-fn emit_timing(stage: &str, duration: std::time::Duration) {
-    if timing_enabled() {
-        eprintln!("[timing] {:<14} {}ms", stage, duration.as_millis());
-    }
-}
 
 pub struct HybridRequest<'a> {
     pub query: &'a str,
     pub limit: usize,
     pub min_score: Option<f64>,
+    pub verbose: bool,
+}
+
+pub struct SearchOutput {
+    pub results: Vec<SearchResult>,
+    /// Pipeline log: always contains decision messages; timing lines only when verbose=true.
+    pub log: Vec<String>,
+}
+
+/// Collects pipeline log lines; timing lines gated on verbose flag.
+struct Logger {
+    log: Vec<String>,
+    verbose: bool,
+}
+
+impl Logger {
+    fn new(verbose: bool) -> Self {
+        Self { log: Vec::new(), verbose }
+    }
+    fn info(&mut self, msg: impl Into<String>) {
+        self.log.push(msg.into());
+    }
+    fn timing(&mut self, stage: &str, d: std::time::Duration) {
+        if self.verbose {
+            self.log.push(format!("[timing] {:<14} {}ms", stage, d.as_millis()));
+        }
+    }
 }
 
 pub struct HybridSearch {
@@ -61,19 +68,23 @@ pub struct HybridSearch {
 const SCORE_FUSION_VEC_ALPHA: f64 = 0.80;
 
 impl HybridSearch {
-    pub fn search(&self, dbs: &[CollectionDb], req: &HybridRequest) -> Result<Vec<SearchResult>> {
+    pub fn search(&self, dbs: &[CollectionDb], req: &HybridRequest) -> Result<SearchOutput> {
+        let mut log = Logger::new(req.verbose);
         let t_total = Instant::now();
 
         // 1. BM25 probe for strong-signal shortcut.
         let t0 = Instant::now();
         let probe_results = bm25_across(dbs, req.query, req.limit)?;
-        emit_timing("bm25_probe", t0.elapsed());
+        log.timing("bm25_probe", t0.elapsed());
 
         if is_strong_signal(&probe_results) {
             let top = probe_results.first().map(|r| r.score).unwrap_or(0.0);
-            eprintln!("Strong BM25 signal ({top:.2}) — skipping expansion");
-            emit_timing("total", t_total.elapsed());
-            return Ok(apply_min_score(probe_results, req.min_score, req.limit));
+            log.info(format!("Strong BM25 signal ({top:.2}) — skipping expansion"));
+            log.timing("total", t_total.elapsed());
+            return Ok(SearchOutput {
+                results: apply_min_score(probe_results, req.min_score, req.limit),
+                log: log.log,
+            });
         }
 
         // 2. Fuse: expander → RRF; else score-fusion.
@@ -82,15 +93,15 @@ impl HybridSearch {
             let cached = self.expander_cache.as_ref()
                 .and_then(|c| c.get(exp.model_id(), req.query));
             let subs = if let Some(subs) = cached {
-                eprintln!("Expanding query (cached)...");
-                emit_timing("expand", t0.elapsed());
+                log.info("Expanding query (cached)...");
+                log.timing("expand", t0.elapsed());
                 subs
             } else {
-                eprintln!("Expanding query...");
+                log.info("Expanding query...");
                 let subs = exp
                     .expand_query(req.query)
                     .unwrap_or_else(|_| fallback(req.query));
-                emit_timing("expand", t0.elapsed());
+                log.timing("expand", t0.elapsed());
                 if let Some(cache) = &self.expander_cache {
                     cache.put(exp.model_id(), req.query, &subs);
                 }
@@ -99,33 +110,36 @@ impl HybridSearch {
 
             let n_vec = subs.iter().filter(|s| matches!(s.kind, SubQueryKind::Vec | SubQueryKind::Hyde)).count();
             let n_lex = subs.iter().filter(|s| s.kind == SubQueryKind::Lex).count();
-            eprintln!("Searching {} sub-queries ({} lex, {} vec/hyde)...", subs.len(), n_lex, n_vec);
+            log.info(format!("Searching {} sub-queries ({} lex, {} vec/hyde)...", subs.len(), n_lex, n_vec));
 
-            rrf_from_subqueries(dbs, &self.embedder, &subs, req, probe_results)?
+            rrf_from_subqueries(dbs, &self.embedder, &subs, req, probe_results, &mut log)?
         } else {
-            eprintln!("Score fusion (no expander)...");
-            score_fusion_two_list(dbs, &self.embedder, req)?
+            log.info("Score fusion (no expander)...");
+            score_fusion_two_list(dbs, &self.embedder, req, &mut log)?
         };
 
         if fused.is_empty() {
-            emit_timing("total", t_total.elapsed());
-            return Ok(vec![]);
+            log.timing("total", t_total.elapsed());
+            return Ok(SearchOutput { results: vec![], log: log.log });
         }
 
         // 3. Rerank top-20 if scorer available.
         let final_results = if let Some(scorer) = &self.scorer {
             let n = fused.len().min(20);
-            eprintln!("Reranking {n} chunks...");
+            log.info(format!("Reranking {n} chunks..."));
             let t0 = Instant::now();
-            let result = rerank(scorer.as_ref(), req.query, fused, dbs, req.limit)?;
-            emit_timing("rerank", t0.elapsed());
+            let result = rerank(scorer.as_ref(), req.query, fused, dbs, req.limit, &mut log)?;
+            log.timing("rerank", t0.elapsed());
             result
         } else {
             fused
         };
 
-        emit_timing("total", t_total.elapsed());
-        Ok(apply_min_score(final_results, req.min_score, req.limit))
+        log.timing("total", t_total.elapsed());
+        Ok(SearchOutput {
+            results: apply_min_score(final_results, req.min_score, req.limit),
+            log: log.log,
+        })
     }
 }
 
@@ -137,15 +151,16 @@ fn score_fusion_two_list(
     dbs: &[CollectionDb],
     embedder: &Embedder,
     req: &HybridRequest,
+    log: &mut Logger,
 ) -> Result<Vec<SearchResult>> {
     let fetch_n = req.limit * 3;
     let bm25_list = bm25_across(dbs, req.query, fetch_n)?;
     let t0 = Instant::now();
     let emb = embedder.embed_query(req.query)?;
-    emit_timing("embed", t0.elapsed());
+    log.timing("embed", t0.elapsed());
     let t0 = Instant::now();
     let vec_list = vec_across(dbs, &emb, fetch_n)?;
-    emit_timing("knn", t0.elapsed());
+    log.timing("knn", t0.elapsed());
 
     // Union of both lists keyed by (collection, path).
     let mut scores: HashMap<(String, String), (f64, f64, SearchResult)> = HashMap::new();
@@ -174,7 +189,7 @@ fn score_fusion_two_list(
 
     SearchResult::sort_desc(&mut merged);
     merged.truncate(req.limit * 2);
-    emit_timing("fusion", t0.elapsed());
+    log.timing("fusion", t0.elapsed());
     Ok(merged)
 }
 
@@ -187,6 +202,7 @@ fn rrf_from_subqueries(
     sub_queries: &[SubQuery],
     req: &HybridRequest,
     probe_results: Vec<SearchResult>,
+    log: &mut Logger,
 ) -> Result<Vec<SearchResult>> {
     let mut ranked_lists: Vec<RankedList> = Vec::new();
 
@@ -225,7 +241,7 @@ fn rrf_from_subqueries(
 
         let t0 = Instant::now();
         let embeddings = embedder.embed_query_batch(&texts)?;
-        emit_timing("embed", t0.elapsed());
+        log.timing("embed", t0.elapsed());
 
         let t0 = Instant::now();
         for (emb, &(_, weight)) in embeddings.iter().zip(&vec_subs) {
@@ -234,7 +250,7 @@ fn rrf_from_subqueries(
                 ranked_lists.push(RankedList { results, weight });
             }
         }
-        emit_timing("knn", t0.elapsed());
+        log.timing("knn", t0.elapsed());
     }
 
     // Include probe only if no lex sub-query was generated (guards against double-counting).
@@ -252,7 +268,7 @@ fn rrf_from_subqueries(
 
     let t0 = Instant::now();
     let result = rrf::fuse(&ranked_lists, req.limit * 2);
-    emit_timing("fusion", t0.elapsed());
+    log.timing("fusion", t0.elapsed());
     Ok(result)
 }
 
@@ -289,7 +305,7 @@ fn is_strong_signal(results: &[SearchResult]) -> bool {
     if results.len() < 2 {
         return results.first().map(|r| r.score >= 0.85).unwrap_or(false);
     }
-    results[0].score >= 0.85 && (results[0].score - results[1].score) >= 0.15
+    results[0].score >= 0.85 && (results[0].score - results[1].score) >= 0.10
 }
 
 fn apply_min_score(
@@ -312,15 +328,17 @@ fn rerank(
     mut candidates: Vec<SearchResult>,
     dbs: &[CollectionDb],
     limit: usize,
+    log: &mut Logger,
 ) -> Result<Vec<SearchResult>> {
     let top_n = candidates.len().min(20);
     let (to_rerank, rest) = candidates.split_at_mut(top_n);
 
     // Build cache keys: sha256(model_id + "\0" + query + "\0" + content_hash)
     let mid = scorer.model_id();
+    let q_norm = query.trim().to_lowercase();
     let cache_keys: Vec<String> = to_rerank
         .iter()
-        .map(|r| hasher::hash_bytes(format!("{}\0{}\0{}", mid, query, r.hash).as_bytes()))
+        .map(|r| hasher::hash_bytes(format!("{}\0{}\0{}", mid, q_norm, r.hash).as_bytes()))
         .collect();
 
     // Batch-lookup cached scores (one query per collection DB)
@@ -350,8 +368,8 @@ fn rerank(
     }
 
     let n_cached = top_n - uncached_indices.len();
-    if n_cached > 0 && timing_enabled() {
-        eprintln!("[timing] rerank_cached  {n_cached}/{top_n} hits");
+    if n_cached > 0 && log.verbose {
+        log.log.push(format!("[timing] rerank_cached  {n_cached}/{top_n} hits"));
     }
 
     // Score only uncached candidates
@@ -434,16 +452,27 @@ mod tests {
             doc_id: "#h".into(),
         };
 
-        // Top ≥ 0.85 but gap < 0.15 → not strong
-        let r1 = vec![make(0.90), make(0.82)];
+        // Top ≥ 0.85 but gap < 0.10 → not strong
+        let r1 = vec![make(0.90), make(0.87)];
         assert!(
             !is_strong_signal(&r1),
-            "gap of 0.08 should not be strong signal"
+            "gap of 0.03 should not be strong signal"
         );
 
-        // Top ≥ 0.85 and gap ≥ 0.15 → strong
+        // Top ≥ 0.85 but gap just under threshold → not strong
+        let r1b = vec![make(0.90), make(0.81)];
+        assert!(
+            !is_strong_signal(&r1b),
+            "gap of 0.09 should not be strong signal"
+        );
+
+        // Top ≥ 0.85 and gap ≥ 0.10 → strong
         let r2 = vec![make(0.92), make(0.70)];
         assert!(is_strong_signal(&r2), "gap of 0.22 should be strong signal");
+
+        // Gap just above threshold → strong
+        let r2b = vec![make(0.92), make(0.80)];
+        assert!(is_strong_signal(&r2b), "gap of 0.12 should be strong signal");
 
         // Top < 0.85 → not strong
         let r3 = vec![make(0.80), make(0.50)];

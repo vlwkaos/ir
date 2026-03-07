@@ -61,5 +61,6 @@ impl ExpanderCache {
 }
 
 fn cache_key(model_id: &str, query: &str) -> String {
-    hasher::hash_bytes(format!("{model_id}\0{query}").as_bytes())
+    let q = query.trim().to_lowercase();
+    hasher::hash_bytes(format!("{model_id}\0{q}").as_bytes())
 }

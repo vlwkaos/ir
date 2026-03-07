@@ -40,6 +40,7 @@ fn run() -> Result<()> {
             csv,
             md,
             files,
+            verbose,
         } => handle_search(
             query.join(" "),
             mode,
@@ -51,6 +52,7 @@ fn run() -> Result<()> {
             csv,
             md,
             files,
+            verbose,
         ),
         Command::Get { .. } => {
             eprintln!("not yet implemented");
@@ -178,6 +180,7 @@ fn handle_search(
     csv: bool,
     md: bool,
     files: bool,
+    verbose: bool,
 ) -> Result<()> {
     let fmt = if json {
         output::Format::Json
@@ -203,6 +206,7 @@ fn handle_search(
             limit,
             min_score,
             mode: mode.clone(),
+            verbose,
         };
 
         let ready = if daemon::is_running() {
@@ -221,7 +225,10 @@ fn handle_search(
 
         if ready {
             match daemon::query(&req) {
-                Ok(daemon_results) => {
+                Ok(daemon::QueryResponse { results: daemon_results, log }) => {
+                    for line in &log {
+                        eprintln!("{line}");
+                    }
                     let results: Vec<types::SearchResult> = daemon_results.into_iter()
                         .map(|r| types::SearchResult {
                             collection: r.collection,
@@ -305,8 +312,11 @@ fn handle_search(
                 query: &query,
                 limit,
                 min_score,
+                verbose,
             };
-            hs.search(&dbs, &req)?
+            let out = hs.search(&dbs, &req)?;
+            for line in &out.log { eprintln!("{line}"); }
+            out.results
         }
     };
 

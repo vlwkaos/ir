@@ -64,6 +64,9 @@ pub enum Command {
         /// Files-only listing
         #[arg(long)]
         files: bool,
+        /// Show pipeline decisions and timing
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// Retrieve a document by path or docid
     Get {

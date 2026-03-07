@@ -36,6 +36,8 @@ pub struct DaemonRequest {
     pub min_score: Option<f64>,
     #[serde(default = "default_mode")]
     pub mode: String,
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 fn default_limit() -> usize { 10 }
@@ -48,6 +50,13 @@ struct DaemonResponse {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     results: Option<Vec<DaemonResult>>,
+    #[serde(default)]
+    log: Vec<String>,
+}
+
+pub struct QueryResponse {
+    pub results: Vec<DaemonResult>,
+    pub log: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -104,8 +113,8 @@ pub fn wait_ready(timeout_ms: u64) -> bool {
     false
 }
 
-/// Send a search request to the daemon and return parsed results.
-pub fn query(req: &DaemonRequest) -> Result<Vec<DaemonResult>> {
+/// Send a search request to the daemon and return parsed results + pipeline log.
+pub fn query(req: &DaemonRequest) -> Result<QueryResponse> {
     let sock = config::daemon_socket_path();
     let stream = UnixStream::connect(&sock)
         .map_err(|e| Error::Other(format!("daemon connect: {e}")))?;
@@ -130,7 +139,10 @@ pub fn query(req: &DaemonRequest) -> Result<Vec<DaemonResult>> {
         let results: Vec<DaemonResult> = serde_json::from_value(
             resp["results"].clone()
         ).map_err(|e| Error::Other(format!("parse results: {e}")))?;
-        Ok(results)
+        let log: Vec<String> = serde_json::from_value(
+            resp["log"].clone()
+        ).unwrap_or_default();
+        Ok(QueryResponse { results, log })
     } else {
         Err(Error::Other(
             resp["error"].as_str().unwrap_or("daemon error").to_string()
@@ -293,8 +305,8 @@ fn handle_connection(
     }
 
     let resp = match handle_request(line.trim_end(), hybrid, state) {
-        Ok(results) => DaemonResponse { ok: true, error: None, results: Some(results) },
-        Err(e) => DaemonResponse { ok: false, error: Some(e.to_string()), results: None },
+        Ok((results, log)) => DaemonResponse { ok: true, error: None, results: Some(results), log },
+        Err(e) => DaemonResponse { ok: false, error: Some(e.to_string()), results: None, log: vec![] },
     };
 
     let json = serde_json::to_string(&resp)
@@ -309,7 +321,7 @@ fn handle_request(
     line: &str,
     hybrid: &search::hybrid::HybridSearch,
     state: &DaemonState,
-) -> Result<Vec<DaemonResult>> {
+) -> Result<(Vec<DaemonResult>, Vec<String>)> {
     let req: DaemonRequest = serde_json::from_str(line)
         .map_err(|e| Error::Other(format!("parse request: {e}")))?;
 
@@ -330,14 +342,16 @@ fn handle_request(
         .map(|(name, path)| CollectionDb::open_rw(name.as_str(), path))
         .collect::<Result<Vec<_>>>()?;
 
-    let results = match mode {
+    let (results, log) = match mode {
         SearchMode::Hybrid => {
             let r = search::hybrid::HybridRequest {
                 query: &req.query,
                 limit: req.limit,
                 min_score: req.min_score,
+                verbose: req.verbose,
             };
-            hybrid.search(&dbs, &r)?
+            let out = hybrid.search(&dbs, &r)?;
+            (out.results, out.log)
         }
         SearchMode::Vector => {
             let r = search::vector::VecSearchRequest {
@@ -345,7 +359,7 @@ fn handle_request(
                 limit: req.limit,
                 min_score: req.min_score,
             };
-            search::vector::search(&hybrid.embedder, &dbs, &r)?
+            (search::vector::search(&hybrid.embedder, &dbs, &r)?, vec![])
         }
         SearchMode::Bm25 => {
             let r = search::fan_out::SearchRequest {
@@ -353,11 +367,11 @@ fn handle_request(
                 limit: req.limit,
                 min_score: req.min_score,
             };
-            search::fan_out::bm25(&dbs, &r)?
+            (search::fan_out::bm25(&dbs, &r)?, vec![])
         }
     };
 
-    Ok(results.into_iter().map(|r| DaemonResult {
+    Ok((results.into_iter().map(|r| DaemonResult {
         collection: r.collection,
         path: r.path,
         title: r.title,
@@ -365,7 +379,7 @@ fn handle_request(
         snippet: r.snippet.unwrap_or_default(),
         hash: r.hash,
         doc_id: r.doc_id,
-    }).collect())
+    }).collect(), log))
 }
 
 // ── Stop / status ─────────────────────────────────────────────────────────────
