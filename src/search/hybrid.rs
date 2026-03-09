@@ -1,11 +1,12 @@
 // Hybrid search pipeline:
-//   1. BM25 probe → strong-signal shortcut (skip expansion if top score ≥ 0.85, gap ≥ 0.10)
-//   2a. With query expander: lex/vec/hyde sub-queries → RRF fusion (k=60)
-//   2b. Without expander: score-based fusion (0.80·vec + 0.20·bm25) — empirically optimal
-//       on NFCorpus (nDCG@10: score-fusion 0.393 > vector-only 0.387 > RRF 0.372)
-//   3. LLM reranking (top 20) → final score = fused×0.4 + rerank×0.6
+//   1. BM25 + vector + score fusion (~20ms) — always runs, cheap
+//   2. is_strong_signal(fused) → return fused (skip LLM enhancement)
+//   3a. With query expander: expand → RRF with fused as base ranked list
+//   3b. Without expander: fused results pass directly to reranking
+//   4. LLM reranking (top 20) → final score = fused×0.4 + rerank×0.6
 //
 // Score-fusion α=0.80 (mid-range of 0.70–0.95 plateau) selected on BEIR/NFCorpus.
+// Strong-signal: top*gap >= STRONG_SIGNAL_PRODUCT && top >= STRONG_SIGNAL_FLOOR.
 // See src/bin/eval.rs for the evaluation harness.
 
 use crate::db::{self, CollectionDb, expander_cache::ExpanderCache, fts, vectors};
@@ -67,72 +68,98 @@ pub struct HybridSearch {
 /// 0.80 is the robust mid-range choice. See eval --mode all for reproduction.
 const SCORE_FUSION_VEC_ALPHA: f64 = 0.80;
 
+/// Shortcut fires when top*gap >= product AND top >= floor.
+/// Conservative defaults — calibrate against real query distributions with -v logging.
+const STRONG_SIGNAL_PRODUCT: f64 = 0.06;
+const STRONG_SIGNAL_FLOOR: f64 = 0.40;
+
 impl HybridSearch {
     pub fn search(&self, dbs: &[CollectionDb], req: &HybridRequest) -> Result<SearchOutput> {
         let mut log = Logger::new(req.verbose);
         let t_total = Instant::now();
 
-        // 1. BM25 probe for strong-signal shortcut.
-        let t0 = Instant::now();
-        let probe_results = bm25_across(dbs, req.query, req.limit)?;
-        log.timing("bm25_probe", t0.elapsed());
-
-        if is_strong_signal(&probe_results) {
-            let top = probe_results.first().map(|r| r.score).unwrap_or(0.0);
-            log.info(format!("Strong BM25 signal ({top:.2}) — skipping expansion"));
-            log.timing("total", t_total.elapsed());
-            return Ok(SearchOutput {
-                results: apply_min_score(probe_results, req.min_score, req.limit),
-                log: log.log,
-            });
-        }
-
-        // 2. Fuse: expander → RRF; else score-fusion.
-        let fused = if let Some(exp) = &self.expander {
-            let t0 = Instant::now();
-            let cached = self.expander_cache.as_ref()
-                .and_then(|c| c.get(exp.model_id(), req.query));
-            let subs = if let Some(subs) = cached {
-                log.info("Expanding query (cached)...");
-                log.timing("expand", t0.elapsed());
-                subs
-            } else {
-                log.info("Expanding query...");
-                let subs = exp
-                    .expand_query(req.query)
-                    .unwrap_or_else(|_| fallback(req.query));
-                log.timing("expand", t0.elapsed());
-                if let Some(cache) = &self.expander_cache {
-                    cache.put(exp.model_id(), req.query, &subs);
-                }
-                subs
-            };
-
-            let n_vec = subs.iter().filter(|s| matches!(s.kind, SubQueryKind::Vec | SubQueryKind::Hyde)).count();
-            let n_lex = subs.iter().filter(|s| s.kind == SubQueryKind::Lex).count();
-            log.info(format!("Searching {} sub-queries ({} lex, {} vec/hyde)...", subs.len(), n_lex, n_vec));
-
-            rrf_from_subqueries(dbs, &self.embedder, &subs, req, probe_results, &mut log)?
-        } else {
-            log.info("Score fusion (no expander)...");
-            score_fusion_two_list(dbs, &self.embedder, req, &mut log)?
-        };
+        // 1. Fast retrieval: BM25 + vector + score fusion (~20ms).
+        let fused = score_fusion_two_list(dbs, &self.embedder, req, &mut log)?;
 
         if fused.is_empty() {
             log.timing("total", t_total.elapsed());
             return Ok(SearchOutput { results: vec![], log: log.log });
         }
 
-        // 3. Rerank top-20 if scorer available.
+        // Log fused score distribution for threshold calibration.
+        if log.verbose {
+            let scores: Vec<String> = fused.iter().take(5).map(|r| format!("{:.3}", r.score)).collect();
+            log.log.push(format!("[fused] top-5 scores: [{}]", scores.join(", ")));
+        }
+
+        // 2. Shortcut: fused results show clear winner → skip LLM enhancement.
+        if is_strong_signal(&fused) {
+            let top = fused[0].score;
+            let gap = fused.get(1).map(|r| top - r.score).unwrap_or(top);
+            log.info(format!(
+                "Strong signal (score={top:.3}, gap={gap:.3}, product={:.3}) — skipping expansion+reranking",
+                top * gap
+            ));
+            log.timing("total", t_total.elapsed());
+            return Ok(SearchOutput {
+                results: apply_min_score(fused, req.min_score, req.limit),
+                log: log.log,
+            });
+        }
+
+        // 3. LLM enhancement: expand only when reranker is also available.
+        // ! Expansion without reranking is harmful (p<0.05 on NFCorpus, -0.53% nDCG).
+        let enhanced = if self.scorer.is_some() {
+            if let Some(exp) = &self.expander {
+                let t0 = Instant::now();
+                let cached = self.expander_cache.as_ref()
+                    .and_then(|c| c.get(exp.model_id(), req.query));
+                let subs = if let Some(subs) = cached {
+                    log.info("Expanding query (cached)...");
+                    log.timing("expand", t0.elapsed());
+                    subs
+                } else {
+                    log.info("Expanding query...");
+                    let subs = exp
+                        .expand_query(req.query)
+                        .unwrap_or_else(|_| fallback(req.query));
+                    log.timing("expand", t0.elapsed());
+                    if let Some(cache) = &self.expander_cache {
+                        cache.put(exp.model_id(), req.query, &subs);
+                    }
+                    subs
+                };
+
+                let n_vec = subs.iter().filter(|s| matches!(s.kind, SubQueryKind::Vec | SubQueryKind::Hyde)).count();
+                let n_lex = subs.iter().filter(|s| s.kind == SubQueryKind::Lex).count();
+                log.info(format!("Searching {} sub-queries ({} lex, {} vec/hyde)...", subs.len(), n_lex, n_vec));
+
+                rrf_from_subqueries(dbs, &self.embedder, &subs, req, fused, &mut log)?
+            } else {
+                fused
+            }
+        } else {
+            if self.expander.is_some() {
+                log.info("Skipping expansion (no reranker)");
+            }
+            fused
+        };
+
+        if enhanced.is_empty() {
+            log.timing("total", t_total.elapsed());
+            return Ok(SearchOutput { results: vec![], log: log.log });
+        }
+
+        // 4. Rerank top-20 if scorer available.
         let final_results = if let Some(scorer) = &self.scorer {
-            let n = fused.len().min(20);
+            let n = enhanced.len().min(20);
             log.info(format!("Reranking {n} chunks..."));
             let t0 = Instant::now();
-            let result = rerank(scorer.as_ref(), req.query, fused, dbs, req.limit, &mut log)?;
+            let result = rerank(scorer.as_ref(), req.query, enhanced, dbs, req.limit, &mut log)?;
             log.timing("rerank", t0.elapsed());
             result
         } else {
-            fused
+            enhanced
         };
 
         log.timing("total", t_total.elapsed());
@@ -195,13 +222,14 @@ fn score_fusion_two_list(
 
 /// Multi-subquery RRF fusion.
 /// Weights: lex=1.0, vec=1.5, hyde=1.0 — vector weighted higher.
-/// Probe BM25 results are NOT added again if a lex sub-query already covers the same query.
+/// base_results (fused BM25+vector) are always included: vector signal is not
+/// ! duplicated by lex sub-queries which only run BM25, so always folding in is correct.
 fn rrf_from_subqueries(
     dbs: &[CollectionDb],
     embedder: &Embedder,
     sub_queries: &[SubQuery],
     req: &HybridRequest,
-    probe_results: Vec<SearchResult>,
+    base_results: Vec<SearchResult>,
     log: &mut Logger,
 ) -> Result<Vec<SearchResult>> {
     let mut ranked_lists: Vec<RankedList> = Vec::new();
@@ -253,11 +281,10 @@ fn rrf_from_subqueries(
         log.timing("knn", t0.elapsed());
     }
 
-    // Include probe only if no lex sub-query was generated (guards against double-counting).
-    let has_lex = sub_queries.iter().any(|s| s.kind == SubQueryKind::Lex);
-    if !has_lex && !probe_results.is_empty() {
+    // Always include fused base results (BM25+vector): adds vector signal not present in lex lists.
+    if !base_results.is_empty() {
         ranked_lists.push(RankedList {
-            results: probe_results,
+            results: base_results,
             weight: 1.0,
         });
     }
@@ -300,12 +327,19 @@ fn vec_across(dbs: &[CollectionDb], embedding: &[f32], limit: usize) -> Result<V
         .map(|vv| vv.into_iter().flatten().collect())
 }
 
-/// Strong-signal shortcut: top BM25 score ≥ 0.85 AND gap to second ≥ 0.15.
+/// Strong-signal shortcut on fused BM25+vector scores.
+/// Fires when top*gap >= STRONG_SIGNAL_PRODUCT and top >= STRONG_SIGNAL_FLOOR.
+/// Higher scores tolerate smaller gaps; lower scores need proportionally larger gaps.
 fn is_strong_signal(results: &[SearchResult]) -> bool {
+    let top = match results.first() {
+        Some(r) if r.score >= STRONG_SIGNAL_FLOOR => r.score,
+        _ => return false,
+    };
     if results.len() < 2 {
-        return results.first().map(|r| r.score >= 0.85).unwrap_or(false);
+        return true;
     }
-    results[0].score >= 0.85 && (results[0].score - results[1].score) >= 0.10
+    let gap = top - results[1].score;
+    top * gap >= STRONG_SIGNAL_PRODUCT
 }
 
 fn apply_min_score(
@@ -441,7 +475,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strong_signal_requires_gap() {
+    fn strong_signal_product_boundary() {
         let make = |score: f64| SearchResult {
             collection: "c".into(),
             path: "p".into(),
@@ -452,34 +486,29 @@ mod tests {
             doc_id: "#h".into(),
         };
 
-        // Top ≥ 0.85 but gap < 0.10 → not strong
-        let r1 = vec![make(0.90), make(0.87)];
-        assert!(
-            !is_strong_signal(&r1),
-            "gap of 0.03 should not be strong signal"
-        );
+        // Below floor → not strong
+        let r = vec![make(0.39), make(0.10)];
+        assert!(!is_strong_signal(&r), "score below floor should not be strong");
 
-        // Top ≥ 0.85 but gap just under threshold → not strong
-        let r1b = vec![make(0.90), make(0.81)];
-        assert!(
-            !is_strong_signal(&r1b),
-            "gap of 0.09 should not be strong signal"
-        );
+        // At floor, product below threshold (0.40 * 0.10 = 0.04 < 0.06) → not strong
+        let r = vec![make(0.40), make(0.30)];
+        assert!(!is_strong_signal(&r), "product 0.04 should not be strong");
 
-        // Top ≥ 0.85 and gap ≥ 0.10 → strong
-        let r2 = vec![make(0.92), make(0.70)];
-        assert!(is_strong_signal(&r2), "gap of 0.22 should be strong signal");
+        // At floor, product at threshold (0.40 * 0.15 = 0.06) → strong
+        let r = vec![make(0.40), make(0.25)];
+        assert!(is_strong_signal(&r), "product 0.06 should be strong");
 
-        // Gap just above threshold → strong
-        let r2b = vec![make(0.92), make(0.80)];
-        assert!(is_strong_signal(&r2b), "gap of 0.12 should be strong signal");
+        // High score, product above threshold (0.80 * 0.08 = 0.064 >= 0.06) → strong
+        let r = vec![make(0.80), make(0.72)];
+        assert!(is_strong_signal(&r), "product 0.064 should be strong");
 
-        // Top < 0.85 → not strong
-        let r3 = vec![make(0.80), make(0.50)];
-        assert!(
-            !is_strong_signal(&r3),
-            "score below 0.85 should not be strong signal"
-        );
+        // High score, tiny gap (0.80 * 0.04 = 0.032 < 0.06) → not strong
+        let r = vec![make(0.80), make(0.76)];
+        assert!(!is_strong_signal(&r), "product 0.032 should not be strong");
+
+        // Single result above floor → strong
+        let r = vec![make(0.50)];
+        assert!(is_strong_signal(&r), "single result above floor should be strong");
     }
 
     #[test]
