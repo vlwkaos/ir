@@ -1,6 +1,6 @@
 [package]
 name = "ir-search"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 description = "Local markdown semantic search with hybrid BM25+vector retrieval and LLM reranking"
 license = "MIT"
