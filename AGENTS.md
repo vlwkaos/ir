@@ -45,6 +45,29 @@ Model search order: `IR_*_MODEL` env → `IR_MODEL_DIRS` → `~/local-models/` �
 - Expander cache: `~/.config/ir/expander_cache.sqlite`
 - Daemon socket: `~/.config/ir/daemon.sock`
 
+## Architecture
+
+### Search Pipeline
+
+Three-tier escalation. Each tier runs only if the previous tier's result isn't strong enough.
+
+| Tier | Models | Enables |
+|------|--------|---------|
+| 0 | none | BM25 (FTS5), in-process |
+| 1 | Embedder | Vector, hybrid score-fusion (0.80·vec + 0.20·bm25) |
+| 2 | Expander + Scorer | Query expansion (lex/vec/hyde → RRF) + reranking |
+
+Strong-signal shortcut: BM25 top ≥ 0.85 AND gap ≥ 0.10 → skip Tier 1+2 entirely (`src/search/hybrid.rs:is_strong_signal`). Expander without scorer is a no-op (`hybrid.rs:112`).
+
+See @research/pipeline.md for the planned staged async daemon design.
+
+### Daemon Startup (current)
+
+Sequential: embedder → expander → reranker → bind socket → write PID.
+Client blocks up to 10s on PID file. Idle timeout: 3600s (configurable via `ir daemon start --timeout`).
+
+**Planned**: bind socket after Tier 1 ready; signal Tier 2 separately. BM25 runs in-process while daemon loads. See @research/pipeline.md.
+
 ## Known Gotchas
 
 - **Crate name mismatch**: package is `ir-search`, but all internal `use` statements in `src/bin/eval.rs` reference `ir_search::` (snake_case). Don't change these back to `ir::`.

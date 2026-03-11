@@ -20,13 +20,36 @@ cargo run --release --bin eval -- --data test-data/nfcorpus --mode all
 
 | Mode | nDCG@10 | Recall@10 | Notes |
 |------|---------|-----------|-------|
-| BM25 | 0.2037 | 0.0932 | no model |
-| Vector | 0.3866 | 0.1926 | EmbeddingGemma 300M |
-| **Hybrid (score-fusion α=0.80)** | **0.3924** | **0.1952** | +1.5% vs vector |
-| Hybrid + reranker | 0.4032 | — | +2.8% vs score-fusion |
+| BM25 | 0.2046 | 0.0932 | no model |
+| Vector | 0.3898 | 0.1926 | EmbeddingGemma 300M |
+| **Hybrid (score-fusion α=0.80)** | **0.3954** | **0.1958** | +1.4% vs vector |
+| Hybrid + reranker | 0.4001 | — | +1.2% vs score-fusion |
 
-α=0.70–0.95 forms a flat plateau; 0.80 is the robust midpoint.
 Old pure-RRF scored 0.372 — score-fusion is +5.5% better.
+
+---
+
+## Experiment: Alpha Sensitivity (α=0.80 vs α=0.95)
+
+**Question**: Does pushing toward pure vector (α=0.95) improve results over α=0.80?
+
+```bash
+for ds in nfcorpus scifact fiqa arguana; do
+  cargo run --release --bin eval -- --data test-data/$ds --mode hybrid \
+    --alpha 0.80 --compare-alpha 0.95
+done
+```
+
+| Dataset | α=0.80 nDCG | α=0.95 nDCG | Δ | t | sig? |
+|---------|-------------|-------------|---|---|------|
+| NFCorpus (323q) | 0.3954 | 0.3962 | +0.0008 | +0.68 | no |
+| SciFact (300q) | 0.7873 | 0.7875 | +0.0002 | +1.00 | no |
+| FiQA (648q) | 0.4266 | 0.4335 | +0.0069 | +3.44 | **yes** |
+| ArguAna (1406q) | 0.4263 | 0.4269 | +0.0006 | +1.39 | no |
+
+**Conclusion**: 1/4 datasets significant (FiQA, t=3.44). FiQA is a financial Q&A corpus where
+dense retrieval naturally dominates; the gain is dataset-specific. Deltas on the other three are
+noise. **α=0.80 stays** — consistent midpoint, no regression risk.
 
 ---
 

@@ -64,6 +64,7 @@ struct Args {
     prf_terms: usize,
     tune_alpha: bool,
     tune_rerank: bool,
+    compare_alpha: Option<f64>,
     chunk_size_tokens: Option<usize>,
     max_docs: Option<usize>,
     max_queries: Option<usize>,
@@ -104,6 +105,7 @@ fn parse_args() -> Args {
     let mut prf_terms = DEFAULT_PRF_TERMS;
     let mut tune_alpha = false;
     let mut tune_rerank = false;
+    let mut compare_alpha: Option<f64> = None;
     let mut chunk_size_tokens: Option<usize> = None;
     let mut max_docs: Option<usize> = None;
     let mut max_queries: Option<usize> = None;
@@ -160,6 +162,13 @@ fn parse_args() -> Args {
                 i += 1;
                 if i < args.len() {
                     alpha = args[i].parse().expect("--alpha must be a number");
+                }
+            }
+            "--compare-alpha" => {
+                i += 1;
+                if i < args.len() {
+                    compare_alpha =
+                        Some(args[i].parse().expect("--compare-alpha must be a number"));
                 }
             }
             "--rerank" => {
@@ -335,6 +344,7 @@ fn parse_args() -> Args {
         prf_terms,
         tune_alpha,
         tune_rerank,
+        compare_alpha,
         chunk_size_tokens,
         max_docs,
         max_queries,
@@ -1597,7 +1607,7 @@ fn tune_score_fusion(
     println!("{:<8}  {:>10}  {:>12}", "alpha", "nDCG@10", "Recall@10");
     println!("{}", "─".repeat(36));
 
-    let alphas = [0.70f64, 0.75, 0.80, 0.85, 0.90];
+    let alphas = [0.70f64, 0.75, 0.80, 0.85, 0.90, 0.95];
     let mut best = (0.0f64, 0.0f64, 0.0f64);
 
     for &alpha in &alphas {
@@ -1764,6 +1774,16 @@ fn main() -> Result<()> {
             "--alpha must be between 0 and 1, got {}",
             args.alpha
         )));
+    }
+    if let Some(ca) = args.compare_alpha {
+        if !(0.0..=1.0).contains(&ca) {
+            return Err(Error::Other(format!(
+                "--compare-alpha must be between 0 and 1, got {ca}"
+            )));
+        }
+        if !matches!(args.mode, EvalMode::Hybrid | EvalMode::All) {
+            eprintln!("warning: --compare-alpha has no effect with --mode {:?}", args.mode);
+        }
     }
     if !(0.0..=1.0).contains(&args.rerank_weight) {
         return Err(Error::Other(format!(
@@ -2082,6 +2102,57 @@ fn main() -> Result<()> {
                 &run_key,
             ));
             println!("done");
+
+            if let Some(cmp_alpha) = args.compare_alpha {
+                print!("evaluating hybrid α={cmp_alpha} ({} queries)... ", queries.len());
+                let _ = std::io::stdout().flush();
+                let mut cmp_cfg = hybrid_cfg;
+                cmp_cfg.alpha = cmp_alpha;
+                let cmp_run_key = format!("{run_key}-cmp-alpha-{cmp_alpha:.2}");
+                let cmp_result = evaluate_hybrid(
+                    &conn,
+                    &queries,
+                    &qrels,
+                    k,
+                    query_embeddings,
+                    embedder,
+                    expander_opt.as_ref(),
+                    &cmp_cfg,
+                    &term_stats,
+                    reranker_ref,
+                    args.rerank_weight,
+                    args.rerank_top_n,
+                    &doc_texts,
+                    mode_name,
+                    &cmp_run_key,
+                );
+                println!("done");
+
+                let base_result = results.last().unwrap();
+                println!(
+                    "\n── Paired comparison: hybrid α={:.2} vs α={cmp_alpha:.2} ────────────",
+                    args.alpha
+                );
+                match paired_t_test(&cmp_result.per_query, &base_result.per_query) {
+                    None => println!("  n<2, skipping"),
+                    Some((mean, se, lo, hi)) => {
+                        let t = if se > 0.0 { mean / se } else { 0.0 };
+                        let sig = if t.abs() >= 1.96 { "sig" } else { "not sig" };
+                        println!(
+                            "  α={cmp_alpha:.2} vs α={:.2}  nDCG: {:.4} vs {:.4}  \
+                             Δ={:+.4}  SE={:.4}  t={:+.2}  95%CI=[{:+.4},{:+.4}]  ({sig})",
+                            args.alpha,
+                            cmp_result.ndcg,
+                            base_result.ndcg,
+                            mean,
+                            se,
+                            t,
+                            lo,
+                            hi
+                        );
+                    }
+                }
+            }
 
             if args.tune_alpha {
                 tune_score_fusion(

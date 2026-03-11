@@ -121,17 +121,14 @@ ir collection rm notes       # remove collection
 ## Search Pipeline
 
 ```
-Query
-  │
-  ├─ BM25 probe ──► score ≥ 0.85 AND gap ≥ 0.15? ──► return immediately
-  │
-  ├─ With expander:    expand → lex/vec/hyde sub-queries → RRF fusion
-  ├─ Without expander: BM25 + vector → score fusion (0.80·vec + 0.20·bm25)
-  │
-  └─ Reranker: final = 0.40·fused + 0.60·P(relevant)
+Query → BM25 probe → score fusion (0.80·vec + 0.20·bm25) → reranking
 ```
 
-Expander and reranker outputs are cached (SQLite). Repeated queries skip LLM inference entirely.
+Strong-signal shortcut (BM25 score ≥ 0.85, gap ≥ 0.10) skips all LLM work.
+With expander: expand → lex/vec/hyde sub-queries → RRF → rerank top-20.
+All LLM outputs cached in SQLite — repeated queries skip inference entirely.
+
+See [research/pipeline.md](research/pipeline.md) for staged async daemon design.
 
 ## Benchmark: BEIR (4 datasets, nDCG@10)
 
@@ -170,34 +167,3 @@ ir is a Rust port of [qmd](https://github.com/tobi/qmd) with a different storage
 
 Same GGUF models (`qmd-query-expansion-1.7B` + `qwen3-reranker-0.6b`) — LLM inference time is identical. Cold difference: ir caps reranking at 20 candidates vs qmd's 40. Warm difference: qmd pays ~800ms process spawn + JS runtime per invocation; ir's daemon round-trip is 30ms (embed + kNN only).
 
-## Development
-
-```bash
-cargo build                  # debug build
-cargo build --release        # release build
-cargo test                   # unit tests (55 passing, no models required)
-cargo test -- --ignored      # model-dependent tests (requires models)
-cargo run --bin eval -- --data test-data/nfcorpus --mode all
-```
-
-## Schema
-
-Each collection database (`~/.config/ir/collections/<name>.sqlite`):
-
-```
-content          — hash → full text (content-addressed)
-documents        — path, title, hash, active flag
-documents_fts    — FTS5 virtual table (porter tokenizer)
-vectors_vec      — sqlite-vec kNN (768d cosine, EmbeddingGemma format)
-content_vectors  — chunk metadata (hash, seq, pos, model)
-llm_cache        — reranker score cache (sha256(model+query+doc) → score)
-meta             — collection metadata (name, schema version)
-```
-
-Global cache (`~/.config/ir/expander_cache.sqlite`):
-
-```
-expander_cache   — sha256(model+query) → JSON Vec<SubQuery>
-```
-
-Triggers keep `documents_fts` in sync with `documents` on insert/update/delete.
