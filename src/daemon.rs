@@ -113,6 +113,29 @@ pub fn wait_ready(timeout_ms: u64) -> bool {
     false
 }
 
+/// Returns true if the daemon's tier-2 models (expander + reranker) are loaded.
+pub fn is_tier2_ready() -> bool {
+    config::daemon_tier2_path().exists()
+}
+
+/// Poll for tier-2 readiness or `timeout_ms` elapses. Returns true if ready.
+pub fn wait_tier2(timeout_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        if is_tier2_ready() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Tier-2 models sent from background loader to main accept loop via sync_channel.
+struct Tier2 {
+    expander: Option<Box<dyn crate::llm::expander::QueryExpander>>,
+    scorer: Option<Box<dyn crate::llm::scoring::Scorer>>,
+}
+
 /// Send a search request to the daemon and return parsed results + pipeline log.
 pub fn query(req: &DaemonRequest) -> Result<QueryResponse> {
     let sock = config::daemon_socket_path();
@@ -170,6 +193,7 @@ impl DaemonState {
 pub fn start_server(timeout_secs: u64) -> Result<()> {
     let sock_path = config::daemon_socket_path();
     let pid_path = config::daemon_pid_path();
+    let tier2_path = config::daemon_tier2_path();
 
     if let Some(parent) = sock_path.parent() {
         std::fs::create_dir_all(parent).map_err(Error::Io)?;
@@ -178,61 +202,74 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
             .map_err(Error::Io)?;
     }
 
-    // Remove stale socket; next start will always replace it.
-    if sock_path.exists() {
-        std::fs::remove_file(&sock_path).map_err(Error::Io)?;
-    }
+    // Remove stale files; next start will always replace them.
+    if sock_path.exists() { std::fs::remove_file(&sock_path).map_err(Error::Io)?; }
+    let _ = std::fs::remove_file(&tier2_path);
 
     let gpu_on = crate::llm::gpu_layers() > 0;
     eprintln!("loading models (Metal: {})...", if gpu_on { "on" } else { "off" });
 
-    // Model stack: try Qwen3.5 unified first, fall back to trio (expander + reranker).
+    // Tier-1: load embedder only.
     let embedder = crate::llm::embedding::Embedder::load_default()
         .map_err(|e| Error::Other(format!("load embedder: {e}")))?;
     eprintln!("  embedder ready");
 
-    let qwen = std::env::var_os("IR_QWEN_MODEL")
-        .map(|_| crate::llm::qwen::Qwen35::load_default()
-            .map_err(|e| { eprintln!("  note: qwen unavailable ({e})"); e })
-            .ok())
-        .flatten()
-        .map(std::sync::Arc::new);
-
-    let (expander, scorer): (Option<Box<dyn crate::llm::expander::QueryExpander>>, Option<Box<dyn crate::llm::scoring::Scorer>>) = if let Some(q) = qwen {
-        eprintln!("  qwen ready");
-        (Some(Box::new(q.clone())), Some(Box::new(q)))
-    } else {
-        let exp = crate::llm::expander::Expander::load_default()
-            .map_err(|e| eprintln!("  note: expander unavailable ({e})"))
-            .ok()
-            .map(|e| { eprintln!("  expander ready"); Box::new(e) as Box<dyn crate::llm::expander::QueryExpander> });
-        let rer = crate::llm::reranker::Reranker::load_default()
-            .map_err(|e| eprintln!("  note: reranker unavailable ({e})"))
-            .ok()
-            .map(|r| { eprintln!("  reranker ready"); Box::new(r) as Box<dyn crate::llm::scoring::Scorer> });
-        (exp, rer)
-    };
-
-    let expander_cache = crate::db::expander_cache::ExpanderCache::open()
-        .map_err(|e| eprintln!("  note: expander cache unavailable ({e})"))
-        .ok();
-
-    let hybrid = search::hybrid::HybridSearch {
+    let mut hybrid = search::hybrid::HybridSearch {
         embedder,
-        expander,
-        scorer,
-        expander_cache,
+        expander: None,
+        scorer: None,
+        expander_cache: None,
     };
 
     let state = DaemonState::load()?;
 
+    // Bind socket — tier-1 signal. Clients can connect for score-fusion queries now.
     let listener = UnixListener::bind(&sock_path)
         .map_err(|e| Error::Other(format!("bind {}: {e}", sock_path.display())))?;
-    // Restrict socket access to owner-only.
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
         .map_err(Error::Io)?;
-    // Write PID only after bind+model init so stop() never targets a half-started process.
+    // Write PID immediately so stop() works from tier-1 onward.
     std::fs::write(&pid_path, std::process::id().to_string()).map_err(Error::Io)?;
+
+    let timeout_msg = if timeout_secs > 0 { format!("  timeout={}s", timeout_secs) } else { "  timeout=never".into() };
+    eprintln!("daemon ready (tier 1)  socket={}{}", sock_path.display(), timeout_msg);
+
+    // Tier-2: load expander+reranker in background; signal readiness via tier2_path.
+    // Race-free: send to channel BEFORE writing tier2_path. Main thread's try_recv()
+    // fires on the next connection after tier2_path appears, so models are always present.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Tier2>(1);
+    let tier2_path_bg = tier2_path.clone();
+    std::thread::spawn(move || {
+        let qwen = std::env::var_os("IR_QWEN_MODEL")
+            .map(|_| crate::llm::qwen::Qwen35::load_default()
+                .map_err(|e| { eprintln!("  note: qwen unavailable ({e})"); e })
+                .ok())
+            .flatten()
+            .map(std::sync::Arc::new);
+
+        let (expander, scorer) = if let Some(q) = qwen {
+            eprintln!("  qwen ready");
+            (
+                Some(Box::new(q.clone()) as Box<dyn crate::llm::expander::QueryExpander>),
+                Some(Box::new(q) as Box<dyn crate::llm::scoring::Scorer>),
+            )
+        } else {
+            let exp = crate::llm::expander::Expander::load_default()
+                .map_err(|e| eprintln!("  note: expander unavailable ({e})"))
+                .ok()
+                .map(|e| { eprintln!("  expander ready"); Box::new(e) as Box<dyn crate::llm::expander::QueryExpander> });
+            let rer = crate::llm::reranker::Reranker::load_default()
+                .map_err(|e| eprintln!("  note: reranker unavailable ({e})"))
+                .ok()
+                .map(|r| { eprintln!("  reranker ready"); Box::new(r) as Box<dyn crate::llm::scoring::Scorer> });
+            (exp, rer)
+        };
+
+        // Send models to main thread before writing signal file.
+        let _ = tx.send(Tier2 { expander, scorer });
+        let _ = std::fs::write(&tier2_path_bg, "");
+        eprintln!("  tier-2 ready");
+    });
 
     // Inactivity watchdog: exit after `timeout_secs` of no queries.
     let last_activity = Arc::new(AtomicU64::new(unix_now()));
@@ -240,6 +277,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
         let last = Arc::clone(&last_activity);
         let sock = sock_path.clone();
         let pid = pid_path.clone();
+        let t2 = tier2_path.clone();
         std::thread::spawn(move || {
             let check_every = (timeout_secs / 10).clamp(1, 30);
             loop {
@@ -249,20 +287,22 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
                     eprintln!("daemon: idle for {idle}s, shutting down");
                     let _ = std::fs::remove_file(&sock);
                     let _ = std::fs::remove_file(&pid);
+                    let _ = std::fs::remove_file(&t2);
                     std::process::exit(0);
                 }
             }
         });
     }
 
-    let timeout_msg = if timeout_secs > 0 {
-        format!("  timeout={}s", timeout_secs)
-    } else {
-        "  timeout=never".into()
-    };
-    eprintln!("daemon ready  socket={}{}", sock_path.display(), timeout_msg);
-
     for stream in listener.incoming() {
+        // Pick up tier-2 models if background thread finished loading.
+        if let Ok(t2) = rx.try_recv() {
+            hybrid.expander = t2.expander;
+            hybrid.scorer = t2.scorer;
+            hybrid.expander_cache = crate::db::expander_cache::ExpanderCache::open()
+                .map_err(|e| eprintln!("  note: expander cache unavailable ({e})"))
+                .ok();
+        }
         match stream {
             Ok(s) => {
                 last_activity.store(unix_now(), Ordering::Relaxed);
@@ -276,6 +316,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
 
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(&tier2_path);
     Ok(())
 }
 
@@ -389,7 +430,14 @@ pub fn stop() -> Result<()> {
     let sock_path = config::daemon_socket_path();
 
     if !pid_path.exists() {
-        eprintln!("daemon not running (no pid file)");
+        // Tier-1 may be up (socket bound) but tier-2 still loading (no PID yet).
+        if sock_path.exists() {
+            let _ = std::fs::remove_file(&sock_path);
+            let _ = std::fs::remove_file(&config::daemon_tier2_path());
+            eprintln!("daemon stopping (tier-2 still loading, socket removed)");
+        } else {
+            eprintln!("daemon not running (no pid file)");
+        }
         return Ok(());
     }
 
@@ -411,6 +459,7 @@ pub fn stop() -> Result<()> {
 
     let _ = std::fs::remove_file(&pid_path);
     let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&config::daemon_tier2_path());
     eprintln!("daemon stopped (pid {pid})");
     Ok(())
 }

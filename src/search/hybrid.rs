@@ -70,8 +70,8 @@ const SCORE_FUSION_VEC_ALPHA: f64 = 0.80;
 
 /// Shortcut fires when top*gap >= product AND top >= floor.
 /// Conservative defaults — calibrate against real query distributions with -v logging.
-const STRONG_SIGNAL_PRODUCT: f64 = 0.06;
-const STRONG_SIGNAL_FLOOR: f64 = 0.40;
+pub(crate) const STRONG_SIGNAL_PRODUCT: f64 = 0.06;
+pub(crate) const STRONG_SIGNAL_FLOOR: f64 = 0.40;
 
 impl HybridSearch {
     pub fn search(&self, dbs: &[CollectionDb], req: &HybridRequest) -> Result<SearchOutput> {
@@ -330,7 +330,7 @@ fn vec_across(dbs: &[CollectionDb], embedding: &[f32], limit: usize) -> Result<V
 /// Strong-signal shortcut on fused BM25+vector scores.
 /// Fires when top*gap >= STRONG_SIGNAL_PRODUCT and top >= STRONG_SIGNAL_FLOOR.
 /// Higher scores tolerate smaller gaps; lower scores need proportionally larger gaps.
-fn is_strong_signal(results: &[SearchResult]) -> bool {
+pub(crate) fn is_strong_signal(results: &[SearchResult]) -> bool {
     let top = match results.first() {
         Some(r) if r.score >= STRONG_SIGNAL_FLOOR => r.score,
         _ => return false,

@@ -119,6 +119,10 @@ pub fn daemon_pid_path() -> PathBuf {
     ir_dir().join("daemon.pid")
 }
 
+pub fn daemon_tier2_path() -> PathBuf {
+    ir_dir().join("daemon.tier2")
+}
+
 pub fn expander_cache_path() -> PathBuf {
     ir_dir().join("expander_cache.sqlite")
 }
