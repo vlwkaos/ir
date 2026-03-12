@@ -209,18 +209,30 @@ fn handle_search(
         .filter_map(|name| config.get_collection(name))
         .collect();
     let dbs: Vec<db::CollectionDb> = cols.iter()
-        .map(|c| db::CollectionDb::open(&c.name, &collection_db_path(&c.name)))
+        .map(|c| db::CollectionDb::open_rw(&c.name, &collection_db_path(&c.name)))
         .collect::<Result<Vec<_>>>()?;
 
     // Tier-0: BM25 in-process, no model needed.
     let bm25_req = search::fan_out::SearchRequest { query: &query, limit, min_score };
     let bm25_results = search::fan_out::bm25(&dbs, &bm25_req)?;
 
-    // Strong BM25 signal → return immediately; warm daemon in background for next query.
-    if search::hybrid::is_strong_signal(&bm25_results) {
-        let _ = daemon::start_in_background();
-        output::print_results(&bm25_results, fmt, full);
-        return Ok(());
+    // Mode dispatch before going to daemon.
+    match search_mode {
+        // bm25 mode: return BM25 results directly, no daemon needed.
+        SearchMode::Bm25 => {
+            output::print_results(&bm25_results, fmt, full);
+            return Ok(());
+        }
+        // vector mode: skip BM25 shortcut — go straight to daemon.
+        SearchMode::Vector => {}
+        // hybrid mode: strong BM25 signal shortcuts LLM work.
+        SearchMode::Hybrid => {
+            if search::hybrid::is_bm25_strong_signal(&bm25_results) {
+                if !daemon::is_running() { let _ = daemon::start_in_background(); }
+                output::print_results(&bm25_results, fmt, full);
+                return Ok(());
+            }
+        }
     }
 
     // Need better results — ensure daemon is running.

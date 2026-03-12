@@ -73,6 +73,11 @@ const SCORE_FUSION_VEC_ALPHA: f64 = 0.80;
 pub(crate) const STRONG_SIGNAL_PRODUCT: f64 = 0.06;
 pub(crate) const STRONG_SIGNAL_FLOOR: f64 = 0.40;
 
+/// Tier-0 shortcut on raw BM25 scores (pos/(1+pos) normalization).
+/// Higher floor than fused thresholds — raw BM25 at 0.40 is a moderate match, not a strong one.
+pub(crate) const BM25_STRONG_FLOOR: f64 = 0.75;
+pub(crate) const BM25_STRONG_GAP: f64 = 0.10;
+
 impl HybridSearch {
     pub fn search(&self, dbs: &[CollectionDb], req: &HybridRequest) -> Result<SearchOutput> {
         let mut log = Logger::new(req.verbose);
@@ -342,6 +347,19 @@ pub(crate) fn is_strong_signal(results: &[SearchResult]) -> bool {
     top * gap >= STRONG_SIGNAL_PRODUCT
 }
 
+/// Tier-0 shortcut on raw BM25 scores before any vector retrieval.
+/// Higher thresholds than fused shortcut — raw BM25 at 0.40 is a moderate match.
+pub(crate) fn is_bm25_strong_signal(results: &[SearchResult]) -> bool {
+    let top = match results.first() {
+        Some(r) if r.score >= BM25_STRONG_FLOOR => r.score,
+        _ => return false,
+    };
+    if results.len() < 2 {
+        return true;
+    }
+    (top - results[1].score) >= BM25_STRONG_GAP
+}
+
 fn apply_min_score(
     mut results: Vec<SearchResult>,
     min_score: Option<f64>,
@@ -509,6 +527,39 @@ mod tests {
         // Single result above floor → strong
         let r = vec![make(0.50)];
         assert!(is_strong_signal(&r), "single result above floor should be strong");
+    }
+
+    #[test]
+    fn bm25_strong_signal_thresholds() {
+        let make = |score: f64| SearchResult {
+            collection: "c".into(),
+            path: "p".into(),
+            title: "t".into(),
+            score,
+            snippet: None,
+            hash: "h".into(),
+            doc_id: "#h".into(),
+        };
+
+        // Below floor → not strong
+        let r = vec![make(0.74), make(0.60)];
+        assert!(!is_bm25_strong_signal(&r), "score below BM25 floor should not be strong");
+
+        // At floor, gap below threshold → not strong
+        let r = vec![make(0.75), make(0.66)];
+        assert!(!is_bm25_strong_signal(&r), "gap 0.09 should not be strong");
+
+        // At floor, gap at threshold → strong
+        let r = vec![make(0.75), make(0.64)];
+        assert!(is_bm25_strong_signal(&r), "gap 0.11 should be strong");
+
+        // High score, large gap → strong
+        let r = vec![make(0.90), make(0.70)];
+        assert!(is_bm25_strong_signal(&r), "high score + large gap should be strong");
+
+        // Single result above floor → strong
+        let r = vec![make(0.80)];
+        assert!(is_bm25_strong_signal(&r), "single result above floor should be strong");
     }
 
     #[test]

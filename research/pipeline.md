@@ -1,7 +1,7 @@
 
 # ir — Search Pipeline
 
-## Staged Async Daemon Design (planned)
+## Staged Async Daemon Design
 
 BM25 runs in-process immediately. Daemon starts in background and signals readiness in two tiers. Client escalates only as far as the query needs.
 
@@ -13,7 +13,7 @@ ir search "query"
 │  BM25  (FTS5)       │  no model · in-process · instant
 └──────────┬──────────┘  daemon starts in background
            │
-     strong signal?         score ≥ 0.85  ∧  gap ≥ 0.10
+     strong signal?         score ≥ 0.75  ∧  gap ≥ 0.10
      ───────yes─────────────────────────────────────────► return
                                                daemon warms in background
            │ no
@@ -75,21 +75,19 @@ Note: expander without scorer is a no-op (expansion skipped if no reranker — `
 
 ### Strong-Signal Shortcut
 
-BM25 score ≥ 0.85 AND gap ≥ 0.10 → skip all LLM work. Implemented in `src/search/hybrid.rs:is_strong_signal`. Fires rarely on non-English corpora (BM25 near-zero for Korean etc.) — those always escalate to Tier 1 minimum.
+Raw BM25 score ≥ 0.75 AND gap ≥ 0.10 → skip all LLM work. Implemented in `src/search/hybrid.rs:is_bm25_strong_signal`. Fires rarely on non-English corpora (BM25 near-zero for Korean etc.) — those always escalate to Tier 1 minimum.
 
 ---
 
-## Current Implementation
+## Implementation
 
-Sequential model load, single readiness signal (PID file after all models loaded):
+Staged async model load, two readiness signals:
 
 ```
-embedder load → expander load → reranker load → bind socket → write PID → ready
+embedder load → bind socket → write tier1 (PID) → [background] expander+reranker load → write tier2
 ```
 
-Client polls for PID file, waits up to 10s. All queries blocked until full load.
-
-Staged design requires: split socket bind (after Tier 1) from PID write (after Tier 2), plus a readiness level protocol so client knows which tier is available.
+Client waits up to 3s for socket (tier 1), then up to 7s for tier2 signal if hybrid mode needs it.
 
 ---
 

@@ -57,16 +57,18 @@ Three-tier escalation. Each tier runs only if the previous tier's result isn't s
 | 1 | Embedder | Vector, hybrid score-fusion (0.80·vec + 0.20·bm25) |
 | 2 | Expander + Scorer | Query expansion (lex/vec/hyde → RRF) + reranking |
 
-Strong-signal shortcut: BM25 top ≥ 0.85 AND gap ≥ 0.10 → skip Tier 1+2 entirely (`src/search/hybrid.rs:is_strong_signal`). Expander without scorer is a no-op (`hybrid.rs:112`).
+Strong-signal shortcut: raw BM25 top ≥ 0.75 AND gap ≥ 0.10 → skip Tier 1+2 entirely (`src/search/hybrid.rs:is_bm25_strong_signal`). Expander without scorer is a no-op (`hybrid.rs:112`).
 
-See @research/pipeline.md for the planned staged async daemon design.
+See @research/pipeline.md for diagrams.
 
-### Daemon Startup (current)
+### Daemon Startup
 
-Sequential: embedder → expander → reranker → bind socket → write PID.
-Client blocks up to 10s on PID file. Idle timeout: 3600s (configurable via `ir daemon start --timeout`).
+Staged async: BM25 runs in-process immediately. Daemon starts in background.
 
-**Planned**: bind socket after Tier 1 ready; signal Tier 2 separately. BM25 runs in-process while daemon loads. See @research/pipeline.md.
+- Tier 1 ready: embedder loaded → socket bound → client unblocks (waits up to 3s)
+- Tier 2 ready: expander + reranker loaded → tier2 signal file written → client re-queries if needed (waits up to 7s)
+
+Idle timeout: 3600s (configurable via `ir daemon start --timeout`).
 
 ## Known Gotchas
 
@@ -77,7 +79,7 @@ Client blocks up to 10s on PID file. Idle timeout: 3600s (configurable via `ir d
 - **Daemon requires restart after binary change**: `ir search` auto-starts the daemon but won't restart a running one. Kill it with `ir daemon stop` after rebuilding.
 - **`ir embed` prints "GPU context unavailable, falling back to CPU"** in sandboxed environments — normal, not an error.
 - **Never run embedding or LLM inference in background shell tasks** — sandboxed shells have no Metal access, so they fall back to CPU and peg it. Hand these off to the user's terminal instead.
-- **Strong-signal shortcut**: BM25 top score ≥ 0.85 AND gap ≥ 0.10 skips expansion+reranking entirely. Adjust in `src/search/hybrid.rs:is_strong_signal`.
+- **Strong-signal shortcut**: raw BM25 top ≥ 0.75 AND gap ≥ 0.10 skips all LLM work (`is_bm25_strong_signal`); fused top*gap ≥ 0.06 AND top ≥ 0.40 skips tier-2 (`is_strong_signal`). Both in `src/search/hybrid.rs`.
 
 ## Release
 

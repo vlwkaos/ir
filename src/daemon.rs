@@ -266,9 +266,13 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
         };
 
         // Send models to main thread before writing signal file.
-        let _ = tx.send(Tier2 { expander, scorer });
-        let _ = std::fs::write(&tier2_path_bg, "");
-        eprintln!("  tier-2 ready");
+        if expander.is_some() || scorer.is_some() {
+            let _ = tx.send(Tier2 { expander, scorer });
+            let _ = std::fs::write(&tier2_path_bg, "");
+            eprintln!("  tier-2 ready");
+        } else {
+            eprintln!("  tier-2 skipped (no models available)");
+        }
     });
 
     // Inactivity watchdog: exit after `timeout_secs` of no queries.
