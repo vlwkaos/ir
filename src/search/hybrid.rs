@@ -75,8 +75,8 @@ pub(crate) const STRONG_SIGNAL_FLOOR: f64 = 0.40;
 
 /// Tier-0 shortcut on raw BM25 scores (pos/(1+pos) normalization).
 /// Higher floor than fused thresholds — raw BM25 at 0.40 is a moderate match, not a strong one.
-pub(crate) const BM25_STRONG_FLOOR: f64 = 0.75;
-pub(crate) const BM25_STRONG_GAP: f64 = 0.10;
+pub const BM25_STRONG_FLOOR: f64 = 0.75;
+pub const BM25_STRONG_GAP: f64 = 0.10;
 
 impl HybridSearch {
     pub fn search(&self, dbs: &[CollectionDb], req: &HybridRequest) -> Result<SearchOutput> {
@@ -349,7 +349,7 @@ pub(crate) fn is_strong_signal(results: &[SearchResult]) -> bool {
 
 /// Tier-0 shortcut on raw BM25 scores before any vector retrieval.
 /// Higher thresholds than fused shortcut — raw BM25 at 0.40 is a moderate match.
-pub(crate) fn is_bm25_strong_signal(results: &[SearchResult]) -> bool {
+pub fn is_bm25_strong_signal(results: &[SearchResult]) -> bool {
     let top = match results.first() {
         Some(r) if r.score >= BM25_STRONG_FLOOR => r.score,
         _ => return false,
