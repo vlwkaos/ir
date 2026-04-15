@@ -1,5 +1,5 @@
 // Shared autoregressive generation: tokenize prompt → sampling loop → string output.
-// Used by Expander and Qwen35.
+// Used by Expander and Combined.
 // docs: https://docs.rs/llama-cpp-2/latest/llama_cpp_2/
 
 use crate::error::{Error, Result};

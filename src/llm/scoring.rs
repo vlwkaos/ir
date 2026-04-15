@@ -1,5 +1,5 @@
 // Shared yes/no logit scoring: ChatML prompt → tokenize → decode → softmax.
-// Used by Reranker and Qwen35 (identical protocol).
+// Used by Reranker and Combined (identical protocol).
 // docs: https://docs.rs/llama-cpp-2/latest/llama_cpp_2/
 
 use crate::error::{Error, Result};

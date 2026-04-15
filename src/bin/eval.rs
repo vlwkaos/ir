@@ -482,10 +482,12 @@ fn eval_run_key(args: &Args) -> String {
     let reranker_model = std::env::var("IR_RERANKER_MODEL")
         .or_else(|_| std::env::var("QMD_RERANKER_MODEL"))
         .unwrap_or_default();
-    let qwen_model = std::env::var("IR_QWEN_MODEL").unwrap_or_default();
+    let combined_model = std::env::var("IR_COMBINED_MODEL")
+        .or_else(|_| std::env::var("IR_QWEN_MODEL"))
+        .unwrap_or_default();
     let pp = args.preprocessor.as_deref().unwrap_or("");
     format!(
-        "embed={embed_model}|expander={expander_model}|reranker={reranker_model}|qwen={qwen_model}|\
+        "embed={embed_model}|expander={expander_model}|reranker={reranker_model}|combined={combined_model}|\
          alpha={:.4}|chunk={:?}|rerank={},w={:.3},n={}|expander_on={}|prf={}|alpha_norm={:.3}|\
          rrf_k={:.1},lex={:.2},vec={:.2},hyde={:.2}|title_w={:.2}|pp={pp}",
         args.alpha,

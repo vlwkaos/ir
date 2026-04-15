@@ -1,4 +1,6 @@
-// Unified Qwen3.5 model: handles both reranking and query expansion in one GGUF load.
+// Combined model: one GGUF load serving both query expansion and reranking.
+// Activated via IR_COMBINED_MODEL (preferred) or IR_QWEN_MODEL (deprecated).
+// Currently tuned for instruction-following models with ChatML format (Qwen3.5).
 // docs: https://docs.rs/llama-cpp-2/latest/llama_cpp_2/
 //
 // Reranker role:  Yes/No logit scoring (same protocol as reranker.rs)
@@ -6,8 +8,6 @@
 //
 // Prompts are DSPy-MIPROv2 optimized (see research/dspy_optimize.py).
 // Run research/dspy_optimize.py to re-optimize; hardcode results here.
-//
-// env: IR_QWEN_MODEL — full path or directory containing the GGUF
 
 use crate::error::{Error, Result};
 use crate::llm::{LlamaBackend, model_load_params, models};
@@ -23,7 +23,7 @@ const RERANK_CONTEXT_SIZE: u32 = 2048;
 const EXPAND_CONTEXT_SIZE: u32 = 2048;
 const MAX_EXPAND_TOKENS: usize = 300;
 
-pub struct Qwen35 {
+pub struct Combined {
     backend: &'static LlamaBackend,
     model: LlamaModel,
     model_filename: String,
@@ -34,14 +34,14 @@ pub struct Qwen35 {
 }
 
 // ! Safety: LlamaModel is Send+Sync, LlamaContext access is serialized by Mutex
-unsafe impl Send for Qwen35 {}
-unsafe impl Sync for Qwen35 {}
+unsafe impl Send for Combined {}
+unsafe impl Sync for Combined {}
 
-impl Qwen35 {
+impl Combined {
     pub fn load(path: &Path) -> Result<Self> {
         let backend = crate::llm::init_backend()?;
         let model = LlamaModel::load_from_file(backend, path, &model_load_params())
-            .map_err(|e| Error::Other(format!("load qwen3.5: {e}")))?;
+            .map_err(|e| Error::Other(format!("load combined model: {e}")))?;
         let model_filename = path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
@@ -57,21 +57,42 @@ impl Qwen35 {
         })
     }
 
-    pub fn load_default() -> Result<Self> {
-        // Try IR_QWEN_MODEL env first, then fall back to default filename search.
-        if let Some(path) = resolve_qwen_env() {
-            return Self::load(&path);
-        }
-        // Prefer 2B, fall back to 0.8B
-        for filename in &[models::QWEN35_2B, models::QWEN35_0_8B] {
-            if let Some(path) = crate::llm::find_model(filename) {
-                return Self::load(&path);
+    pub fn name(&self) -> &str {
+        &self.model_filename
+    }
+
+    /// Resolve the combined model path from env vars, or search local model dirs.
+    /// Returns `Ok(None)` when no env var is set and no known model file is found locally.
+    pub fn try_load_default() -> Result<Option<Self>> {
+        use crate::llm::env;
+
+        // Priority: IR_COMBINED_MODEL > IR_QWEN_MODEL (deprecated).
+        let env_key: &[&str] = if std::env::var_os(env::COMBINED_MODEL).is_some() {
+            &[env::COMBINED_MODEL]
+        } else if std::env::var_os(env::QWEN_MODEL).is_some() {
+            eprintln!("ir: IR_QWEN_MODEL is deprecated — use IR_COMBINED_MODEL instead");
+            &[env::QWEN_MODEL]
+        } else {
+            &[]
+        };
+
+        if env_key.is_empty() {
+            // No env var — check whether a known file exists locally (no download).
+            for filename in &[models::QWEN35_2B, models::QWEN35_0_8B] {
+                if let Some(path) = crate::llm::find_model(filename) {
+                    return Ok(Some(Self::load(&path)?));
+                }
             }
+            return Ok(None);
         }
-        Err(Error::Other(format!(
-            "Qwen3.5 model not found. Set IR_QWEN_MODEL or place {} in ~/local-models/",
-            models::QWEN35_2B
-        )))
+
+        match crate::llm::download::resolve_env_hf_or_path(
+            env_key,
+            &[models::QWEN35_2B, models::QWEN35_0_8B],
+        )? {
+            Some(p) => Ok(Some(Self::load(&p)?)),
+            None => Ok(None),
+        }
     }
 
     /// Expand a query into typed sub-queries (lex/vec/hyde). Falls back on parse failure.
@@ -121,14 +142,14 @@ impl Qwen35 {
     }
 }
 
-impl Drop for Qwen35 {
+impl Drop for Combined {
     fn drop(&mut self) {
         // ! Drop context before model
         let _ = self.cached_rerank_ctx.lock().map(|mut g| g.take());
     }
 }
 
-impl Scorer for Qwen35 {
+impl Scorer for Combined {
     fn model_id(&self) -> &str {
         &self.model_filename
     }
@@ -149,7 +170,7 @@ impl Scorer for Qwen35 {
     }
 }
 
-impl QueryExpander for Qwen35 {
+impl QueryExpander for Combined {
     fn expand_query(&self, query: &str) -> Result<Vec<SubQuery>> {
         self.expand(query)
     }
@@ -171,23 +192,6 @@ fn build_expand_prompt(query: &str) -> String {
     )
 }
 
-fn resolve_qwen_env() -> Option<std::path::PathBuf> {
-    let raw = std::env::var_os("IR_QWEN_MODEL")?;
-    let path = std::path::PathBuf::from(raw);
-    if path.is_file() {
-        return Some(path);
-    }
-    // Directory: try both model filenames
-    if path.is_dir() {
-        for filename in &[models::QWEN35_2B, models::QWEN35_0_8B] {
-            let candidate = path.join(filename);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
 
 #[cfg(test)]
 mod tests {
@@ -196,24 +200,20 @@ mod tests {
     #[test]
     #[ignore]
     fn load_0_8b_and_tokenize() {
-        // Phase 1c smoke test: verify Gated DeltaNet works in llama-cpp-2
-        // Download: huggingface.co/unsloth/Qwen3.5-0.8B-GGUF → ~/local-models/
         let path = dirs::home_dir()
             .unwrap()
             .join("local-models")
             .join(models::QWEN35_0_8B);
         assert!(path.exists(), "model not found: {}", path.display());
 
-        let q = Qwen35::load(&path).expect("load 0.8B");
+        let q = Combined::load(&path).expect("load 0.8B");
 
-        // Smoke: tokenize a short string
         let tokens = q
             .model
             .str_to_token("hello world", AddBos::Never)
             .expect("tokenize");
         assert!(!tokens.is_empty(), "tokenization returned empty");
 
-        // Generate 10 tokens from a trivial prompt
         let result = q.expand("hello");
         assert!(result.is_ok(), "expand failed: {:?}", result.err());
         println!("0.8B output: {:?}", result.unwrap());
@@ -228,7 +228,7 @@ mod tests {
             .join(models::QWEN35_2B);
         assert!(path.exists(), "model not found: {}", path.display());
 
-        let q = Qwen35::load(&path).expect("load 2B");
+        let q = Combined::load(&path).expect("load 2B");
         let tokens = q
             .model
             .str_to_token("hello world", AddBos::Never)
@@ -241,7 +241,7 @@ mod tests {
     #[ignore]
     fn expand_returns_valid_subqueries() {
         use crate::llm::expander::SubQueryKind;
-        let q = Qwen35::load_default().expect("load model");
+        let q = Combined::try_load_default().expect("load model").unwrap();
         let subs = q.expand("rust memory management").expect("expand");
         assert!(!subs.is_empty());
         let any_relevant = subs
@@ -258,7 +258,7 @@ mod tests {
     #[ignore]
     fn score_batch_orders_correctly() {
         use crate::llm::scoring::Scorer;
-        let q = Qwen35::load_default().expect("load model");
+        let q = Combined::try_load_default().expect("load model").unwrap();
         let scores = q
             .score_batch(
                 "rust memory management",
