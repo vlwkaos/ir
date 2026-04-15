@@ -16,7 +16,7 @@ cargo test -- --ignored            # includes LLM tests (require model files)
 
 Benchmark runner (requires BEIR dataset):
 ```bash
-scripts/bench.sh --data test-data/nfcorpus baseline "B:IR_QWEN_MODEL=~/local-models/Qwen3.5-0.8B-Q8_0.gguf"
+scripts/bench.sh --data test-data/nfcorpus baseline "B:IR_COMBINED_MODEL=~/local-models/Qwen3.5-0.8B-Q8_0.gguf"
 ```
 Logs go to `logs/` (gitignored).
 
@@ -27,7 +27,7 @@ Logs go to `logs/` (gitignored).
 | `IR_EMBEDDING_MODEL` | auto-detect | Path to embedding GGUF |
 | `IR_EXPANDER_MODEL` | auto-detect | Path to expander GGUF (qmd-1.7B) |
 | `IR_RERANKER_MODEL` | auto-detect | Path to reranker GGUF (Qwen3-0.6B) |
-| `IR_QWEN_MODEL` | unset | Unified Qwen3.5 GGUF — replaces both expander + reranker |
+| `IR_COMBINED_MODEL` | unset | Unified Qwen3.5 GGUF — replaces both expander + reranker (`IR_QWEN_MODEL` deprecated alias) |
 | `IR_GPU_LAYERS` | `99` on macOS | Number of layers offloaded to GPU |
 | `IR_FORCE_CPU_BACKEND` | unset | Set to `1` to disable Metal |
 | `IR_LLAMA_LOGS` | unset | Set to `1` to enable llama.cpp verbose logging |
@@ -92,3 +92,12 @@ cargo publish   # publishes as ir-search
 ```
 
 Requires `dangerouslyDisableSandbox: true` — gh CLI reads `~/.config/gh` (sandbox read deny list); tap writes to `~/ws-ps/homebrew-tap` (add to sandbox write allowlist to avoid this).
+
+## good-to-go
+
+Recurring audit axes (auto-maintained by /good-to-go):
+- README.md + README.ko.md must both be updated for any user-facing feature (CLI flags, env vars, output formats)
+- CHANGELOG.md Unreleased section must cover: new CLI flags, env var renames/deprecations, breaking behavior changes
+- Enum variants in types.rs must be wired to a CLI flag or MCP field — check with `rg 'Variant::' src/ | grep -v test`
+- Preprocessor protocol tests must use line-flushing commands (cat, rev) not buffered ones (tr, sed, sort)
+- IR_COMBINED_MODEL is the canonical combined-model env var; IR_QWEN_MODEL is a deprecated alias — do not promote the alias in new docs

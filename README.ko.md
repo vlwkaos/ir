@@ -82,13 +82,13 @@ ir search "서울 지하철" -c wiki
 | [qmd-query-expansion 1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | `tobil/qmd-query-expansion-1.7B` | 쿼리 확장 전용 (선택) |
 | [BGE-M3 568M](https://huggingface.co/ggml-org/bge-m3-Q8_0-GGUF) | `ggml-org/bge-m3-Q8_0-GGUF` | 한국어 임베딩 대안 (선택) |
 
-BM25 검색은 모델 없이 동작합니다. `IR_QWEN_MODEL`이 설정되거나 `~/local-models/`에 Qwen3.5 GGUF가 있으면 확장기와 재순위기를 대체합니다.
+BM25 검색은 모델 없이 동작합니다. `IR_COMBINED_MODEL`이 설정되거나 `~/local-models/`에 Qwen3.5 GGUF가 있으면 확장기와 재순위기를 대체합니다.
 
 **로컬 모델:**
 
 ```bash
 export IR_MODEL_DIRS="$HOME/my-models"
-export IR_QWEN_MODEL="$HOME/local-models/Qwen3.5-2B-Q4_K_M.gguf"   # 통합
+export IR_COMBINED_MODEL="$HOME/local-models/Qwen3.5-2B-Q4_K_M.gguf"   # 통합
 export IR_EMBEDDING_MODEL="$HOME/my-models/embeddinggemma-300M-Q8_0.gguf"
 export IR_RERANKER_MODEL="$HOME/my-models/qwen3-reranker-0.6b-q8_0.gguf"
 export IR_EXPANDER_MODEL="$HOME/my-models/qmd-query-expansion-1.7B-q4_k_m.gguf"
@@ -178,6 +178,7 @@ ir search "소유권" --md
 ir search "소유권" --files       # 경로만
 ir search "소유권" --full        # 결과에 문서 전문 포함
 ir search "소유권" --chunk       # 가장 관련성 높은 청크 텍스트 포함 (벡터 결과)
+ir search "소유권" --quiet       # stderr 억제 (진행 표시, 로그) — 스크립팅용
 ```
 
 **문서 조회:**

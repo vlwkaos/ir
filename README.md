@@ -67,13 +67,13 @@ Models are downloaded automatically from HuggingFace Hub on first use and cached
 | [qmd-query-expansion 1.7B](https://huggingface.co/tobil/qmd-query-expansion-1.7B) | `tobil/qmd-query-expansion-1.7B` | expansion only (optional) |
 | [BGE-M3 568M](https://huggingface.co/ggml-org/bge-m3-Q8_0-GGUF) | `ggml-org/bge-m3-Q8_0-GGUF` | Korean embedding alternative (optional) |
 
-BM25 search works without any models. When `IR_QWEN_MODEL` is set (or a Qwen3.5 GGUF is found in `~/local-models/`), it replaces both the expander and reranker.
+BM25 search works without any models. When `IR_COMBINED_MODEL` is set (or a Qwen3.5 GGUF is found in `~/local-models/`), it replaces both the expander and reranker.
 
 **Local models:**
 
 ```bash
 export IR_MODEL_DIRS="$HOME/my-models"
-export IR_QWEN_MODEL="$HOME/local-models/Qwen3.5-2B-Q4_K_M.gguf"   # unified
+export IR_COMBINED_MODEL="$HOME/local-models/Qwen3.5-2B-Q4_K_M.gguf"   # unified
 export IR_EMBEDDING_MODEL="$HOME/my-models/embeddinggemma-300M-Q8_0.gguf"
 export IR_RERANKER_MODEL="$HOME/my-models/qwen3-reranker-0.6b-q8_0.gguf"
 export IR_EXPANDER_MODEL="$HOME/my-models/qmd-query-expansion-1.7B-q4_k_m.gguf"
@@ -134,6 +134,7 @@ ir search "ownership" --md
 ir search "ownership" --files       # paths only
 ir search "ownership" --full        # include full document content in results
 ir search "ownership" --chunk       # include best-matching chunk text (vector results)
+ir search "ownership" --quiet       # suppress stderr (progress, logs) — for scripting
 ```
 
 **Retrieve documents:**

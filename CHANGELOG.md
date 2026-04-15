@@ -2,6 +2,8 @@
 
 ### Features
 
+- `ir search --quiet` / `-q`: suppress all stderr output (progress indicators, daemon log lines). Useful for scripting. Conflicts with `--verbose`.
+- `IR_COMBINED_MODEL`: new canonical env var for the unified Qwen3.5 GGUF (replaces both expander + reranker). `IR_QWEN_MODEL` still accepted but emits a deprecation warning on load.
 - `IR_*_MODEL` env vars now accept HuggingFace repo IDs (`owner/name`) in addition to local file and directory paths. Setting e.g. `IR_EMBEDDING_MODEL=ggml-org/bge-m3-Q8_0-GGUF` downloads and caches the model automatically on first use.
 - BGE-M3 added to the auto-download registry (`ggml-org/bge-m3-Q8_0-GGUF`). Download progress is shown in the foreground terminal; the daemon loads from cache and starts instantly.
 - Download UX improved: a structured message is printed before the HF progress bar showing model name, size hint, source URL, cache location, and a tip for offline use.
