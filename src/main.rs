@@ -46,6 +46,7 @@ fn run() -> Result<()> {
             md,
             files,
             verbose,
+            quiet,
         } => handle_search(
             query.join(" "),
             mode,
@@ -58,7 +59,7 @@ fn run() -> Result<()> {
             csv,
             md,
             files,
-            verbose,
+            if verbose { types::Verbosity::Verbose } else if quiet { types::Verbosity::Quiet } else { types::Verbosity::Normal },
         ),
         Command::Get { target, collections, section, offset, max_chars, json } => {
             handle_get(target, collections, section, offset, max_chars, json)
@@ -420,7 +421,7 @@ fn handle_search(
     csv: bool,
     md: bool,
     files: bool,
-    verbose: bool,
+    verbosity: types::Verbosity,
 ) -> Result<()> {
     let fmt = if json {
         output::Format::Json
@@ -434,7 +435,6 @@ fn handle_search(
         output::Format::Pretty
     };
 
-    let verbosity = if verbose { types::Verbosity::Verbose } else { types::Verbosity::Normal };
     let mut results = search_core(&query, &mode, limit, min_score, &collection_filter, verbosity)?;
 
     if full {
@@ -638,6 +638,7 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
 
 enum PreprocessorKind {
     Binary { binary_name: &'static str },
+    #[allow(dead_code)] // reserved for future script-based preprocessors
     Script { repo_subdir: &'static str, script_name: &'static str },
 }
 struct KnownPreprocessor {

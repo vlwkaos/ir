@@ -70,6 +70,9 @@ pub enum Command {
         /// Show pipeline decisions and timing
         #[arg(long, short = 'v')]
         verbose: bool,
+        /// Suppress all stderr output (progress, logs)
+        #[arg(long, short = 'q', conflicts_with = "verbose")]
+        quiet: bool,
     },
     /// Retrieve a document by path
     Get {
