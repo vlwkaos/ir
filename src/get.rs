@@ -1,7 +1,7 @@
 // Document retrieval by path -- shared by CLI and MCP.
 // Supports exact, suffix, and substring matching with vault-root path resolution.
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -198,8 +198,10 @@ fn apply_chunks_from_conn(
     Ok(())
 }
 
-/// Inner: fetch a single chunk from an open connection.
+/// Inner: fetch a single chunk from an open connection. Used in tests only.
+#[cfg(test)]
 fn fetch_chunk_from_conn(conn: &Connection, hash: &str, seq: usize) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
     let doc: Option<String> = conn
         .query_row(
             "SELECT doc FROM content WHERE hash = ?1",
@@ -245,24 +247,6 @@ pub fn populate_chunk_content(results: &mut [SearchResult]) -> Result<()> {
         apply_chunks_from_conn(&conn, items, results)?;
     }
     Ok(())
-}
-
-/// Return the text of chunk `seq` for a single document by hash.
-/// For batch use over multiple search results, prefer `populate_chunk_content`.
-pub fn fetch_chunk_text(hash: &str, seq: usize, collection: &str) -> Result<Option<String>> {
-    let config = Config::load()?;
-    let col = match config.get_collection(collection) {
-        Some(c) => c,
-        None => return Ok(None),
-    };
-    let db_path = collection_db_path(&col.name);
-    let conn = match open_readonly(&db_path) {
-        Ok(c) => c,
-        Err(rusqlite::Error::SqliteFailure(e, _))
-            if e.code == rusqlite::ErrorCode::CannotOpen => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    fetch_chunk_from_conn(&conn, hash, seq)
 }
 
 // ── section extraction ───────────────────────────────────────────────────────
