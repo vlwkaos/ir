@@ -299,6 +299,8 @@ pub(crate) fn search_core(
     collection_filter: &[String],
     verbosity: types::Verbosity,
 ) -> Result<Vec<types::SearchResult>> {
+    llm::download::prepare_model_envs()?;
+
     let config = Config::load()?;
     let collection_names = resolve_collections(&config, collection_filter)?;
     let search_mode: SearchMode = mode.parse().map_err(error::Error::Other)?;
@@ -322,13 +324,17 @@ pub(crate) fn search_core(
         SearchMode::Vector => {}
         SearchMode::Hybrid => {
             if search::hybrid::is_bm25_strong_signal(&bm25_results) {
-                if !daemon::is_running() { let _ = daemon::start_in_background(); }
+                if !daemon::is_running() {
+                    llm::download::prepare_model_envs()?;
+                    let _ = daemon::start_in_background();
+                }
                 return Ok(bm25_results);
             }
         }
     }
 
     if !daemon::is_running() {
+        llm::download::prepare_model_envs()?;
         if let Err(e) = daemon::start_in_background() {
             if verbosity.show_progress() { eprintln!("note: could not start daemon ({e})"); }
             return Ok(bm25_results);
@@ -807,6 +813,7 @@ fn handle_embed(collection: Option<String>, force: bool) -> Result<()> {
         None => config.collections.iter().collect(),
     };
 
+    llm::download::prepare_model_envs()?;
     println!("loading embedding model…");
     let embedder = llm::embedding::Embedder::load_default()?;
 

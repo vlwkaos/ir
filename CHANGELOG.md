@@ -1,3 +1,16 @@
+## [Unreleased]
+
+### Features
+
+- `IR_*_MODEL` env vars now accept HuggingFace repo IDs (`owner/name`) in addition to local file and directory paths. Setting e.g. `IR_EMBEDDING_MODEL=ggml-org/bge-m3-Q8_0-GGUF` downloads and caches the model automatically on first use.
+- BGE-M3 added to the auto-download registry (`ggml-org/bge-m3-Q8_0-GGUF`). Download progress is shown in the foreground terminal; the daemon loads from cache and starts instantly.
+- Download UX improved: a structured message is printed before the HF progress bar showing model name, size hint, source URL, cache location, and a tip for offline use.
+- Download errors now include actionable fixes: network retry, offline mode (`HF_HUB_OFFLINE=1`), manual download URL, and cache directory path for clearing corrupt downloads.
+
+### Breaking
+
+- Unrecognized `IR_*_MODEL` values (not a file, directory, or known HF repo ID) now error immediately instead of silently falling through to the default model. Users with leftover garbage env vars will see an error with an "Accepted forms" list. Unset the env var to restore default behavior.
+
 ## [0.8.2] - 2026-04-15
 
 ### Features

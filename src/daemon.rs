@@ -306,6 +306,14 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     if sock_path.exists() { std::fs::remove_file(&sock_path).map_err(Error::Io)?; }
     let _ = std::fs::remove_file(&tier2_path);
 
+    // Validate + pre-download env-configured models before loading.
+    // When invoked via start_in_background, the client already ran this and
+    // the cache is warm — this is a fast idempotent no-op.
+    // When invoked directly (`ir daemon start`), this is the foreground path
+    // and download progress is visible in the user's terminal.
+    crate::llm::download::prepare_model_envs()
+        .map_err(|e| Error::Other(format!("model env check: {e}")))?;
+
     let gpu_on = crate::llm::gpu_layers() > 0;
     eprintln!("loading models (Metal: {})...", if gpu_on { "on" } else { "off" });
 
@@ -344,28 +352,39 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Tier2>(1);
     let tier2_path_bg = tier2_path.clone();
     std::thread::spawn(move || {
-        let qwen = std::env::var_os("IR_QWEN_MODEL")
-            .map(|_| crate::llm::qwen::Qwen35::load_default()
-                .map_err(|e| { eprintln!("  note: qwen unavailable ({e})"); e })
-                .ok())
+        // Try combined model first (IR_COMBINED_MODEL, or deprecated IR_QWEN_MODEL).
+        // On load failure, fall through to dedicated expander + reranker.
+        let combined = crate::llm::combined::Combined::try_load_default()
+            .map_err(|e| eprintln!("  note: combined model unavailable ({e}), falling back to dedicated models"))
+            .ok()
             .flatten()
             .map(std::sync::Arc::new);
 
-        let (expander, scorer) = if let Some(q) = qwen {
-            eprintln!("  qwen ready");
+        let (expander, scorer) = if let Some(c) = combined {
+            let name = c.name().to_string();
+            eprintln!("  tier-2: combined mode ({name})");
             (
-                Some(Box::new(q.clone()) as Box<dyn crate::llm::expander::QueryExpander>),
-                Some(Box::new(q) as Box<dyn crate::llm::scoring::Scorer>),
+                Some(Box::new(c.clone()) as Box<dyn crate::llm::expander::QueryExpander>),
+                Some(Box::new(c) as Box<dyn crate::llm::scoring::Scorer>),
             )
         } else {
             let exp = crate::llm::expander::Expander::load_default()
                 .map_err(|e| eprintln!("  note: expander unavailable ({e})"))
                 .ok()
-                .map(|e| { eprintln!("  expander ready"); Box::new(e) as Box<dyn crate::llm::expander::QueryExpander> });
+                .map(|e| {
+                    eprintln!("  expander ready ({})", crate::llm::models::EXPANDER);
+                    Box::new(e) as Box<dyn crate::llm::expander::QueryExpander>
+                });
             let rer = crate::llm::reranker::Reranker::load_default()
                 .map_err(|e| eprintln!("  note: reranker unavailable ({e})"))
                 .ok()
-                .map(|r| { eprintln!("  reranker ready"); Box::new(r) as Box<dyn crate::llm::scoring::Scorer> });
+                .map(|r| {
+                    eprintln!("  reranker ready ({})", crate::llm::models::RERANKER);
+                    Box::new(r) as Box<dyn crate::llm::scoring::Scorer>
+                });
+            if exp.is_some() || rer.is_some() {
+                eprintln!("  tier-2: dedicated mode");
+            }
             (exp, rer)
         };
 

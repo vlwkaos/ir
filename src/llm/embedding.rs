@@ -81,7 +81,13 @@ impl Embedder {
     }
 
     pub fn load_default() -> Result<Self> {
-        let path = crate::llm::download::ensure_model(models::EMBEDDING)?;
+        let path = match crate::llm::download::resolve_env_hf_or_path(
+            crate::llm::env::EMBEDDING_MODEL,
+            &[models::EMBEDDING, models::BGE_M3],
+        )? {
+            Some(p) => p,
+            None => crate::llm::download::ensure_model(models::EMBEDDING)?,
+        };
         let gpu_layers = crate::llm::gpu_layers();
         let embedder = Self::load_with_gpu_layers(&path, gpu_layers)?;
 

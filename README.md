@@ -81,6 +81,10 @@ export IR_EXPANDER_MODEL="$HOME/my-models/qmd-query-expansion-1.7B-q4_k_m.gguf"
 
 Search order: env → `IR_MODEL_DIRS` → `~/local-models/` → `~/.cache/ir/models/` → `~/.cache/qmd/models/` → HF Hub auto-download.
 
+`IR_*_MODEL` env vars accept a path to a `.gguf` file, a directory containing a known model file, or a HuggingFace repo ID (`owner/name`). Unrecognized values error immediately instead of silently loading the default.
+
+Known HF repo IDs: `ggml-org/embeddinggemma-300M-GGUF`, `ggml-org/bge-m3-Q8_0-GGUF`, `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF`, `tobil/qmd-query-expansion-1.7B`, `unsloth/Qwen3.5-0.8B-GGUF`, `unsloth/Qwen3.5-2B-GGUF`.
+
 Compatibility aliases: `QMD_EMBEDDING_MODEL`, `QMD_RERANKER_MODEL`, `QMD_EXPANDER_MODEL`, `QMD_MODEL_DIRS`.
 
 **GPU:**

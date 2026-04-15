@@ -8,7 +8,7 @@
 // docs: https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md
 
 use crate::error::{Error, Result};
-use crate::llm::{LlamaBackend, model_load_params, models};
+use crate::llm::{LlamaBackend, env, model_load_params, models};
 use llama_cpp_2::model::{AddBos, LlamaModel};
 // Note: grammar-constrained sampling (GBNF) is intentionally not used here.
 // llama_grammar_reject_candidates has an assertion failure with this llama.cpp version
@@ -62,7 +62,13 @@ impl Expander {
     }
 
     pub fn load_default() -> Result<Self> {
-        let path = crate::llm::download::ensure_model(models::EXPANDER)?;
+        let path = match crate::llm::download::resolve_env_hf_or_path(
+            env::EXPANDER_MODEL,
+            &[models::EXPANDER],
+        )? {
+            Some(p) => p,
+            None => crate::llm::download::ensure_model(models::EXPANDER)?,
+        };
         Self::load(&path)
     }
 

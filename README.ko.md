@@ -96,6 +96,8 @@ export IR_EXPANDER_MODEL="$HOME/my-models/qmd-query-expansion-1.7B-q4_k_m.gguf"
 
 탐색 순서: 환경변수 → `IR_MODEL_DIRS` → `~/local-models/` → `~/.cache/ir/models/` → `~/.cache/qmd/models/` → HF Hub 자동 다운로드.
 
+`IR_*_MODEL` 환경변수는 `.gguf` 파일 경로, 모델이 포함된 디렉터리 경로, 또는 HuggingFace 레포 ID(`owner/name`)를 허용합니다. 인식되지 않는 값은 기본 모델을 조용히 로드하는 대신 즉시 오류를 출력합니다.
+
 **GPU:**
 
 ```bash

@@ -9,11 +9,11 @@
 //      - ~/.cache/ir/models/
 //      - ~/.cache/qmd/models/
 
+pub mod combined;
 pub mod download;
 pub mod embedding;
 pub mod expander;
 pub mod generate;
-pub mod qwen;
 pub mod reranker;
 pub mod scoring;
 
@@ -35,6 +35,7 @@ pub mod models {
     pub const EXPANDER: &str = "qmd-query-expansion-1.7B-q4_k_m.gguf";
     pub const QWEN35_0_8B: &str = "Qwen3.5-0.8B-Q8_0.gguf";
     pub const QWEN35_2B: &str = "Qwen3.5-2B-Q4_K_M.gguf";
+    pub const BGE_M3: &str = "bge-m3-q8_0.gguf";
 }
 
 /// HuggingFace repo + filename for each known model.
@@ -61,6 +62,10 @@ pub mod hf_repos {
         "unsloth/Qwen3.5-2B-GGUF",
         "Qwen3.5-2B-Q4_K_M.gguf",
     );
+    pub const BGE_M3: (&str, &str) = (
+        "ggml-org/bge-m3-Q8_0-GGUF",
+        "bge-m3-q8_0.gguf",
+    );
 
     /// Returns `(repo_id, hf_filename)` for a local model filename, or `None`.
     pub fn for_filename(filename: &str) -> Option<(&'static str, &'static str)> {
@@ -70,7 +75,34 @@ pub mod hf_repos {
             super::models::EXPANDER => Some(EXPANDER),
             super::models::QWEN35_0_8B => Some(QWEN35_0_8B),
             super::models::QWEN35_2B => Some(QWEN35_2B),
+            super::models::BGE_M3 => Some(BGE_M3),
             _ => None,
+        }
+    }
+
+    /// All known (repo_id, hf_filename) pairs.
+    pub fn all_known_repos() -> &'static [(&'static str, &'static str)] {
+        &[EMBEDDING, RERANKER, EXPANDER, QWEN35_0_8B, QWEN35_2B, BGE_M3]
+    }
+
+    /// Reverse lookup: HF repo ID → local canonical filename. Case-insensitive.
+    /// Returns `None` for unknown repos.
+    pub fn local_filename_for_repo(repo_id: &str) -> Option<&'static str> {
+        let eq = |s: &str| s.eq_ignore_ascii_case(repo_id);
+        if eq(EMBEDDING.0) {
+            Some(super::models::EMBEDDING)
+        } else if eq(RERANKER.0) {
+            Some(super::models::RERANKER)
+        } else if eq(EXPANDER.0) {
+            Some(super::models::EXPANDER)
+        } else if eq(QWEN35_0_8B.0) {
+            Some(super::models::QWEN35_0_8B)
+        } else if eq(QWEN35_2B.0) {
+            Some(super::models::QWEN35_2B)
+        } else if eq(BGE_M3.0) {
+            Some(super::models::BGE_M3)
+        } else {
+            None
         }
     }
 }
@@ -162,11 +194,17 @@ pub mod env {
         "QMD_EXPANDER_MODEL",
         "QMD_EXPAND_MODEL",
     ];
-    /// Unified Qwen3.5 model (reranker + expander). Takes priority over separate models.
+    /// Combined model: one GGUF serving both expander + reranker roles.
+    pub const COMBINED_MODEL: &str = "IR_COMBINED_MODEL";
+    /// Deprecated alias for IR_COMBINED_MODEL. Still accepted; emits a warning.
     pub const QWEN_MODEL: &str = "IR_QWEN_MODEL";
 }
 
 /// Env vars that can override the full path for a known model filename.
+///
+/// ^ BGE_M3 must NOT appear here. `resolve_env_hf_or_path` calls `ensure_model("bge-m3-q8_0.gguf")`
+/// ^ which calls `find_model` → `resolve_model_override` → this function. If BGE_M3 were registered,
+/// ^ that would re-read `IR_EMBEDDING_MODEL` and call `ensure_model` again — infinite loop.
 pub fn model_override_env_vars(filename: &str) -> &'static [&'static str] {
     match filename {
         models::EMBEDDING => env::EMBEDDING_MODEL,
@@ -339,5 +377,59 @@ mod tests {
             model_override_env_vars(models::EXPANDER),
             env::EXPANDER_MODEL
         );
+    }
+
+    // ^ Regression guard for loop-prevention invariant. See comment on model_override_env_vars.
+    #[test]
+    fn bge_m3_not_in_model_override_env_vars() {
+        assert!(
+            model_override_env_vars(models::BGE_M3).is_empty(),
+            "BGE_M3 must not appear in model_override_env_vars — it would cause infinite recursion"
+        );
+    }
+
+    #[test]
+    fn bge_m3_is_in_hf_repos() {
+        assert!(
+            hf_repos::for_filename(models::BGE_M3).is_some(),
+            "BGE_M3 must have an HF repo entry"
+        );
+    }
+
+    #[test]
+    fn all_known_repos_contains_bge_m3() {
+        let repos = hf_repos::all_known_repos();
+        assert!(
+            repos.iter().any(|(repo_id, _)| *repo_id == hf_repos::BGE_M3.0),
+            "all_known_repos must include BGE_M3"
+        );
+    }
+
+    #[test]
+    fn local_filename_for_repo_maps_all_known() {
+        for (repo_id, _) in hf_repos::all_known_repos() {
+            assert!(
+                hf_repos::local_filename_for_repo(repo_id).is_some(),
+                "no local filename for repo: {repo_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_filename_for_repo_case_insensitive() {
+        // HF repo IDs are case-insensitive in practice.
+        assert_eq!(
+            hf_repos::local_filename_for_repo("GGML-ORG/BGE-M3-Q8_0-GGUF"),
+            Some(models::BGE_M3)
+        );
+        assert_eq!(
+            hf_repos::local_filename_for_repo("ggml-org/bge-m3-Q8_0-GGUF"),
+            Some(models::BGE_M3)
+        );
+    }
+
+    #[test]
+    fn local_filename_for_repo_returns_none_for_unknown() {
+        assert_eq!(hf_repos::local_filename_for_repo("nobody/fake-model"), None);
     }
 }
