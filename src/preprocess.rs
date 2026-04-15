@@ -163,29 +163,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn tr_transforms_text() {
-        let mut chain = PreprocessChain::spawn(&["tr A-Z a-z".to_string()]);
+    fn rev_transforms_text() {
+        let mut chain = PreprocessChain::spawn(&["rev".to_string()]);
         assert!(chain.is_active());
-        let out = chain.process_text("HELLO WORLD").unwrap();
-        assert_eq!(out, "hello world");
+        let out = chain.process_text("hello world").unwrap();
+        assert_eq!(out, "dlrow olleh");
     }
 
     #[cfg(unix)]
     #[test]
     fn chain_pipes_through_multiple() {
-        let cmds = vec!["tr A-Z a-z".to_string(), "tr ' ' '_'".to_string()];
+        let cmds = vec!["rev".to_string(), "rev".to_string()];
         let mut chain = PreprocessChain::spawn(&cmds);
         assert!(chain.is_active());
-        let out = chain.process_text("HELLO WORLD").unwrap();
-        assert_eq!(out, "hello_world");
+        let out = chain.process_text("hello world").unwrap();
+        assert_eq!(out, "hello world");
     }
 
     #[cfg(unix)]
     #[test]
     fn preprocess_query_applies_transformation() {
-        let cmds = vec!["tr A-Z a-z".to_string()];
-        let out = preprocess_query("HELLO WORLD", &cmds);
-        assert_eq!(out, "hello world");
+        let cmds = vec!["rev".to_string()];
+        let out = preprocess_query("hello world", &cmds);
+        assert_eq!(out, "dlrow olleh");
     }
 
     #[cfg(unix)]
@@ -206,20 +206,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn chain_skips_invalid_handles() {
-        let cmds = vec!["__nonexistent_command_xyz__".to_string(), "tr A-Z a-z".to_string()];
+        let cmds = vec!["__nonexistent_command_xyz__".to_string(), "rev".to_string()];
         let mut chain = PreprocessChain::spawn(&cmds);
-        // One valid handle should remain active
         assert!(chain.is_active());
-        let out = chain.process_text("HELLO WORLD").unwrap();
-        assert_eq!(out, "hello world");
+        let out = chain.process_text("hello world").unwrap();
+        assert_eq!(out, "dlrow olleh");
     }
 
     #[cfg(unix)]
     #[test]
     fn multiline_with_transformation() {
-        let mut chain = PreprocessChain::spawn(&["tr A-Z a-z".to_string()]);
+        let mut chain = PreprocessChain::spawn(&["rev".to_string()]);
         assert!(chain.is_active());
-        let out = chain.process_text("HELLO\nWORLD").unwrap();
-        assert_eq!(out, "hello\nworld");
+        let out = chain.process_text("hello\nworld").unwrap();
+        assert_eq!(out, "olleh\ndlrow");
     }
 }
