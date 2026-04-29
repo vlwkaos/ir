@@ -37,6 +37,14 @@ brew tap vlwkaos/tap
 brew install ir
 ```
 
+**Nix flake:**
+
+```bash
+nix run github:vlwkaos/ir              # 일회성 실행
+nix profile install github:vlwkaos/ir  # 영구 설치
+nix develop                            # rustc + 빌드 의존성 포함 개발 셸
+```
+
 **소스에서 빌드:**
 
 ```bash

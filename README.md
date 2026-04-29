@@ -36,6 +36,14 @@ Search quality benchmarked on 4 BEIR datasets; reranking adds up to +14.5% nDCG@
 brew install vlwkaos/tap/ir
 ```
 
+**Nix flake:**
+
+```bash
+nix run github:vlwkaos/ir            # one-off run
+nix profile install github:vlwkaos/ir  # persistent install
+nix develop                          # dev shell with rustc + build deps
+```
+
 **From source:**
 
 ```bash
