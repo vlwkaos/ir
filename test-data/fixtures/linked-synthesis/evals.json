@@ -1,0 +1,50 @@
+{
+  "collection": "linked-synthesis",
+  "tasks": [
+    {
+      "id": "routing_shortcut",
+      "query": "why does route_query return bm25 while daemon warms",
+      "expected_primary_path": "src/search.rs",
+      "required_related_paths": ["docs/search-routing.md"],
+      "required_related_kinds": ["markdown"],
+      "required_related_targets": ["docs/search-routing.md"],
+      "required_markers": ["routing-shortcut"],
+      "required_evidence_terms": [
+        "decisive BM25 evidence",
+        "daemon warms",
+        "semantic daemon warms"
+      ],
+      "expected_synthesis": "route_query returns BM25 immediately when lexical evidence is decisive, so latency stays low while the semantic daemon warms."
+    },
+    {
+      "id": "cache_key_model_version",
+      "query": "why does cache_key include model version",
+      "expected_primary_path": "src/cache.py",
+      "required_related_paths": ["docs/cache-policy.md"],
+      "required_related_kinds": ["wikilink"],
+      "required_related_targets": ["Cache Policy"],
+      "required_markers": ["cache-key-model-version"],
+      "required_evidence_terms": [
+        "model version",
+        "cache key",
+        "incompatible dimensions"
+      ],
+      "expected_synthesis": "cache_key includes the model version so cached embeddings are not reused across incompatible embedding dimensions after a model switch."
+    },
+    {
+      "id": "retry_budget_jitter",
+      "query": "why does retryDelay cap retries and add jitter",
+      "expected_primary_path": "src/retry.ts",
+      "required_related_paths": ["docs/retry-budget.md"],
+      "required_related_kinds": ["wikilink"],
+      "required_related_targets": ["Retry Budget"],
+      "required_markers": ["retry-budget-jitter"],
+      "required_evidence_terms": [
+        "caps retries",
+        "jitter",
+        "same instant"
+      ],
+      "expected_synthesis": "retryDelay caps attempts and adds jitter so workers do not retry at the same instant after a shared transient failure."
+    }
+  ]
+}
