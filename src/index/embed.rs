@@ -3,7 +3,7 @@
 
 use crate::db::{self, CollectionDb, vectors};
 use crate::error::Result;
-use crate::index::{chunker, new_progress_bar};
+use crate::index::new_progress_bar;
 use crate::llm::embedding::Embedder;
 use rusqlite::{Connection, params};
 
@@ -53,14 +53,14 @@ pub fn embed(
             break;
         }
 
-        for (path, title, hash, doc_text) in &pending {
+        for (path, _title, hash, _doc_text) in &pending {
             pb.set_message(path.clone());
 
             // Compute embeddings before touching the DB.
-            let chunks = chunker::chunk_document(doc_text);
-            let inputs: Vec<(String, String)> = chunks
+            let units = load_units_for_hash(conn, hash)?;
+            let inputs: Vec<(String, String)> = units
                 .iter()
-                .map(|c| (title.clone(), c.text.clone()))
+                .map(|u| (u.title.clone(), u.text.clone()))
                 .collect();
             let embeddings = embedder.embed_doc_batch(&inputs)?;
 
@@ -87,14 +87,14 @@ pub fn embed(
                     }
                     conn.execute("DELETE FROM content_vectors WHERE hash = ?1", [hash])?;
                 }
-                for (chunk, emb) in chunks.iter().zip(embeddings.iter()) {
-                    let hash_seq = format!("{hash}_{}", chunk.seq);
+                for (unit, emb) in units.iter().zip(embeddings.iter()) {
+                    let hash_seq = format!("{hash}_{}", unit.seq);
                     vectors::insert(conn, &hash_seq, emb)?;
                     vectors::mark_embedded(
                         conn,
                         hash,
-                        chunk.seq as i64,
-                        chunk.pos as i64,
+                        unit.seq as i64,
+                        unit.start_byte as i64,
                         model_name,
                     )?;
                 }
@@ -108,7 +108,7 @@ pub fn embed(
                 }
             }
 
-            total_chunks += chunks.len();
+            total_chunks += units.len();
             total_docs += 1;
             pb.inc(1);
         }
@@ -118,6 +118,33 @@ pub fn embed(
 
     pb.finish_with_message("done");
     Ok((total_docs, total_chunks))
+}
+
+#[derive(Debug)]
+struct PendingUnit {
+    seq: usize,
+    start_byte: usize,
+    title: String,
+    text: String,
+}
+
+fn load_units_for_hash(conn: &Connection, hash: &str) -> Result<Vec<PendingUnit>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq, start_byte, title, text
+         FROM content_units
+         WHERE hash = ?1
+         ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([hash], |row| {
+        Ok(PendingUnit {
+            seq: row.get::<_, i64>(0)? as usize,
+            start_byte: row.get::<_, i64>(1)? as usize,
+            title: row.get(2)?,
+            text: row.get(3)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn count_pending(conn: &Connection, force: bool) -> Result<usize> {

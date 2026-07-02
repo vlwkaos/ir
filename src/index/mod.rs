@@ -3,6 +3,7 @@ pub mod diff;
 pub mod embed;
 pub mod hasher;
 pub mod scanner;
+pub mod units;
 
 use crate::config::Config;
 use crate::db::CollectionDb;
@@ -70,7 +71,9 @@ pub fn update(
              DELETE FROM content;
              DELETE FROM content_vectors;
              DELETE FROM vectors_vec;
-             DELETE FROM llm_cache;",
+             DELETE FROM llm_cache;
+             DELETE FROM content_units;
+             DELETE FROM unit_links;",
         )?;
         // Re-init schema with correct trigger state.
         crate::db::schema::init(conn, &db.name, has_preprocessor)?;
@@ -285,6 +288,8 @@ fn store_document(
             )?;
         }
     }
+
+    units::store_units(conn, doc_id, rel_path, hash, text)?;
 
     // When chain is active, triggers are disabled — explicitly insert preprocessed text into FTS.
     if let Some(chain) = chain

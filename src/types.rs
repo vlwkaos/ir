@@ -46,6 +46,51 @@ pub struct SearchResult {
     /// Best-matching chunk index within the document (set by vector search; None for BM25-only results).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_seq: Option<usize>,
+    /// Best-matching indexed unit. Newer code should prefer this over chunk_seq.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_seq: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_byte: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_byte: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<RelatedItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RelatedItem {
+    pub kind: String,
+    pub target: String,
+    pub raw: String,
+    pub collection: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    pub resolved: bool,
 }
 
 impl SearchResult {

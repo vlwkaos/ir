@@ -779,6 +779,18 @@ mod tests {
             doc_id: "#h".into(),
             content: None,
             chunk_seq: None,
+            unit_seq: None,
+            unit_kind: None,
+            language: None,
+            symbol: None,
+            start_line: None,
+            end_line: None,
+            start_byte: None,
+            end_byte: None,
+            indexed_hash: None,
+            indexed_at: None,
+            markers: Vec::new(),
+            related: Vec::new(),
         };
 
         // Below floor → not strong
@@ -883,6 +895,18 @@ mod tests {
             doc_id: "#h".into(),
             content: None,
             chunk_seq: None,
+            unit_seq: None,
+            unit_kind: None,
+            language: None,
+            symbol: None,
+            start_line: None,
+            end_line: None,
+            start_byte: None,
+            end_byte: None,
+            indexed_hash: None,
+            indexed_at: None,
+            markers: Vec::new(),
+            related: Vec::new(),
         };
 
         let r = vec![make(0.70), make(0.60)];
@@ -919,6 +943,18 @@ mod tests {
             doc_id: "#h".into(),
             content: None,
             chunk_seq: None,
+            unit_seq: None,
+            unit_kind: None,
+            language: None,
+            symbol: None,
+            start_line: None,
+            end_line: None,
+            start_byte: None,
+            end_byte: None,
+            indexed_hash: None,
+            indexed_at: None,
+            markers: Vec::new(),
+            related: Vec::new(),
         };
 
         // Below floor → not strong
@@ -1030,6 +1066,18 @@ mod tests {
             doc_id: "#h".into(),
             content: None,
             chunk_seq: None,
+            unit_seq: None,
+            unit_kind: None,
+            language: None,
+            symbol: None,
+            start_line: None,
+            end_line: None,
+            start_byte: None,
+            end_byte: None,
+            indexed_hash: None,
+            indexed_at: None,
+            markers: Vec::new(),
+            related: Vec::new(),
         };
         let results = vec![make(0.9), make(0.5), make(0.3)];
         let filtered = apply_min_score(results, Some(0.6), 10);

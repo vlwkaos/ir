@@ -53,8 +53,12 @@ struct SearchInput {
     collections: Option<Vec<String>>,
     /// Include full document content in results (default: false; returns snippet only)
     full: Option<bool>,
-    /// Include best-matching chunk text in results (vector results only; ignored for BM25-only results)
+    /// Include best-matching chunk/unit text in results when available
     include_chunk: Option<bool>,
+    /// Include explicit one-hop related units from markers, wikilinks, markdown links, and related frontmatter
+    include_related: Option<bool>,
+    /// Maximum related items per result when include_related=true (default: 3)
+    related_limit: Option<usize>,
     /// Filter clauses (ANDed). Fields: path, modified_at, created_at, meta.<name>.
     /// Ops: =, !=, >, >=, <, <=, ~ (contains), !~ (not-contains).
     /// Example: [{"field":"modified_at","op":">=","value":"2024-01-01"},{"field":"meta.tags","op":"=","value":"rust"}]
@@ -141,7 +145,8 @@ impl IrMcpServer {
         description = "Hybrid BM25+vector search over indexed document collections. \
         Returns ranked results with file path, title, relevance score, and a text snippet. \
         Set full=true to include full document text inline. \
-        Set include_chunk=true to include the best-matching chunk text inline (vector results only). \
+        Set include_chunk=true to include best-matching chunk/unit text inline when available. \
+        Set include_related=true to include explicit one-hop linked context; related_limit is capped. \
         Use get or multi_get to retrieve full document text by path. \
         Use filter to narrow results by metadata: fields path, modified_at, created_at, meta.<name>; \
         ops =, !=, >, >=, <, <=, ~ (contains), !~ (not-contains); multiple clauses are ANDed."
@@ -155,6 +160,8 @@ impl IrMcpServer {
             collections,
             full,
             include_chunk,
+            include_related,
+            related_limit,
             filter,
         } = params.0;
         let mode = mode.unwrap_or_else(|| "hybrid".to_string());
@@ -162,6 +169,10 @@ impl IrMcpServer {
         let collections = collections.unwrap_or_default();
         let full = full.unwrap_or(false);
         let include_chunk = include_chunk.unwrap_or(false);
+        let include_related = include_related.unwrap_or(false);
+        let related_limit = related_limit
+            .unwrap_or(3)
+            .min(crate::get::MAX_RELATED_PER_RESULT);
         let filter = crate::types::Filter::from_clauses(
             filter
                 .unwrap_or_default()
@@ -187,6 +198,9 @@ impl IrMcpServer {
                 fill_results_content(&mut results)?;
             } else if include_chunk {
                 crate::get::populate_chunk_content(&mut results)?;
+            }
+            if include_related {
+                crate::get::populate_related(&mut results, related_limit)?;
             }
             Ok(results)
         })

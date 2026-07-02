@@ -52,6 +52,25 @@ fn pretty(results: &[SearchResult]) {
             let cleaned = snippet.replace("<b>", "").replace("</b>", "");
             println!("    {}", cleaned.dimmed());
         }
+        for item in &r.related {
+            let loc = match (item.start_line, item.end_line) {
+                (Some(start), Some(end)) if start != end => format!(":{}-{}", start, end),
+                (Some(start), _) => format!(":{start}"),
+                _ => String::new(),
+            };
+            let label = item
+                .symbol
+                .as_deref()
+                .or(item.title.as_deref())
+                .unwrap_or(item.target.as_str());
+            println!(
+                "    {} {}{} {}",
+                "related".dimmed(),
+                item.path.cyan(),
+                loc.dimmed(),
+                label.dimmed()
+            );
+        }
         println!();
     }
 }
@@ -97,6 +116,18 @@ fn markdown(results: &[SearchResult]) {
         if let Some(snippet) = &r.snippet {
             let cleaned = snippet.replace("<b>", "**").replace("</b>", "**");
             println!("  > {cleaned}");
+        }
+        for item in &r.related {
+            let loc = item
+                .start_line
+                .map(|line| format!(":{line}"))
+                .unwrap_or_default();
+            let label = item
+                .symbol
+                .as_deref()
+                .or(item.title.as_deref())
+                .unwrap_or(item.target.as_str());
+            println!("  - related: [{}]({}{})", label, item.path, loc);
         }
     }
 }

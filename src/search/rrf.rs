@@ -68,6 +68,18 @@ mod tests {
             doc_id: "#abc".into(),
             content: None,
             chunk_seq: None,
+            unit_seq: None,
+            unit_kind: None,
+            language: None,
+            symbol: None,
+            start_line: None,
+            end_line: None,
+            start_byte: None,
+            end_byte: None,
+            indexed_hash: None,
+            indexed_at: None,
+            markers: Vec::new(),
+            related: Vec::new(),
         }
     }
 

@@ -1238,6 +1238,7 @@ dependencies = [
  "indicatif 0.17.11",
  "libc",
  "llama-cpp-2",
+ "regex",
  "rmcp",
  "rusqlite",
  "schemars",

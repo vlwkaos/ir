@@ -41,6 +41,7 @@ tokio = { version = "1.51.0", features = ["macros", "rt", "rt-multi-thread", "io
 axum = { version = "0.8.8", default-features = false, features = ["http1", "tokio"] }
 tower-http = { version = "0.6.8", features = ["cors"] }
 schemars = "1.2.1"
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"

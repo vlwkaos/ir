@@ -68,3 +68,44 @@ CREATE INDEX IF NOT EXISTS idx_documents_hash   ON documents (hash);
 CREATE INDEX IF NOT EXISTS idx_documents_active ON documents (active);
 CREATE INDEX IF NOT EXISTS idx_content_vectors_hash ON content_vectors (hash);
 CREATE INDEX IF NOT EXISTS idx_document_metadata_key_value ON document_metadata (key, value);
+
+-- Searchable units extracted from a document. Markdown documents use the existing chunker;
+-- code documents use lightweight symbol/range extraction. Line ranges are presentation hints:
+-- durable retrieval uses hash + seq + stored text.
+CREATE TABLE IF NOT EXISTS content_units (
+    hash        TEXT NOT NULL REFERENCES content(hash) ON DELETE CASCADE,
+    seq         INTEGER NOT NULL DEFAULT 0,
+    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    unit_kind   TEXT NOT NULL,
+    language    TEXT,
+    symbol      TEXT,
+    start_byte  INTEGER NOT NULL DEFAULT 0,
+    end_byte    INTEGER NOT NULL DEFAULT 0,
+    start_line  INTEGER NOT NULL DEFAULT 1,
+    end_line    INTEGER NOT NULL DEFAULT 1,
+    title       TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    text_hash   TEXT NOT NULL,
+    indexed_at  TEXT NOT NULL,
+    PRIMARY KEY (hash, seq)
+);
+
+-- Explicit parseable links emitted from Markdown/prose/comments/frontmatter.
+-- Targets may remain unresolved; search expansion uses exact target matches first.
+CREATE TABLE IF NOT EXISTS unit_links (
+    source_hash          TEXT NOT NULL,
+    source_seq           INTEGER NOT NULL DEFAULT 0,
+    document_id          INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    kind                 TEXT NOT NULL,
+    target               TEXT NOT NULL,
+    raw                  TEXT NOT NULL,
+    resolved_document_id INTEGER,
+    resolved_hash        TEXT,
+    resolved_seq         INTEGER,
+    PRIMARY KEY (source_hash, source_seq, kind, target, raw)
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_units_document ON content_units (document_id);
+CREATE INDEX IF NOT EXISTS idx_content_units_symbol ON content_units (symbol);
+CREATE INDEX IF NOT EXISTS idx_unit_links_target ON unit_links (target);
+CREATE INDEX IF NOT EXISTS idx_unit_links_source ON unit_links (source_hash, source_seq);

@@ -52,9 +52,12 @@ pub enum Command {
         /// Show full document content
         #[arg(long, conflicts_with = "chunk")]
         full: bool,
-        /// Show best-matching chunk content (vector results only; falls back to snippet for BM25)
+        /// Show best-matching chunk/unit content when available
         #[arg(long, conflicts_with = "full")]
         chunk: bool,
+        /// Include explicit one-hop related units from markers, wikilinks, markdown links, and related frontmatter (capped at 20)
+        #[arg(long, default_value = "0")]
+        related: usize,
         /// JSON output
         #[arg(long)]
         json: bool,
@@ -176,6 +179,9 @@ pub enum CollectionCmd {
         /// Glob patterns to exclude
         #[arg(long)]
         exclude: Vec<String>,
+        /// Built-in glob/exclude preset: markdown | mixed
+        #[arg(long)]
+        preset: Option<String>,
         /// Short description
         #[arg(long)]
         description: Option<String>,

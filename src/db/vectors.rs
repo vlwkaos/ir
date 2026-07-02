@@ -99,30 +99,92 @@ pub fn search(
     // Single query to fetch all document metadata for matched hashes.
     let placeholders = hash_order.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT hash, path, title FROM documents WHERE hash IN ({placeholders}) AND active = 1"
+        "SELECT d.hash, d.path, d.title, cu.seq, cu.unit_kind, cu.language, cu.symbol,
+                cu.start_byte, cu.end_byte, cu.start_line, cu.end_line, cu.text_hash, cu.indexed_at
+         FROM documents d
+         LEFT JOIN content_units cu ON cu.hash = d.hash
+         WHERE d.hash IN ({placeholders}) AND d.active = 1"
     );
     let hashes: Vec<&str> = hash_order.iter().map(|(h, _, _)| *h).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let hash_meta: HashMap<String, (String, String)> = stmt
-        .query_map(rusqlite::params_from_iter(hashes.iter().copied()), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
-            ))
-        })?
-        .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+    type UnitMeta = (
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut hash_meta: HashMap<String, Vec<UnitMeta>> = HashMap::new();
+    for row in stmt.query_map(rusqlite::params_from_iter(hashes.iter().copied()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            (
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+            ),
+        ))
+    })? {
+        let (hash, meta) = row?;
+        hash_meta.entry(hash).or_default().push(meta);
+    }
 
     // Build result list, deduplicating by path with O(1) lookup.
     let mut results: Vec<SearchResult> = Vec::new();
     let mut path_idx: HashMap<String, usize> = HashMap::new();
 
     for (hash, distance, seq) in &hash_order {
-        if let Some((path, title)) = hash_meta.get(*hash) {
+        if let Some(metas) = hash_meta.get(*hash) {
+            let meta = metas
+                .iter()
+                .find(|m| m.2 == Some(*seq as i64))
+                .or_else(|| metas.first())
+                .expect("non-empty metadata list");
+            let (
+                path,
+                title,
+                unit_seq,
+                unit_kind,
+                language,
+                symbol,
+                start_byte,
+                end_byte,
+                start_line,
+                end_line,
+                text_hash,
+                indexed_at,
+            ) = meta;
             let score = 1.0 - distance;
             if let Some(&idx) = path_idx.get(path) {
                 if score > results[idx].score {
                     results[idx].score = score;
                     results[idx].chunk_seq = Some(*seq);
+                    results[idx].unit_seq = unit_seq.map(|v| v as usize).or(Some(*seq));
+                    results[idx].unit_kind = unit_kind.clone();
+                    results[idx].language = language.clone();
+                    results[idx].symbol = symbol.clone();
+                    results[idx].start_line = start_line.map(|v| v as usize);
+                    results[idx].end_line = end_line.map(|v| v as usize);
+                    results[idx].start_byte = start_byte.map(|v| v as usize);
+                    results[idx].end_byte = end_byte.map(|v| v as usize);
+                    results[idx].indexed_hash = text_hash.clone();
+                    results[idx].indexed_at = indexed_at.clone();
                 }
             } else {
                 path_idx.insert(path.clone(), results.len());
@@ -136,6 +198,18 @@ pub fn search(
                     doc_id: format!("#{}", &hash[..6.min(hash.len())]),
                     content: None,
                     chunk_seq: Some(*seq),
+                    unit_seq: unit_seq.map(|v| v as usize).or(Some(*seq)),
+                    unit_kind: unit_kind.clone(),
+                    language: language.clone(),
+                    symbol: symbol.clone(),
+                    start_line: start_line.map(|v| v as usize),
+                    end_line: end_line.map(|v| v as usize),
+                    start_byte: start_byte.map(|v| v as usize),
+                    end_byte: end_byte.map(|v| v as usize),
+                    indexed_hash: text_hash.clone(),
+                    indexed_at: indexed_at.clone(),
+                    markers: Vec::new(),
+                    related: Vec::new(),
                 });
             }
         }
@@ -170,6 +244,23 @@ mod tests {
              );
              CREATE TABLE content_vectors (
                 hash TEXT, seq INTEGER, pos INTEGER, model TEXT, embedded_at TEXT,
+                PRIMARY KEY (hash, seq)
+             );
+             CREATE TABLE content_units (
+                hash TEXT NOT NULL,
+                seq INTEGER NOT NULL DEFAULT 0,
+                document_id INTEGER NOT NULL DEFAULT 1,
+                unit_kind TEXT NOT NULL,
+                language TEXT,
+                symbol TEXT,
+                start_byte INTEGER NOT NULL DEFAULT 0,
+                end_byte INTEGER NOT NULL DEFAULT 0,
+                start_line INTEGER NOT NULL DEFAULT 1,
+                end_line INTEGER NOT NULL DEFAULT 1,
+                title TEXT NOT NULL,
+                text TEXT NOT NULL,
+                text_hash TEXT NOT NULL,
+                indexed_at TEXT NOT NULL,
                 PRIMARY KEY (hash, seq)
              );",
         )
@@ -248,5 +339,44 @@ mod tests {
         assert_eq!(results.len(), 1);
         // chunk 2 is closest — its seq should win
         assert_eq!(results[0].chunk_seq, Some(2));
+    }
+
+    #[test]
+    fn search_returns_metadata_for_best_matching_unit() {
+        let conn = open_test_db();
+        let hash = "unitmeta";
+        conn.execute(
+            "INSERT INTO documents (id, path, title, hash, active)
+             VALUES (1, 'src/lib.rs', 'Lib', ?1, 1)",
+            [hash],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content_units
+             (hash, seq, document_id, unit_kind, language, symbol, start_byte, end_byte,
+              start_line, end_line, title, text, text_hash, indexed_at)
+             VALUES
+             (?1, 0, 1, 'function', 'rust', 'far_fn', 0, 10, 1, 2,
+              'far_fn', 'fn far_fn() {}', 'far', '2026-01-01'),
+             (?1, 2, 1, 'function', 'rust', 'near_fn', 20, 40, 5, 8,
+              'near_fn', 'fn near_fn() {}', 'near', '2026-01-02')",
+            [hash],
+        )
+        .unwrap();
+
+        insert(&conn, &format!("{hash}_0"), &[0.5, 0.5, 0.5, 0.5]).unwrap();
+        insert(&conn, &format!("{hash}_2"), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        let results = search(&conn, &[1.0, 0.0, 0.0, 0.0], "col", 5).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_seq, Some(2));
+        assert_eq!(results[0].unit_seq, Some(2));
+        assert_eq!(results[0].unit_kind.as_deref(), Some("function"));
+        assert_eq!(results[0].language.as_deref(), Some("rust"));
+        assert_eq!(results[0].symbol.as_deref(), Some("near_fn"));
+        assert_eq!(results[0].start_line, Some(5));
+        assert_eq!(results[0].end_line, Some(8));
+        assert_eq!(results[0].indexed_at.as_deref(), Some("2026-01-02"));
     }
 }

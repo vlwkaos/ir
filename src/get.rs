@@ -8,7 +8,24 @@ use std::collections::HashMap;
 use crate::config::{Config, collection_db_path};
 use crate::db;
 use crate::error::Result;
-use crate::types::{Collection, SearchResult};
+use crate::types::{Collection, RelatedItem, SearchResult};
+
+pub const MAX_RELATED_PER_RESULT: usize = 20;
+const MAX_SOURCE_LINKS_PER_RESULT: usize = 64;
+
+#[derive(Debug, Clone)]
+struct UnitContent {
+    text: String,
+    unit_kind: String,
+    language: Option<String>,
+    symbol: Option<String>,
+    start_byte: usize,
+    end_byte: usize,
+    start_line: usize,
+    end_line: usize,
+    text_hash: String,
+    indexed_at: String,
+}
 
 // ── output types ─────────────────────────────────────────────────────────────
 
@@ -182,12 +199,12 @@ fn resolve_vault_root_path<'a>(
 
 // ── chunk retrieval ───────────────────────────────────────────────────────────
 
-/// Inner: batch-fetch chunks from a single open connection.
-/// `items` is a slice of (result_idx, hash, seq) tuples.
+/// Inner: batch-fetch indexed units from a single open connection.
+/// `items` is a slice of (result_idx, hash, preferred seq) tuples.
 /// Writes chunk text into `results[result_idx].content`.
 fn apply_chunks_from_conn(
     conn: &Connection,
-    items: &[(usize, String, usize)],
+    items: &[(usize, String, Option<usize>)],
     results: &mut [SearchResult],
 ) -> Result<()> {
     let mut unique_hashes: Vec<&str> = items.iter().map(|(_, h, _)| h.as_str()).collect();
@@ -198,6 +215,8 @@ fn apply_chunks_from_conn(
         .map(|_| "?")
         .collect::<Vec<_>>()
         .join(",");
+    let unit_map = load_units_for_hashes(conn, &unique_hashes)?;
+
     let sql = format!("SELECT hash, doc FROM content WHERE hash IN ({placeholders})");
     let mut stmt = conn.prepare(&sql)?;
     let content_map: HashMap<String, String> = stmt
@@ -207,13 +226,85 @@ fn apply_chunks_from_conn(
         )?
         .collect::<std::result::Result<_, _>>()?;
 
-    for (result_idx, hash, seq) in items {
-        if let Some(doc) = content_map.get(hash) {
+    for (result_idx, hash, preferred_seq) in items {
+        let seq = preferred_seq.unwrap_or_else(|| {
+            choose_best_unit_seq(
+                unit_map.iter().filter_map(|((unit_hash, seq), unit)| {
+                    (unit_hash == hash).then_some((*seq, unit))
+                }),
+                results[*result_idx].snippet.as_deref(),
+            )
+            .unwrap_or(0)
+        });
+        if let Some(unit) = unit_map.get(&(hash.clone(), seq)) {
+            let result = &mut results[*result_idx];
+            result.content = Some(unit.text.clone());
+            result.unit_seq = Some(seq);
+            result.unit_kind = Some(unit.unit_kind.clone());
+            result.language = unit.language.clone();
+            result.symbol = unit.symbol.clone();
+            result.start_byte = Some(unit.start_byte);
+            result.end_byte = Some(unit.end_byte);
+            result.start_line = Some(unit.start_line);
+            result.end_line = Some(unit.end_line);
+            result.indexed_hash = Some(unit.text_hash.clone());
+            result.indexed_at = Some(unit.indexed_at.clone());
+        } else if let Some(doc) = content_map.get(hash) {
             let chunks = crate::index::chunker::chunk_document(doc);
-            results[*result_idx].content = chunks.into_iter().nth(*seq).map(|c| c.text);
+            results[*result_idx].content = chunks.into_iter().nth(seq).map(|c| c.text);
         }
     }
     Ok(())
+}
+
+fn choose_best_unit_seq<'a>(
+    units: impl Iterator<Item = (usize, &'a UnitContent)>,
+    snippet: Option<&str>,
+) -> Option<usize> {
+    let mut candidates: Vec<(usize, &'a UnitContent)> = units.collect();
+    candidates.sort_by_key(|(seq, _)| *seq);
+    let terms = snippet_terms(snippet.unwrap_or_default());
+    if terms.is_empty() {
+        return candidates.first().map(|(seq, _)| *seq);
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|(_, unit)| score_unit_for_terms(unit, &terms))
+        .map(|(seq, _)| seq)
+}
+
+fn snippet_terms(text: &str) -> Vec<String> {
+    let stripped = strip_html_tags(text);
+    let mut terms = stripped
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter_map(|term| {
+            let term = term.trim().to_lowercase();
+            (term.len() >= 3).then_some(term)
+        })
+        .collect::<Vec<_>>();
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn strip_html_tags(text: &str) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"<[^>]+>").expect("valid html-strip regex"));
+    re.replace_all(text, " ").into_owned()
+}
+
+fn score_unit_for_terms(unit: &UnitContent, terms: &[String]) -> usize {
+    let haystack = format!(
+        "{}\n{}\n{}",
+        unit.symbol.as_deref().unwrap_or_default(),
+        unit.unit_kind,
+        unit.text
+    )
+    .to_lowercase();
+    terms
+        .iter()
+        .filter(|term| haystack.contains(term.as_str()))
+        .count()
 }
 
 /// Inner: fetch a single chunk from an open connection. Used in tests only.
@@ -235,15 +326,19 @@ fn fetch_chunk_from_conn(conn: &Connection, hash: &str, seq: usize) -> Result<Op
     }))
 }
 
-/// Populate `.content` on search results that have `chunk_seq` set.
+/// Populate `.content` from indexed units where possible, falling back to legacy chunks.
 /// Batches DB access per collection: one connection + one query per distinct collection.
 pub fn populate_chunk_content(results: &mut [SearchResult]) -> Result<()> {
-    let tasks: Vec<(usize, String, String, usize)> = results
+    let tasks: Vec<(usize, String, String, Option<usize>)> = results
         .iter()
         .enumerate()
-        .filter_map(|(i, r)| {
-            r.chunk_seq
-                .map(|seq| (i, r.collection.clone(), r.hash.clone(), seq))
+        .map(|(i, r)| {
+            (
+                i,
+                r.collection.clone(),
+                r.hash.clone(),
+                r.unit_seq.or(r.chunk_seq),
+            )
         })
         .collect();
     if tasks.is_empty() {
@@ -251,7 +346,7 @@ pub fn populate_chunk_content(results: &mut [SearchResult]) -> Result<()> {
     }
 
     let config = Config::load()?;
-    let mut by_col: HashMap<String, Vec<(usize, String, usize)>> = HashMap::new();
+    let mut by_col: HashMap<String, Vec<(usize, String, Option<usize>)>> = HashMap::new();
     for (idx, col, hash, seq) in tasks {
         by_col.entry(col).or_default().push((idx, hash, seq));
     }
@@ -274,6 +369,222 @@ pub fn populate_chunk_content(results: &mut [SearchResult]) -> Result<()> {
         apply_chunks_from_conn(&conn, items, results)?;
     }
     Ok(())
+}
+
+/// Populate explicit one-hop related items from shared marker/wiki/markdown/frontmatter targets.
+/// This intentionally does not infer semantic neighbors; callers can trust these as parsed links.
+pub fn populate_related(results: &mut [SearchResult], limit_per_result: usize) -> Result<()> {
+    if limit_per_result == 0 || results.is_empty() {
+        return Ok(());
+    }
+    let limit_per_result = limit_per_result.min(MAX_RELATED_PER_RESULT);
+
+    let config = Config::load()?;
+    let mut conns = Vec::new();
+    for col in &config.collections {
+        let db_path = collection_db_path(&col.name);
+        if let Ok(conn) = open_readonly(&db_path) {
+            conns.push((col.name.clone(), conn));
+        }
+    }
+
+    for result in results.iter_mut() {
+        let mut seq = result.unit_seq.or(result.chunk_seq);
+        let mut links = Vec::new();
+        for (col_name, conn) in &conns {
+            if col_name == &result.collection {
+                if seq.is_none() {
+                    seq = best_unit_seq_for_result(conn, &result.hash, result.snippet.as_deref())?;
+                }
+                links.extend(fetch_source_links(conn, &result.hash, seq.unwrap_or(0))?);
+                result.unit_seq = seq;
+            }
+        }
+
+        result.markers = links
+            .iter()
+            .filter(|(kind, _, _)| kind == "marker")
+            .map(|(_, target, _)| target.clone())
+            .collect();
+        result.markers.sort();
+        result.markers.dedup();
+
+        let mut related = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let source_seq = seq.unwrap_or(0);
+        for (kind, target, raw) in links {
+            for (col_name, conn) in &conns {
+                let items = fetch_related_for_target(
+                    conn,
+                    col_name,
+                    &target,
+                    &result.collection,
+                    &result.hash,
+                    source_seq,
+                )?;
+                for mut item in items {
+                    let key = format!(
+                        "{}\0{}\0{}\0{}",
+                        item.collection,
+                        item.path,
+                        item.start_line.unwrap_or(0),
+                        item.symbol.clone().unwrap_or_default()
+                    );
+                    if seen.insert(key) {
+                        item.kind = kind.clone();
+                        item.target = target.clone();
+                        item.raw = raw.clone();
+                        related.push(item);
+                    }
+                    if related.len() >= limit_per_result {
+                        break;
+                    }
+                }
+                if related.len() >= limit_per_result {
+                    break;
+                }
+            }
+            if related.len() >= limit_per_result {
+                break;
+            }
+        }
+        result.related = related;
+    }
+
+    Ok(())
+}
+
+fn fetch_source_links(
+    conn: &Connection,
+    hash: &str,
+    seq: usize,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT kind, target, raw
+         FROM unit_links
+         WHERE source_hash = ?1 AND source_seq = ?2
+         ORDER BY kind, target
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![hash, seq as i64, MAX_SOURCE_LINKS_PER_RESULT as i64],
+        |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn best_unit_seq_for_result(
+    conn: &Connection,
+    hash: &str,
+    snippet: Option<&str>,
+) -> Result<Option<usize>> {
+    let hashes = [hash];
+    let unit_map = load_units_for_hashes(conn, &hashes)?;
+    let mut units = unit_map
+        .into_iter()
+        .filter_map(|((unit_hash, seq), unit)| (unit_hash == hash).then_some((seq, unit)))
+        .collect::<Vec<_>>();
+    units.sort_by_key(|(seq, _)| *seq);
+    Ok(choose_best_unit_seq(
+        units.iter().map(|(seq, unit)| (*seq, unit)),
+        snippet,
+    ))
+}
+
+fn load_units_for_hashes(
+    conn: &Connection,
+    hashes: &[&str],
+) -> Result<HashMap<(String, usize), UnitContent>> {
+    if hashes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = hashes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let unit_sql = format!(
+        "SELECT hash, seq, text, unit_kind, language, symbol, start_byte, end_byte,
+                start_line, end_line, text_hash, indexed_at
+         FROM content_units
+         WHERE hash IN ({placeholders})
+         ORDER BY hash, seq"
+    );
+    let mut stmt = conn.prepare(&unit_sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(hashes.iter().copied()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)? as usize,
+            UnitContent {
+                text: row.get(2)?,
+                unit_kind: row.get(3)?,
+                language: row.get(4)?,
+                symbol: row.get(5)?,
+                start_byte: row.get::<_, i64>(6)? as usize,
+                end_byte: row.get::<_, i64>(7)? as usize,
+                start_line: row.get::<_, i64>(8)? as usize,
+                end_line: row.get::<_, i64>(9)? as usize,
+                text_hash: row.get(10)?,
+                indexed_at: row.get(11)?,
+            },
+        ))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (hash, seq, unit) = row?;
+        out.insert((hash, seq), unit);
+    }
+    Ok(out)
+}
+
+fn fetch_related_for_target(
+    conn: &Connection,
+    collection: &str,
+    target: &str,
+    source_collection: &str,
+    source_hash: &str,
+    source_seq: usize,
+) -> Result<Vec<RelatedItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT ul.source_hash, ul.source_seq, d.path, cu.title, cu.symbol,
+                cu.start_line, cu.end_line, substr(cu.text, 1, 800)
+         FROM unit_links ul
+         JOIN content_units cu ON cu.hash = ul.source_hash AND cu.seq = ul.source_seq
+         JOIN documents d ON d.id = ul.document_id
+         WHERE ul.target = ?1 AND d.active = 1
+         ORDER BY d.path, cu.start_line
+         LIMIT 20",
+    )?;
+    let rows = stmt.query_map([target], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)? as usize,
+            RelatedItem {
+                kind: String::new(),
+                target: String::new(),
+                raw: String::new(),
+                collection: collection.to_string(),
+                path: row.get(2)?,
+                title: row.get(3)?,
+                symbol: row.get(4)?,
+                start_line: row.get::<_, Option<i64>>(5)?.map(|v| v as usize),
+                end_line: row.get::<_, Option<i64>>(6)?.map(|v| v as usize),
+                snippet: row.get(7)?,
+                resolved: true,
+            },
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (hash, seq, item) = row?;
+        if collection == source_collection && hash == source_hash && seq == source_seq {
+            continue;
+        }
+        out.push(item);
+    }
+    Ok(out)
 }
 
 // ── section extraction ───────────────────────────────────────────────────────
@@ -374,6 +685,33 @@ pub fn trim_content(content: &str, offset: Option<usize>, max_chars: Option<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Collection;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     // ── extract_section ──────────────────────────────────────────────────────
 
@@ -747,6 +1085,18 @@ mod tests {
             doc_id: "#abc".into(),
             content: None,
             chunk_seq: Some(seq),
+            unit_seq: Some(seq),
+            unit_kind: None,
+            language: None,
+            symbol: None,
+            start_line: None,
+            end_line: None,
+            start_byte: None,
+            end_byte: None,
+            indexed_hash: None,
+            indexed_at: None,
+            markers: Vec::new(),
+            related: Vec::new(),
         }
     }
 
@@ -761,6 +1111,18 @@ mod tests {
             doc_id: "#abc".into(),
             content: None,
             chunk_seq: None,
+            unit_seq: None,
+            unit_kind: None,
+            language: None,
+            symbol: None,
+            start_line: None,
+            end_line: None,
+            start_byte: None,
+            end_byte: None,
+            indexed_hash: None,
+            indexed_at: None,
+            markers: Vec::new(),
+            related: Vec::new(),
         }
     }
 
@@ -768,7 +1130,7 @@ mod tests {
     fn apply_chunks_populates_content() {
         let conn = open_chunk_test_db();
         insert_content(&conn, "abc", "hello world");
-        let items = vec![(0usize, "abc".to_string(), 0usize)];
+        let items = vec![(0usize, "abc".to_string(), Some(0usize))];
         let mut results = vec![make_result_with_chunk("abc", 0)];
         apply_chunks_from_conn(&conn, &items, &mut results).unwrap();
         assert_eq!(results[0].content.as_deref(), Some("hello world"));
@@ -777,7 +1139,7 @@ mod tests {
     #[test]
     fn apply_chunks_skips_missing_hash() {
         let conn = open_chunk_test_db();
-        let items = vec![(0usize, "nope".to_string(), 0usize)];
+        let items = vec![(0usize, "nope".to_string(), Some(0usize))];
         let mut results = vec![make_result_with_chunk("nope", 0)];
         apply_chunks_from_conn(&conn, &items, &mut results).unwrap();
         assert!(results[0].content.is_none());
@@ -789,8 +1151,8 @@ mod tests {
         insert_content(&conn, "h_a", "doc alpha");
         insert_content(&conn, "h_b", "doc beta");
         let items = vec![
-            (0usize, "h_a".to_string(), 0usize),
-            (1usize, "h_b".to_string(), 0usize),
+            (0usize, "h_a".to_string(), Some(0usize)),
+            (1usize, "h_b".to_string(), Some(0usize)),
         ];
         let mut results = vec![
             make_result_with_chunk("h_a", 0),
@@ -802,20 +1164,355 @@ mod tests {
     }
 
     #[test]
-    fn apply_chunks_leaves_no_chunk_seq_results_untouched() {
-        // Results without chunk_seq are not passed to apply_chunks, but even if content is
-        // pre-populated it should not be overwritten (items list controls what gets written).
+    fn apply_chunks_selects_best_unit_for_no_seq_result() {
         let conn = open_chunk_test_db();
-        insert_content(&conn, "h_c", "some content");
-        // Only pass the result that has chunk_seq; the other is untouched.
-        let items = vec![(0usize, "h_c".to_string(), 0usize)];
-        let mut results = vec![
-            make_result_with_chunk("h_c", 0),
-            make_result_no_chunk("h_d"),
-        ];
+        insert_content(&conn, "h_c", "legacy fallback content");
+        conn.execute(
+            "INSERT INTO documents (id,path,title,hash,created_at,modified_at,active)
+             VALUES (1,'src/lib.rs','lib','h_c','2026-01-01','2026-01-01',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content_units
+             (hash, seq, document_id, unit_kind, language, symbol, start_byte, end_byte,
+              start_line, end_line, title, text, text_hash, indexed_at)
+             VALUES
+             ('h_c', 0, 1, 'function', 'rust', 'first_fn', 0, 20, 1, 2,
+              'first_fn', 'fn first_fn() {}', 'first_hash', '2026-01-01'),
+             ('h_c', 1, 1, 'function', 'rust', 'cache_policy', 21, 60, 4, 6,
+              'cache_policy', 'fn cache_policy() { apply retry budget }', 'cache_hash', '2026-01-02')",
+            [],
+        )
+        .unwrap();
+
+        let items = vec![(0usize, "h_c".to_string(), None)];
+        let mut result = make_result_no_chunk("h_c");
+        result.snippet = Some("retry budget cache policy".to_string());
+        let mut results = vec![result];
         apply_chunks_from_conn(&conn, &items, &mut results).unwrap();
-        assert!(results[0].content.is_some());
-        assert!(results[1].content.is_none());
+
+        assert_eq!(results[0].unit_seq, Some(1));
+        assert_eq!(results[0].symbol.as_deref(), Some("cache_policy"));
+        assert_eq!(
+            results[0].content.as_deref(),
+            Some("fn cache_policy() { apply retry budget }")
+        );
+    }
+
+    #[test]
+    fn populate_chunk_content_hydrates_no_seq_result_from_configured_collection() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("ir-state");
+        std::fs::create_dir_all(state.join("collections")).unwrap();
+        let _guard = EnvGuard::set("IR_CONFIG_DIR", state.to_str().unwrap());
+        crate::db::ensure_sqlite_vec();
+
+        let collection = Collection {
+            name: "col".into(),
+            path: tmp.path().to_string_lossy().into_owned(),
+            globs: vec![],
+            excludes: vec![],
+            description: None,
+            preprocessor: None,
+            routing: None,
+        };
+        let config = Config {
+            collections: vec![collection],
+            ..Config::default()
+        };
+        config.save().unwrap();
+
+        let db_path = crate::config::collection_db_path("col");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(include_str!("db/schema_base.sql")).unwrap();
+        insert_content(&conn, "h_public", "full document fallback");
+        conn.execute(
+            "INSERT INTO documents (id,path,title,hash,created_at,modified_at,active)
+             VALUES (1,'src/lib.rs','lib','h_public','2026-01-01','2026-01-01',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content_units
+             (hash, seq, document_id, unit_kind, language, symbol, start_byte, end_byte,
+              start_line, end_line, title, text, text_hash, indexed_at)
+             VALUES
+             ('h_public', 0, 1, 'function', 'rust', 'first_fn', 0, 10, 1, 2,
+              'first_fn', 'fn first_fn() {}', 'first_hash', '2026-01-01'),
+             ('h_public', 1, 1, 'function', 'rust', 'retry_budget', 11, 50, 4, 7,
+              'retry_budget', 'fn retry_budget() { jitter policy }', 'retry_hash', '2026-01-02')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut result = make_result_no_chunk("h_public");
+        result.collection = "col".into();
+        result.snippet = Some("retry budget jitter policy".into());
+        let mut results = vec![result];
+
+        populate_chunk_content(&mut results).unwrap();
+
+        assert_eq!(results[0].unit_seq, Some(1));
+        assert_eq!(results[0].symbol.as_deref(), Some("retry_budget"));
+        assert_eq!(
+            results[0].content.as_deref(),
+            Some("fn retry_budget() { jitter policy }")
+        );
+        assert_eq!(results[0].indexed_hash.as_deref(), Some("retry_hash"));
+    }
+
+    #[test]
+    fn populate_related_uses_best_unit_and_respects_limit() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("ir-state");
+        std::fs::create_dir_all(state.join("collections")).unwrap();
+        let _guard = EnvGuard::set("IR_CONFIG_DIR", state.to_str().unwrap());
+        crate::db::ensure_sqlite_vec();
+
+        let collection = Collection {
+            name: "col".into(),
+            path: tmp.path().to_string_lossy().into_owned(),
+            globs: vec![],
+            excludes: vec![],
+            description: None,
+            preprocessor: None,
+            routing: None,
+        };
+        Config {
+            collections: vec![collection],
+            ..Config::default()
+        }
+        .save()
+        .unwrap();
+
+        let db_path = crate::config::collection_db_path("col");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(include_str!("db/schema_base.sql")).unwrap();
+        insert_content(&conn, "h_src", "source");
+        insert_content(&conn, "h_note", "note");
+        insert_content(&conn, "h_other", "other");
+        conn.execute(
+            "INSERT INTO documents (id,path,title,hash,created_at,modified_at,active)
+             VALUES
+             (1,'src/lib.rs','lib','h_src','2026-01-01','2026-01-01',1),
+             (2,'docs/cache.md','Cache','h_note','2026-01-01','2026-01-01',1),
+             (3,'docs/other.md','Other','h_other','2026-01-01','2026-01-01',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content_units
+             (hash, seq, document_id, unit_kind, language, symbol, start_byte, end_byte,
+              start_line, end_line, title, text, text_hash, indexed_at)
+             VALUES
+             ('h_src',0,1,'function','rust','wrong_unit',0,10,1,2,'wrong_unit',
+              '// [wrong-anchor]\nfn wrong_unit() {}','wrong_hash','2026-01-01'),
+             ('h_src',1,1,'function','rust','cache_policy',11,60,4,8,'cache_policy',
+              '// [cache-policy]\nfn cache_policy() { retry budget }','src_hash','2026-01-02'),
+             ('h_note',0,2,'chunk',NULL,NULL,0,30,1,3,'Cache',
+              '[cache-policy] Retry budget note','note_hash','2026-01-01'),
+             ('h_other',0,3,'chunk',NULL,NULL,0,30,1,3,'Other',
+              '[cache-policy] Duplicate note','other_hash','2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO unit_links (source_hash, source_seq, document_id, kind, target, raw)
+             VALUES
+             ('h_src',0,1,'marker','wrong-anchor','[wrong-anchor]'),
+             ('h_src',1,1,'marker','cache-policy','[cache-policy]'),
+             ('h_src',1,1,'marker','cache-policy','[cache-policy-duplicate]'),
+             ('h_note',0,2,'marker','cache-policy','[cache-policy]'),
+             ('h_note',0,2,'wikilink','second-hop','[[second-hop]]'),
+             ('h_other',0,3,'marker','cache-policy','[cache-policy]')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut result = make_result_no_chunk("h_src");
+        result.collection = "col".into();
+        result.snippet = Some("cache policy retry budget".into());
+        let mut results = vec![result];
+
+        populate_related(&mut results, 5).unwrap();
+
+        assert_eq!(results[0].unit_seq, Some(1));
+        assert_eq!(results[0].markers, vec!["cache-policy"]);
+        assert_eq!(results[0].related.len(), 2);
+        assert!(results[0].related.iter().all(|item| item.path != "src/lib.rs"));
+        assert!(results[0]
+            .related
+            .iter()
+            .any(|item| item.path == "docs/cache.md"));
+        assert!(results[0]
+            .related
+            .iter()
+            .any(|item| item.path == "docs/other.md"));
+        assert!(results[0]
+            .related
+            .iter()
+            .all(|item| item.target != "second-hop"));
+    }
+
+    #[test]
+    fn apply_chunks_prefers_stored_unit_text() {
+        let conn = open_chunk_test_db();
+        insert_content(
+            &conn,
+            "h_unit",
+            "full document text that should not be returned",
+        );
+        conn.execute(
+            "INSERT INTO documents (id,path,title,hash,created_at,modified_at,active)
+             VALUES (1,'src/lib.rs','lib','h_unit','2026-01-01','2026-01-01',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content_units
+             (hash, seq, document_id, unit_kind, language, symbol, start_byte, end_byte,
+              start_line, end_line, title, text, text_hash, indexed_at)
+             VALUES ('h_unit', 2, 1, 'function', 'rust', 'target_fn', 10, 30, 2, 4,
+                     'target_fn', 'fn target_fn() {}', 'unit_hash', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        let mut results = vec![make_result_with_chunk("h_unit", 2)];
+        let items = vec![(0usize, "h_unit".to_string(), Some(2usize))];
+        apply_chunks_from_conn(&conn, &items, &mut results).unwrap();
+
+        assert_eq!(results[0].content.as_deref(), Some("fn target_fn() {}"));
+        assert_eq!(results[0].unit_seq, Some(2));
+        assert_eq!(results[0].unit_kind.as_deref(), Some("function"));
+        assert_eq!(results[0].language.as_deref(), Some("rust"));
+        assert_eq!(results[0].symbol.as_deref(), Some("target_fn"));
+        assert_eq!(results[0].start_line, Some(2));
+        assert_eq!(results[0].end_line, Some(4));
+        assert_eq!(results[0].indexed_hash.as_deref(), Some("unit_hash"));
+    }
+
+    #[test]
+    fn related_lookup_returns_other_unit_with_same_target() {
+        let conn = open_chunk_test_db();
+        insert_content(&conn, "ha", "a");
+        insert_content(&conn, "hb", "b");
+        conn.execute(
+            "INSERT INTO documents (id,path,title,hash,created_at,modified_at,active)
+             VALUES (1,'a.md','A','ha','2026-01-01','2026-01-01',1),
+                    (2,'src/lib.rs','lib','hb','2026-01-01','2026-01-01',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content_units
+             (hash, seq, document_id, unit_kind, language, symbol, start_byte, end_byte,
+              start_line, end_line, title, text, text_hash, indexed_at)
+             VALUES
+             ('ha', 0, 1, 'chunk', NULL, NULL, 0, 1, 1, 1, 'A', '[cache-key]', 'a', '2026-01-01'),
+             ('hb', 0, 2, 'function', 'rust', 'load_cache', 0, 1, 10, 12, 'load_cache',
+              '// [cache-key]\nfn load_cache() {}', 'b', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO unit_links (source_hash, source_seq, document_id, kind, target, raw)
+             VALUES ('ha',0,1,'marker','cache-key','[cache-key]'),
+                    ('hb',0,2,'marker','cache-key','[cache-key]')",
+            [],
+        )
+        .unwrap();
+
+        let related = fetch_related_for_target(&conn, "col", "cache-key", "col", "ha", 0).unwrap();
+
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].path, "src/lib.rs");
+        assert_eq!(related[0].symbol.as_deref(), Some("load_cache"));
+    }
+
+    #[test]
+    fn source_links_are_capped_before_related_expansion() {
+        let conn = open_chunk_test_db();
+        insert_content(&conn, "ha", "a");
+        conn.execute(
+            "INSERT INTO documents (id,path,title,hash,created_at,modified_at,active)
+             VALUES (1,'a.md','A','ha','2026-01-01','2026-01-01',1)",
+            [],
+        )
+        .unwrap();
+        for i in 0..(MAX_SOURCE_LINKS_PER_RESULT + 5) {
+            conn.execute(
+                "INSERT INTO unit_links (source_hash, source_seq, document_id, kind, target, raw)
+                 VALUES ('ha',0,1,'marker',?1,?2)",
+                rusqlite::params![format!("target-{i:03}"), format!("[target-{i:03}]")],
+            )
+            .unwrap();
+        }
+
+        let links = fetch_source_links(&conn, "ha", 0).unwrap();
+
+        assert_eq!(links.len(), MAX_SOURCE_LINKS_PER_RESULT);
+        assert_eq!(links[0].1, "target-000");
+    }
+
+    #[test]
+    fn related_lookup_filters_self_and_never_exceeds_cap() {
+        let conn = open_chunk_test_db();
+        insert_content(&conn, "ha", "a");
+        conn.execute(
+            "INSERT INTO documents (id,path,title,hash,created_at,modified_at,active)
+             VALUES (1,'a.md','A','ha','2026-01-01','2026-01-01',1)",
+            [],
+        )
+        .unwrap();
+        for i in 0..25 {
+            let hash = format!("h{i}");
+            insert_content(&conn, &hash, "peer");
+            conn.execute(
+                "INSERT INTO documents (id,path,title,hash,created_at,modified_at,active)
+                 VALUES (?1,?2,'Peer',?3,'2026-01-01','2026-01-01',1)",
+                rusqlite::params![i as i64 + 2, format!("peer-{i:02}.md"), hash],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO content_units
+                 (hash, seq, document_id, unit_kind, language, symbol, start_byte, end_byte,
+                  start_line, end_line, title, text, text_hash, indexed_at)
+                 VALUES (?1,0,?2,'chunk',NULL,NULL,0,4,1,1,'Peer','peer',?3,'2026-01-01')",
+                rusqlite::params![hash, i as i64 + 2, format!("unit-{i}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO unit_links (source_hash, source_seq, document_id, kind, target, raw)
+                 VALUES (?1,0,?2,'marker','shared','[shared]')",
+                rusqlite::params![hash, i as i64 + 2],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO content_units
+             (hash, seq, document_id, unit_kind, language, symbol, start_byte, end_byte,
+              start_line, end_line, title, text, text_hash, indexed_at)
+             VALUES ('ha',0,1,'chunk',NULL,NULL,0,1,1,1,'A','[shared]','self','2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO unit_links (source_hash, source_seq, document_id, kind, target, raw)
+             VALUES ('ha',0,1,'marker','shared','[shared]')",
+            [],
+        )
+        .unwrap();
+
+        let related = fetch_related_for_target(&conn, "col", "shared", "col", "ha", 0).unwrap();
+
+        assert!(related.len() <= MAX_RELATED_PER_RESULT);
+        assert!(related.iter().all(|item| item.path != "a.md"));
     }
 
     fn test_col(name: &str, path: &str) -> Collection {

@@ -94,6 +94,26 @@ pub struct DaemonResult {
     pub doc_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_seq: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_seq: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_byte: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_byte: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_at: Option<String>,
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -680,6 +700,16 @@ fn handle_request(
                 hash: r.hash,
                 doc_id: r.doc_id,
                 chunk_seq: r.chunk_seq,
+                unit_seq: r.unit_seq,
+                unit_kind: r.unit_kind,
+                language: r.language,
+                symbol: r.symbol,
+                start_line: r.start_line,
+                end_line: r.end_line,
+                start_byte: r.start_byte,
+                end_byte: r.end_byte,
+                indexed_hash: r.indexed_hash,
+                indexed_at: r.indexed_at,
             })
             .collect(),
         log,

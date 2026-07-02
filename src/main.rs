@@ -67,6 +67,7 @@ fn run() -> Result<()> {
             all,
             full,
             chunk,
+            related,
             json,
             csv,
             md,
@@ -86,6 +87,7 @@ fn run() -> Result<()> {
             collections,
             full,
             chunk,
+            related,
             json,
             csv,
             md,
@@ -225,6 +227,7 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
             path,
             glob,
             exclude,
+            preset,
             description,
             preprocessor,
         } => {
@@ -237,11 +240,12 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
                 }
             }
             let store_path = config::portable_path(&path)?;
+            let (globs, excludes) = collection_globs_for_preset(preset.as_deref(), glob, exclude)?;
             config.add_collection(Collection {
                 name: name.clone(),
                 path: store_path,
-                globs: glob,
-                excludes: exclude,
+                globs,
+                excludes,
                 description,
                 preprocessor: if preprocessor.is_empty() {
                     None
@@ -599,6 +603,7 @@ fn handle_search(
     collection_filter: Vec<String>,
     full: bool,
     chunk: bool,
+    related: usize,
     json: bool,
     csv: bool,
     md: bool,
@@ -656,9 +661,90 @@ fn handle_search(
     } else if chunk {
         get::populate_chunk_content(&mut results)?;
     }
+    if related > 0 {
+        get::populate_related(&mut results, related.min(get::MAX_RELATED_PER_RESULT))?;
+    }
 
     output::print_results(&results, fmt);
     Ok(())
+}
+
+fn collection_globs_for_preset(
+    preset: Option<&str>,
+    mut glob: Vec<String>,
+    mut exclude: Vec<String>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    match preset {
+        None | Some("markdown") => {}
+        Some("mixed") => {
+            if glob.is_empty() {
+                glob = vec![
+                    "**/*.md",
+                    "**/*.markdown",
+                    "**/*.rs",
+                    "**/*.py",
+                    "**/*.js",
+                    "**/*.jsx",
+                    "**/*.ts",
+                    "**/*.tsx",
+                    "**/*.go",
+                    "**/*.java",
+                    "**/*.c",
+                    "**/*.h",
+                    "**/*.cc",
+                    "**/*.cpp",
+                    "**/*.cxx",
+                    "**/*.hpp",
+                    "**/*.cs",
+                    "**/*.rb",
+                    "**/*.php",
+                    "**/*.swift",
+                    "**/*.kt",
+                    "**/*.kts",
+                    "**/*.scala",
+                    "**/*.sh",
+                    "**/*.bash",
+                    "**/*.zsh",
+                    "**/*.fish",
+                    "**/*.lua",
+                    "**/*.dart",
+                    "**/*.ex",
+                    "**/*.exs",
+                    "**/*.erl",
+                    "**/*.hrl",
+                    "**/*.fs",
+                    "**/*.fsx",
+                    "**/*.clj",
+                    "**/*.cljs",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            }
+            let defaults = [
+                ".git/**",
+                "target/**",
+                "node_modules/**",
+                "vendor/**",
+                "dist/**",
+                "build/**",
+                ".next/**",
+                ".venv/**",
+                "__pycache__/**",
+            ];
+            for item in defaults {
+                if !exclude.iter().any(|e| e == item) {
+                    exclude.push(item.to_string());
+                }
+            }
+        }
+        Some(other) => {
+            return Err(error::Error::Other(format!(
+                "unknown collection preset '{other}' (expected markdown or mixed)"
+            )));
+        }
+    }
+    Ok((glob, exclude))
 }
 
 fn to_search_results(daemon_results: Vec<daemon::DaemonResult>) -> Vec<types::SearchResult> {
@@ -678,6 +764,18 @@ fn to_search_results(daemon_results: Vec<daemon::DaemonResult>) -> Vec<types::Se
             doc_id: r.doc_id,
             content: None,
             chunk_seq: r.chunk_seq,
+            unit_seq: r.unit_seq.or(r.chunk_seq),
+            unit_kind: r.unit_kind,
+            language: r.language,
+            symbol: r.symbol,
+            start_line: r.start_line,
+            end_line: r.end_line,
+            start_byte: r.start_byte,
+            end_byte: r.end_byte,
+            indexed_hash: r.indexed_hash,
+            indexed_at: r.indexed_at,
+            markers: Vec::new(),
+            related: Vec::new(),
         })
         .collect()
 }
@@ -1182,5 +1280,55 @@ mod tests {
         col.routing = Some(ko_default_routing());
         clear_bind_defaults_if_auto(&mut col, "ko");
         assert_eq!(col.routing, None);
+    }
+
+    #[test]
+    fn mixed_collection_preset_adds_code_globs_and_default_excludes() {
+        let (globs, excludes) =
+            collection_globs_for_preset(Some("mixed"), vec![], vec![]).expect("mixed preset");
+
+        assert!(globs.contains(&"**/*.md".to_string()));
+        assert!(globs.contains(&"**/*.rs".to_string()));
+        assert!(globs.contains(&"**/*.py".to_string()));
+        assert!(globs.contains(&"**/*.ts".to_string()));
+        assert!(globs.contains(&"**/*.go".to_string()));
+        assert!(excludes.contains(&"target/**".to_string()));
+        assert!(excludes.contains(&"node_modules/**".to_string()));
+    }
+
+    #[test]
+    fn markdown_collection_preset_preserves_default_behavior() {
+        let (globs, excludes) =
+            collection_globs_for_preset(None, vec!["**/*.md".to_string()], vec![])
+                .expect("default preset");
+        assert_eq!(globs, vec!["**/*.md"]);
+        assert!(excludes.is_empty());
+
+        let (globs, excludes) =
+            collection_globs_for_preset(Some("markdown"), vec!["notes/**/*.md".to_string()], vec![])
+                .expect("markdown preset");
+        assert_eq!(globs, vec!["notes/**/*.md"]);
+        assert!(excludes.is_empty());
+    }
+
+    #[test]
+    fn mixed_collection_preset_preserves_explicit_globs() {
+        let (globs, excludes) = collection_globs_for_preset(
+            Some("mixed"),
+            vec!["custom/**/*.rs".to_string()],
+            vec!["generated/**".to_string()],
+        )
+        .expect("mixed preset");
+
+        assert_eq!(globs, vec!["custom/**/*.rs"]);
+        assert!(excludes.contains(&"generated/**".to_string()));
+        assert!(excludes.contains(&"target/**".to_string()));
+    }
+
+    #[test]
+    fn unknown_collection_preset_is_rejected() {
+        let err = collection_globs_for_preset(Some("everything"), vec![], vec![])
+            .expect_err("unknown preset should fail");
+        assert!(err.to_string().contains("unknown collection preset"));
     }
 }
