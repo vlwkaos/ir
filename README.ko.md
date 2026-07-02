@@ -2,12 +2,13 @@
 
 [ENG](README.md) | [한국어](README.ko.md) | [中文](README.zh.md)
 
-마크다운 지식베이스를 위한 로컬 시맨틱 검색 엔진. [qmd](https://github.com/tobi/qmd)의 Rust 포트, 세 가지 핵심 차이점:
+마크다운 지식베이스와 코드 저장소를 함께 검색하는 로컬 시맨틱 검색 엔진. [qmd](https://github.com/tobi/qmd)의 Rust 포트, 세 가지 핵심 차이점:
 
 - **컬렉션별 SQLite** — 각 컬렉션이 독립 파일; 공유 전역 인덱스 없음
 - **퍼시스턴트 데몬** — 모델이 쿼리 사이에 메모리에 상주; 첫 검색 시 자동 시작
   차가운 첫 쿼리는 데몬이 뒤에서 예열되는 동안 BM25 결과를 먼저 돌려줄 수 있다.
 - **이중 LLM 캐시** — 확장기 출력과 재순위 점수 영속화; 반복 쿼리는 즉각 반환
+- **연결 검색** — 선택적으로 코드 단위와 명시적 마크다운/주석 링크를 함께 반환
 
 4개 BEIR 데이터셋 기준 검색 품질 측정; 재순위화로 순수 벡터 대비 최대 +14.5% nDCG@10.
 
@@ -55,6 +56,21 @@ ir search "러스트 메모리 안전성"  # 검색 (데몬 자동 시작)
 ```
 
 `ir update`는 빠릅니다 (모델 불필요, 순수 텍스트 처리). `ir embed`는 첫 실행 시 느리지만 (청크별 모델 추론), 이후에는 변경된 내용만 재임베딩합니다. BM25 검색은 `update`만으로 동작하며, 벡터 및 하이브리드 검색은 `embed`가 필요합니다.
+
+## 코드 + 지식 연결 검색
+
+기존 마크다운 전용 동작은 그대로 유지됩니다. 코드와 지식을 함께 인덱싱하려면 mixed 프리셋을 사용합니다:
+
+```bash
+ir collection add project . --preset mixed
+ir update project
+ir embed project
+ir search "reranking을 왜 건너뛰는가" -c project --chunk --related 3 --json
+```
+
+`--preset mixed`는 마크다운과 주요 코드 확장자(Rust, Python, JS/TS, Go, Java, C/C++, C#, Ruby, PHP, Swift, Kotlin, Scala, shell, Lua, Dart, Elixir, Erlang, F#, Clojure)를 포함하고 일반적인 빌드/벤더 디렉터리를 제외합니다. 코드 심볼 추출은 best-effort이며, 인식되지 않는 형태도 파일 단위로 인덱싱됩니다.
+
+연결은 추론하지 않고 명시적 구조에서만 만듭니다: `[[wikilink]]`, 로컬 마크다운 링크, frontmatter `related:`, 그리고 주석/본문의 `[concept-slug]`. 줄 번호는 표시용 힌트일 뿐이며, 검색 결과는 인덱싱 당시의 단위 텍스트와 단위 텍스트 해시인 `indexed_hash`를 함께 반환합니다. 자세한 에이전트 규칙은 [docs/linked-retrieval-agent.md](docs/linked-retrieval-agent.md)를 참고하세요.
 
 **한국어/일본어/중국어 컬렉션:**
 
@@ -192,7 +208,8 @@ ir search "소유권" --json
 ir search "소유권" --md
 ir search "소유권" --files       # 경로만
 ir search "소유권" --full        # 결과에 문서 전문 포함
-ir search "소유권" --chunk       # 가장 관련성 높은 청크 텍스트 포함 (벡터 결과)
+ir search "소유권" --chunk       # 가장 관련성 높은 청크/단위 텍스트 포함
+ir search "소유권" --related 3   # 명시적 1-hop 연결 컨텍스트 포함 (최대 20)
 ir search "소유권" --quiet       # stderr 억제 (진행 표시, 로그) — 스크립팅용
 
 # 필터 (-f/--filter, 반복 가능; 모든 조건 AND)
@@ -355,7 +372,7 @@ ir update notes              # 출력: "0 added, 0 updated, 1 deactivated"
 
 | 도구 | 설명 |
 |------|------|
-| `search` | 하이브리드 BM25+벡터 검색. 경로, 제목, 점수, 스니펫 반환. `mode`, `limit`, `min_score`, `collections`, `full`(전문 포함), `include_chunk`(청크 텍스트 포함), `filter`(`{field, op, value}` 객체 배열, AND 결합) 파라미터 지원. |
+| `search` | 하이브리드 BM25+벡터 검색. 경로, 제목, 점수, 스니펫 반환. `mode`, `limit`, `min_score`, `collections`, `full`(전문 포함), `include_chunk`(청크/단위 텍스트 포함), `include_related`, `related_limit`(최대 20), `filter`(`{field, op, value}` 객체 배열, AND 결합) 파라미터 지원. |
 | `get` | 경로로 문서 조회 (정확 → 접미 → 부분 일치). `collections`, `section`(헤딩 텍스트, 대소문자 무관), `offset`(문자 오프셋), `max_chars`(잘라내기) 파라미터 지원. |
 | `multi_get` | 문서 일괄 조회. `paths[]`, `collections`, `max_chars`(각 문서 잘라내기) 파라미터. `found`와 `not_found` 반환. |
 | `status` | 인덱스 상태 — 컬렉션 이름, 문서 수, DB 크기, 데몬 상태. |

@@ -2,12 +2,13 @@
 
 [ENG](README.md) | [한국어](README.ko.md) | [中文](README.zh.md)
 
-面向 Markdown 知识库的本地语义搜索引擎。[qmd](https://github.com/tobi/qmd) 的 Rust 移植版，具有三项核心差异：
+面向 Markdown 知识库和混合代码仓库的本地语义搜索引擎。[qmd](https://github.com/tobi/qmd) 的 Rust 移植版，具有三项核心差异：
 
 - **按集合独立 SQLite** — 每个集合是独立文件，无共享全局索引
 - **持久化守护进程** — 模型在查询间保持加载；首次搜索自动启动
   冷启动的首次查询可在守护进程后台预热期间先返回 BM25 结果。
 - **双重 LLM 缓存** — 扩展器输出和重排序分数持久化；重复查询即时返回
+- **链接检索** — 可选代码单元与显式 Markdown/注释链接，便于代理获取上下文
 
 已在 4 个 BEIR 数据集上测量检索质量；重排序相对纯向量最高提升 +14.5% nDCG@10。
 
@@ -66,6 +67,21 @@ ir search "机器学习" -c wiki
 不使用预处理器时，"검색엔진"、"機械学習" 等黏着语词形会被当作单个 FTS 令牌处理，无法匹配词素级查询。中文同理——"机器学习"若不分词，则无法匹配"机器"或"学习"。
 
 `ir update` 速度快（无需模型，纯文本处理）。`ir embed` 首次运行较慢（逐块模型推理），后续仅对变更内容重新嵌入。BM25 检索仅需 `update`；向量和混合检索需要 `embed`。
+
+## 代码 + 知识链接检索
+
+默认 Markdown 行为保持不变。若要索引混合代码/知识库，请使用 mixed 预设：
+
+```bash
+ir collection add project . --preset mixed
+ir update project
+ir embed project
+ir search "为什么跳过 reranking" -c project --chunk --related 3 --json
+```
+
+`--preset mixed` 包含 Markdown 与主流代码扩展名（Rust、Python、JS/TS、Go、Java、C/C++、C#、Ruby、PHP、Swift、Kotlin、Scala、shell、Lua、Dart、Elixir、Erlang、F#、Clojure），并排除常见 build/vendor 目录。代码符号提取是 best-effort；无法识别的代码形态仍会按文件级单元索引。
+
+相关链接只来自显式结构，不做静默推断：`[[wikilink]]`、本地 Markdown 链接、frontmatter `related:`，以及正文/注释中的 `[concept-slug]`。行号只是显示提示；结果会返回索引时的单元文本和表示单元文本哈希的 `indexed_hash`。代理使用规范见 [docs/linked-retrieval-agent.md](docs/linked-retrieval-agent.md)。
 
 <details>
 <summary><strong>模型</strong></summary>
@@ -156,7 +172,8 @@ ir search "所有权" --json
 ir search "所有权" --md
 ir search "所有权" --files       # 仅路径
 ir search "所有权" --full        # 结果中包含完整文档内容
-ir search "所有权" --chunk       # 包含最匹配的分块文本（向量结果）
+ir search "所有权" --chunk       # 包含最匹配的分块/单元文本
+ir search "所有权" --related 3   # 包含显式一跳关联上下文（最多 20）
 ir search "所有权" --quiet       # 抑制 stderr（进度、日志）— 用于脚本
 
 # 字段过滤（-f/--filter，可重复；所有条件 AND 连接）
@@ -319,7 +336,7 @@ ir update notes              # 输出："0 added, 0 updated, 1 deactivated"
 
 | 工具 | 说明 |
 |------|------|
-| `search` | 混合 BM25+向量检索。返回路径、标题、分数、摘要。参数：`mode`、`limit`、`min_score`、`collections`、`full`（包含完整文档文本）、`include_chunk`（包含最匹配分块文本）、`filter`（`{field, op, value}` 对象数组，AND 连接）。 |
+| `search` | 混合 BM25+向量检索。返回路径、标题、分数、摘要。参数：`mode`、`limit`、`min_score`、`collections`、`full`（包含完整文档文本）、`include_chunk`（包含最匹配分块/单元文本）、`include_related`、`related_limit`（最多 20）、`filter`（`{field, op, value}` 对象数组，AND 连接）。 |
 | `get` | 按路径检索文档文本（精确 → 后缀 → 子串匹配）。参数：`collections`、`section`（标题文本，不区分大小写）、`offset`（字符偏移）、`max_chars`（截断）。 |
 | `multi_get` | 批量文档检索。参数：`paths[]`、`collections`、`max_chars`（截断每份文档）。返回 `found` 和 `not_found`。 |
 | `status` | 索引状态——集合名称、文档数、数据库大小、守护进程状态。 |

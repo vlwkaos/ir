@@ -2,12 +2,13 @@
 
 [ENG](README.md) | [한국어](README.ko.md) | [中文](README.zh.md)
 
-Local semantic search engine for markdown knowledge bases. Rust port of [qmd](https://github.com/tobi/qmd) with three key differences:
+Local semantic search engine for Markdown knowledge bases and mixed code repositories. Rust port of [qmd](https://github.com/tobi/qmd) with three key differences:
 
 - **Per-collection SQLite** — each collection is an independent file; no shared global index
 - **Persistent daemon** — models stay loaded between queries; first search auto-starts it
   Cold first queries can still return BM25 immediately while the daemon warms in the background.
 - **Dual LLM cache** — expander outputs and reranker scores are persisted; repeated queries are instant
+- **Linked retrieval** — optional code-aware units plus explicit Markdown/comment links for agent context
 
 Search quality benchmarked on 4 BEIR datasets; reranking adds up to +14.5% nDCG@10 over pure vector.
 
@@ -25,6 +26,7 @@ Search quality benchmarked on 4 BEIR datasets; reranking adds up to +14.5% nDCG@
 - **FTS5 injection-safe** — all user input escaped before FTS5 query construction
 - **GPU acceleration** — Metal on macOS (default), CUDA/ROCm/Vulkan on Linux (opt-in via feature flags); `IR_GPU_LAYERS=N` to override
 - **Auto-download** — models fetched from HuggingFace Hub on first use; `HF_HUB_OFFLINE=1` to disable
+- **Linked retrieval** — mixed Markdown/code collections, code-unit snippets, and explicit `--related` context
 
 </details>
 
@@ -54,6 +56,49 @@ ir search "memory safety in rust" # search (daemon auto-starts)
 ```
 
 `ir update` is fast (no models, pure text processing). `ir embed` is slow on first run (model inference per chunk) but only re-embeds changed content on subsequent runs. BM25 search works after `update` alone; vector and hybrid search require `embed`.
+
+## Linked retrieval for code + knowledge
+
+Markdown-only behavior is unchanged. To opt into mixed code/knowledge retrieval, register a collection with the built-in preset:
+
+```bash
+ir collection add project . --preset mixed
+ir update project
+ir embed project
+
+ir search "why does hybrid search skip reranking" \
+  -c project \
+  --chunk \
+  --related 3 \
+  --json
+```
+
+`--preset mixed` includes Markdown plus mainstream code extensions (Rust, Python, JS/TS, Go, Java, C/C++, C#, Ruby, PHP, Swift, Kotlin, Scala, shells, Lua, Dart, Elixir, Erlang, F#, Clojure) and excludes common build/vendor directories. Code extraction is best-effort: common symbols become indexed units; unsupported code shapes still index as file-level units.
+
+Related links are deterministic, not inferred. `ir update` extracts:
+
+```md
+---
+related:
+  - src/search/hybrid.rs#is_bm25_strong_signal
+---
+
+See [[Search pipeline#Strong signal shortcut]] and [strong-signal-shortcut].
+```
+
+```rust
+// [strong-signal-shortcut]
+// See [[Search pipeline#Strong signal shortcut]].
+fn is_bm25_strong_signal(...) -> bool { ... }
+```
+
+Line ranges are display hints. Search results include indexed unit text, `indexed_hash` (the indexed unit text hash), symbol/range metadata, markers, and one-hop `related` items; live file navigation should treat a changed file as stale until `ir update` runs again. See [docs/linked-retrieval-agent.md](docs/linked-retrieval-agent.md) for the minimal agent writing/search contract.
+
+Linked retrieval has a model-free synthesis evidence fixture:
+
+```bash
+python3 scripts/linked-synthesis-eval.py --ir-bin target/debug/ir
+```
 
 <details>
 <summary><strong>Models</strong></summary>
@@ -148,7 +193,8 @@ ir search "ownership" --json
 ir search "ownership" --md
 ir search "ownership" --files       # paths only
 ir search "ownership" --full        # include full document content in results
-ir search "ownership" --chunk       # include best-matching chunk text (vector results)
+ir search "ownership" --chunk       # include best-matching chunk/unit text
+ir search "ownership" --related 3   # include explicit one-hop linked context (max 20)
 ir search "ownership" --quiet       # suppress stderr (progress, logs) — for scripting
 
 # Filter by field (-f/--filter, repeatable; all clauses ANDed)
@@ -196,7 +242,7 @@ Each clause is a string `FIELD OP VALUE`. Multiple `-f` flags are ANDed together
 
 Date values for `modified_at`, `created_at`, and `meta.date` are normalized to UTC RFC3339 (`YYYY-MM-DD` becomes `YYYY-MM-DDT00:00:00Z`). Multi-valued frontmatter fields (e.g. tag arrays) match if **any** element satisfies the clause — including `!=`. A doc tagged `["rust", "go"]` passes `meta.tags!=rust` because `"go"` satisfies the condition. Documents with no metadata rows always fail `meta.*` clauses.
 
-> **Note:** Collection DBs are upgraded to schema version 2 on first use after this release. The one-time backfill (populating `document_metadata` from existing frontmatter) is fast (<1s for <10k docs).
+> **Note:** Collection DBs are upgraded automatically on first use. Schema v2 backfills frontmatter metadata; schema v3 backfills indexed units and explicit links. Both migrations are local and preserve existing Markdown search behavior.
 
 **Daemon:**
 
@@ -311,7 +357,7 @@ Five tools are exposed:
 
 | Tool | Description |
 |------|-------------|
-| `search` | Hybrid BM25+vector search. Returns path, title, score, snippet. Params: `mode`, `limit`, `min_score`, `collections`, `full` (include full doc text), `include_chunk` (include best-matching chunk text), `filter` (array of `{field, op, value}` objects, ANDed). |
+| `search` | Hybrid BM25+vector search. Returns path, title, score, snippet. Params: `mode`, `limit`, `min_score`, `collections`, `full` (include full doc text), `include_chunk` (include best-matching chunk/unit text), `include_related`, `related_limit` (max 20), `filter` (array of `{field, op, value}` objects, ANDed). |
 | `get` | Retrieve document text by path (exact → suffix → substring match). Params: `collections`, `section` (heading text, case-insensitive), `offset` (char offset), `max_chars` (truncate). |
 | `multi_get` | Batch document retrieval. Params: `paths[]`, `collections`, `max_chars` (truncate each doc). Returns `found` and `not_found`. |
 | `status` | Index health — collection names, doc counts, DB sizes, daemon status. |

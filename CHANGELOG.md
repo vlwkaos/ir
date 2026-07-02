@@ -1,3 +1,17 @@
+## [Unreleased]
+
+### Features
+
+- **Enhanced linked retrieval** (`src/index/units.rs`, `src/db/schema_base.sql`, `src/get.rs`): collection DBs upgrade to schema v3 with indexed content units and explicit unit links. Markdown keeps current chunk behavior; mixed code collections can index best-effort code units with symbols, ranges, language, stored unit text, and deterministic links from `[concept-slug]`, wikilinks, local Markdown links, and frontmatter `related:` / `aliases:`.
+- **Mixed collection preset** (`ir collection add --preset mixed`): opt-in globs for Markdown plus mainstream code extensions with common build/vendor excludes. Existing collections and the default Markdown glob are unchanged.
+- **Related search output** (`ir search --related N`, MCP `include_related` / `related_limit`): search results can include explicit one-hop related units. Related items are capped at 20 per result, returned separately from primary scores, and are not inferred semantically.
+- **Code-unit result metadata**: JSON search results may now include additive optional fields such as `unit_seq`, `unit_kind`, `language`, `symbol`, `start_line`, `end_line`, `indexed_hash`, `indexed_at`, `markers`, and `related`. `chunk_seq` remains for compatibility.
+- **Linked synthesis evaluation fixture** (`test-data/fixtures/linked-synthesis`, `scripts/linked-synthesis-eval.py`): model-free evaluation set for mixed code/Markdown synthesis evidence. It fails when search finds a code unit but omits the explicitly linked note evidence needed to answer "why" questions.
+
+### Documentation
+
+- Added `docs/linked-retrieval-agent.md` with a minimal agent search/writing contract for durable knowledge links.
+
 ## [0.15.0] - 2026-05-06
 
 ### Features
