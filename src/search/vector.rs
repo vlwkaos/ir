@@ -17,14 +17,17 @@ pub fn search(
     req: &VecSearchRequest,
 ) -> Result<Vec<SearchResult>> {
     let query_emb = embedder.embed_query(req.query)?;
+    let profile =
+        crate::search::profile::resolve_for_query(dbs.iter().map(|d| d.retrieval.as_ref()));
 
     let mut all: Vec<SearchResult> = dbs
         .iter()
         .flat_map(|db| {
-            vectors::search(db.conn(), &query_emb, &db.name, req.limit * 2).unwrap_or_else(|e| {
-                eprintln!("warn: vector search on '{}' failed: {e}", db.name);
-                vec![]
-            })
+            vectors::search(db.conn(), &query_emb, &db.name, req.limit * 2, profile.ann)
+                .unwrap_or_else(|e| {
+                    eprintln!("warn: vector search on '{}' failed: {e}", db.name);
+                    vec![]
+                })
         })
         .collect();
 

@@ -25,59 +25,34 @@ BM25 검색은 모델 없이 동작한다. 벡터/하이브리드 검색은 첫 
 
 3개 티어. 각 티어는 **이전 티어가 확실하지 않을 때만** 실행되므로, 대부분의 쿼리는 티어 0 또는 1에서 반환되고 LLM을 건드리지 않는다. 하나의 웜 데몬이 모든 모델을 메모리에 유지하고, 모든 LLM 출력은 SQLite에 캐시된다.
 
-```
-  ir search "query"        ░ one warm daemon · every model resident · all LLM output cached ░
-              │
-              ▼
-  ┌────────────────────────┐
-  │  PREPROCESS   ko/ja/zh │   lindera morpheme tokenize · optional
-  │               ~sub-ms  │   SAME transform at index + query time
-  └───────────┬────────────┘
-              │   without it, CJK BM25 ≈ 0.00
-              ▼
-  ┌────────────────────────┐
-  │  TIER 0   BM25         │   FTS5 · no model · in-process
-  │           ~1 ms        │
-  └───────────┬────────────┘
-              │   top ≥ 0.75 & gap ≥ 0.10 ?   ── yes ─────►  ◎ results
-              │  no
-              ▼
-  ┌────────────────────────┐
-  │  TIER 1   Hybrid       │   + EmbeddingGemma-300M
-  │           ~50 ms       │   score = 0.80·vec + 0.20·bm25
-  └───────────┬────────────┘
-              │   strong fused signal ?       ── yes ─────►  ◎ results
-              │  no
-              ▼
-  ┌────────────────────────┐
-  │  TIER 2   Rerank       │   + Qwen3-Reranker-0.6B
-  │           ~0.3–5 s     │   final = 0.40·fused + 0.60·rerank
-  └───────────┬────────────┘
-              ▼
-           ◎ results
-```
+<p align="center">
+  <img src="research/ir-pipeline.png" alt="ir 0.18 3-티어 검색 파이프라인: 티어 0 BM25 + doc-graph 확장, 티어 1 HNSW ANN + 하이브리드 융합, 티어 2 재순위기 (윈도우 100 + keep-window); 강신호 단축으로 조기 반환; LLM 확장기는 기본 비활성화되어 호출 에이전트에 위임." width="620">
+</p>
 
 전처리기는 한국어·일본어·중국어 검색의 성패를 가르는 단계다: 색인 텍스트와 쿼리를 동일하게 형태소 단위로 토큰화하며, 없으면 CJK BM25 점수가 0에 가깝다.
 
-**콜드 vs 웜** (M4 Max): 첫 쿼리는 데몬이 모델을 로드하는 ~3.0초, 이후 모든 쿼리는 ~30ms 왕복 — 콜드 스타트 중에도 BM25는 즉시 응답한다. 선택적 연구 경로(그래프 확장, HNSW ANN, LLM 쿼리 확장)는 같은 티어에 연결되며 **기본 비활성화** — [버전 한눈에 보기](#버전-한눈에-보기) 참고.
+**콜드 vs 웜** (M4 Max): 첫 쿼리는 데몬이 모델을 로드하는 ~3.0초, 이후 모든 쿼리는 ~30ms 왕복 — 콜드 스타트 중에도 BM25는 즉시 응답한다. **0.18**부터 HNSW ANN, 티어-0 그래프 확장, 넓은 재순위 윈도우가 기본 활성화되고, LLM 쿼리 확장기는 호출 에이전트로 위임된다 — 모두 [고급 설정](#고급-설정)에서 컬렉션별로 조정할 수 있다.
 
-## 측정된 품질 (v0.17, nDCG@10)
+## 측정된 품질 (0.18 기본값, nDCG@10)
 
-| 코퍼스 | BM25 단독 | 하이브리드 융합 | 전체 파이프라인 |
-|---|---|---|---|
-| NFCorpus (en, 3.6k 문서, 323 쿼리) | 0.31 | 0.39 | 0.39 |
-| FiQA (en, 57.6k 문서, 648 쿼리) | 0.24 | 0.40 | — |
-| MIRACL-ko 50k 샘플 (ko 전처리기, 213 쿼리) | 0.73 | 0.92 | **0.96** |
-| Allganize RAG-eval-KO (ko, 1.4k 페이지, 298 쿼리) | 0.70 | 0.69 | 0.72 |
+각 단계는 하나의 완전한 에스컬레이션 단계 — **쿼리가 그 단계에서 멈췄을 때**의 점수다. `BM25`와 `Vector`는 단일 신호 기준선이고, `Hybrid`는 둘을 융합하며(`0.80·vec + 0.20·bm25`, 티어 1), `+ Rerank`는 window-100 풀에 0.6B 재순위기를 더한다(티어 2). LLM 확장기는 **기본 비활성화**.
 
-하이브리드 융합은 300M 임베더만 필요하다 (웜 기준 쿼리당 ~50–280ms). 전체 파이프라인은 에스컬레이션되는 쿼리에 한해 확장기 + 재순위기를 추가한다. 한국어 수치는 `ko` 전처리기가 전제다 (아래 참고) — 없으면 한국어 BM25는 거의 0이다.
+| 코퍼스 | BM25 | Vector | Hybrid | + Rerank |
+|---|---|---|---|---|
+| NFCorpus (en, 3.6k 문서, 323 쿼리) | 0.31 | 0.39 | 0.39 | 0.40 |
+| FiQA (en, 57.6k 문서, 648 쿼리) | 0.24 | 0.40 | 0.40 | **0.44** |
+| MIRACL-ko 50k (ko, 213 쿼리) | 0.73 | — | 0.92 | **0.96** |
+| Allganize RAG-eval-KO (ko, 1.4k 페이지, 298 쿼리) | 0.70 | — | 0.69 | 0.72 |
+| **중앙값 지연시간** (웜, M-시리즈) | ~1 ms | ~50 ms | ~50–280 ms | ~2 s |
+
+`BM25`는 원시 FTS5이며, 0.18 기본 티어-0은 **doc-graph 확장**도 실행한다 — 희소 코퍼스(NFCorpus, `0.31 → 0.33`)에서 ≈ +0.02 nDCG@10, 밀집 코퍼스(FiQA)에서는 ~중립. FiQA는 BM25가 약해 `Vector ≈ Hybrid`이고, 재순위기가 실질 향상을 만든다(`0.40 → 0.44`). 한국어는 `ko` 전처리기가 전제다 (없으면 한국어 BM25 ≈ 0). 한국어 `Vector`는 여기서 재측정하지 않음(—).
 
 ## 버전 한눈에 보기
 
 - **≤ 0.15** — 코어 파이프라인, 데몬, MCP, CJK 전처리기.
 - **0.16** — `ir sync` (인덱스 + 임베딩 단일 명령), 자가 복구 증분 업데이트: 삭제된 파일은 완전히 제거되고, 이동/복원된 콘텐츠는 캐시된 벡터를 재사용.
 - **0.17** — graph-expanded retrieval 연구 인프라와 선택적 HNSW ANN 인덱스, 대폭 빨라진 벤치마크 툴체인. **전부 기본 비활성화이며 검색 동작을 전혀 바꾸지 않는다** — opt-in 실험이지 내장 기능이 아니다. 컬렉션 DB에는 첫 쓰기 시 빈 테이블 2개가 추가되며, 0.16과 양방향으로 완전 호환.
-- **0.18 (예정)** — 위 연구 경로들이 **기본** 파이프라인이 된다: 벡터 검색에 HNSW ANN, 그로부터 파생되는 `doc_graph`(그래프 빌드가 O(N²) → O(N·log N)), 티어-0 그래프 확장, 넓은 재순위 윈도우, 그리고 기본 파이프라인에서 LLM 쿼리 확장기 제거(확장은 호출 에이전트로 이관). 마이그레이션은 매끄럽다 — 기존 컬렉션은 다음 `ir sync`에서 인덱스를 재빌드하고 그 전까지는 정확 검색으로 폴백. 근거와 측정 결과: [research/adr-0001-default-retrieval-pipeline.md](research/adr-0001-default-retrieval-pipeline.md).
+- **0.18** — 위 연구 경로들이 **기본** 파이프라인이 된다: 벡터 검색용 HNSW ANN, 티어-0 그래프 확장, keep-window를 갖춘 넓은 재순위 윈도우, 그리고 기본에서 제거된 LLM 쿼리 확장기(확장은 호출 에이전트로 이관). 모든 항목은 `retrieval:` 설정 블록을 통해 컬렉션별로 조정할 수 있다 ([고급 설정](#고급-설정)). 마이그레이션은 매끄럽다 — 기존 컬렉션은 다음 `ir sync`에서 ANN 인덱스와 doc graph를 빌드하고 그 전까지는 정확 검색으로 폴백한다; 스키마 변경 없음. 근거와 측정 결과: [research/adr-0001-default-retrieval-pipeline.md](research/adr-0001-default-retrieval-pipeline.md). *(O(N·log N) graph-from-ANN 빌드는 0.18.x 후속 작업이며, 0.18.0은 기존 정확 패스로 그래프를 빌드한다.)*
 
 ## 문서
 
@@ -279,9 +254,49 @@ cargo test                   # 모델 불필요
 cargo test -- --ignored      # 모델 의존 테스트
 ```
 
-컬렉션별 스키마: `content` (해시 → 텍스트), `documents`, `documents_fts` (FTS5), `vectors_vec` (sqlite-vec, 코사인), `content_vectors` (청크 메타데이터), `llm_cache` (재순위 점수), `document_metadata` (프론트매터), `meta` — 그리고 0.17부터 기본적으로 비어 있는 연구 테이블 (`doc_graph`, `ann_keys`). 전역 `expander_cache.sqlite`는 확장 출력을 캐시한다. 스테이지드 비동기 데몬 설계는 [research/pipeline.md](research/pipeline.md) 참고.
+컬렉션별 스키마: `content` (해시 → 텍스트), `documents`, `documents_fts` (FTS5), `vectors_vec` (sqlite-vec, 코사인), `content_vectors` (청크 메타데이터), `llm_cache` (재순위 점수), `document_metadata` (프론트매터), `meta`, `doc_graph`, `ann_keys`. 전역 `expander_cache.sqlite`는 확장 출력을 캐시한다. 스테이지드 비동기 데몬 설계는 [research/pipeline.md](research/pipeline.md) 참고.
 
 </details>
+
+## 고급 설정
+
+검색 파이프라인 동작은 `config.yml`의 `retrieval:` 블록에서 컬렉션별로(그리고 전역으로) 설정한다. 모든 필드는 선택 사항이며 — 생략하면 0.18 기본값이 적용된다. 해석 우선순위는 **`config > env > default`**: 여기에 설정한 값이 최종 권한을 가지며, 떠도는 환경변수에 조용히 덮어써지지 않는다.
+
+```yaml
+# ~/.config/ir/config.yml
+
+# 전역 (데몬): 인프로세스 LLM 쿼리 확장기 로드 여부
+retrieval:
+  expander: false            # 0.18 기본값 — 확장은 호출 에이전트의 몫
+
+collections:
+  - name: notes
+    path: ~/notes
+    # 컬렉션별 파이프라인 오버라이드
+    retrieval:
+      ann: true              # 벡터 kNN용 HNSW ANN (미빌드 시 정확 검색으로 폴백)
+      t0_graph_expand: true  # 티어-0 doc-graph 시드 확장
+      rerank_window: 100     # 재순위기로 보내는 후보 수
+      rerank_keep_window: true
+```
+
+| 키 | 범위 | 0.18 기본값 | 의미 |
+|---|---|---|---|
+| `ann` | 컬렉션 | `true` | 벡터 검색용 HNSW ANN 인덱스; 없거나 오래되면 정확 브루트포스로 폴백. |
+| `t0_graph_expand` | 컬렉션 | `true` | BM25 시드가 `doc_graph` 이웃을 티어-0 후보 목록으로 끌어온다. |
+| `rerank_window` | 컬렉션 | `100` | 티어-2 재순위기로 보내는 후보 수. |
+| `rerank_keep_window` | 컬렉션 | `true` | 판정된 문서를 미판정 꼬리보다 위에 유지. |
+| `expander` | 전역 | `false` | 인프로세스 LLM 쿼리 확장기 로드; 아니면 확장은 호출자에게 위임. |
+
+함께 검색되는 컬렉션들은 컬렉션별 값이 **일치**해야 적용된다; 충돌하면 기본값으로 폴백한다 (`routing:`과 동일한 규칙). `ir sync` / `ir embed`는 해당 노브가 켜져 있을 때 ANN 인덱스와 doc graph를 빌드한다 (빈 컬렉션은 건너뜀). 컬렉션을 0.18 이전 검색 동작으로 되돌리려면 `ann: false`, `t0_graph_expand: false`, `rerank_window: 20`, `rerank_keep_window: false`, 그리고 전역 `expander: true`로 설정한다.
+
+**대체 설정 파일** — 데이터 디렉터리를 옮기지 않고(컬렉션과 캐시는 그대로) 다른 `config.yml`을 `ir`에 지정하여, 하나의 임베딩된 코퍼스 위에서 여러 파이프라인 설정을 비교할 수 있다:
+
+```bash
+ir --config-path ./variant.yml search "query" -c notes
+```
+
+우선순위: `--config-path` > `IR_CONFIG_FILE` > `<config-dir>/config.yml`.
 
 ## 라이선스
 

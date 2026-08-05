@@ -70,15 +70,17 @@ pub fn knn(
 }
 
 /// Full vector search: kNN → batch document lookup → deduplicate by path.
+/// `use_ann` (from the resolved retrieval profile) selects the HNSW sidecar;
+/// exact brute force is the fallback whenever it's off, absent, or stale.
 pub fn search(
     conn: &Connection,
     query_embedding: &[f32],
     collection: &str,
     limit: usize,
+    use_ann: bool,
 ) -> Result<Vec<SearchResult>> {
     // Over-fetch to deduplicate (multiple chunks per doc).
-    // Research (IR_ANN=hnsw): ANN sidecar when present and fresh; exact otherwise.
-    let raw = match super::ann::search(conn, query_embedding, limit * 4) {
+    let raw = match super::ann::search(conn, query_embedding, limit * 4, use_ann) {
         Some(hits) => hits,
         None => knn(conn, query_embedding, limit * 4)?,
     };
@@ -223,7 +225,7 @@ mod tests {
         let v = vec![1.0f32, 0.0, 0.0, 0.0];
         insert(&conn, &format!("{hash}_0"), &v).unwrap();
 
-        let results = search(&conn, &v, "test_col", 5).unwrap();
+        let results = search(&conn, &v, "test_col", 5, false).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "doc.md");
         assert_eq!(results[0].title, "Doc Title");
@@ -248,7 +250,7 @@ mod tests {
         insert(&conn, &format!("{hash}_2"), &near).unwrap();
 
         let query = vec![1.0f32, 0.0, 0.0, 0.0];
-        let results = search(&conn, &query, "col", 5).unwrap();
+        let results = search(&conn, &query, "col", 5, false).unwrap();
         assert_eq!(results.len(), 1);
         // chunk 2 is closest — its seq should win
         assert_eq!(results[0].chunk_seq, Some(2));

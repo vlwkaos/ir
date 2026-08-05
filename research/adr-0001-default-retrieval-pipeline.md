@@ -1,8 +1,11 @@
 # ADR-0001 — Default retrieval pipeline for v0.18
 
-- **Status:** Accepted, targeted for 0.18. Shipped opt-in through the 0.17.x line.
+- **Status:** Accepted; shipped as the **default in 0.18.0** (ANN, tier-0 graph
+  expansion, wide rerank window + keep-window on; LLM expander off). The
+  O(N·log N) graph-from-ANN build is deferred to a 0.18.x follow-up — 0.18.0
+  builds the doc graph via the existing exact pass.
 - **Date:** 2026-08-01
-- **Supersedes default behavior of:** 0.17.x (all features below are env-gated / off).
+- **Supersedes default behavior of:** 0.17.x (all features below were env-gated / off).
 
 ## Context
 
@@ -49,6 +52,45 @@ In 0.18, make the following the **default** pipeline (each remains overridable):
 0.17.x keeps all of the above **opt-in** (env-gated), plus the tier-2 metadata
 filter-bypass fix. 0.18 flips the defaults; no schema change is required —
 `doc_graph` and `ann_keys` already exist (created empty since 0.17).
+
+### Configuration and precedence
+
+The scattered per-call `env_flag`/`env::var` reads (~10 sites across the
+index-build, daemon, and query layers) are replaced by **one resolved
+`RetrievalProfile`** (`src/search/profile.rs`), resolved once per owning layer:
+`resolve_for_query` (per-collection, agreement rule reused from `RoutingConfig`),
+`resolve_for_daemon` (global — `expander` is a process-level model-load decision),
+`resolve_for_build` (per-collection at `ir embed`). All defaults live in one
+`DEFAULT_V017` / `DEFAULT_V018` const.
+
+Three inputs, resolved **`config > env > default`** — identical to how
+`RoutingConfig` already resolves, so the whole binary shares one precedence rule:
+
+- **config.yml** — the authoritative, persistent home. A `retrieval:` block,
+  hand-edited, mirroring the existing `routing:` UX (per-collection + a top-level
+  block for the global `expander` knob). `Option`/serde-default: omit a knob to
+  get the built-in default. A value set here **cannot be silently masked** by a
+  stale environment variable.
+- **env** — a **deprecated convenience layer**. The existing `IR_*` presence knobs
+  keep working for quick one-off sweeps, but only fill in where config is silent;
+  they are documented as deprecated and removed progressively in later versions
+  once benchmarks and users have moved to config-path. The daemon prints a startup
+  note whenever a research override is active (so "why am I not seeing 0.18
+  behavior?" is one glance at the log). Fine-tuning calibration knobs
+  (`IR_ANN_EF`, `IR_GRAPH_DECAY`, …) are **not** part of the profile and stay env.
+- **built-in default** — `DEFAULT_V018`. No config, no env → the 0.18 pipeline.
+
+`--config-path` (file-level) overrides **only the config.yml file, not the data
+dir** (collections, caches, daemon socket stay put). This decouples "which config"
+from "which data" so a benchmark can vary pipeline config across candidates while
+reusing one embedded corpus. Precedence: `--config-path` arg > `IR_CONFIG_DIR` >
+default. Benchmarks graduate from env sweeps to per-candidate config files
+(reproducible: run = a checked-in file, not remembered shell exports).
+
+Documentation lives under **README → Advanced Configuration** (EN/KO/ZH) — between
+"invisible research env var" and "front-page feature": default users get
+`DEFAULT_V018` with zero config; power users editing pipeline behavior go to
+Advanced. Genuinely per-query knobs (`--mode`) stay CLI args, outside the profile.
 
 ### Index time (0.18)
 
@@ -118,9 +160,12 @@ No manual step for existing collections:
 
 Staged so each stage ships green:
 
-- **Stage 1** — introduce a single resolved retrieval-profile as the one presence
-  source of truth (replaces scattered per-call `env_flag` reads). Defaults match
-  0.17 exactly → behavior-preserving, existing tests pass unchanged.
+- **Stage 1** — introduce the resolved `RetrievalProfile` as the one presence
+  source of truth (replaces scattered per-call `env_flag` reads), with
+  `config > env > default` precedence and the `retrieval:` config block; land the
+  file-level `--config-path` override (decoupled from the data dir) so benchmarks
+  can validate Stages 2–3 via per-candidate config files. Defaults are
+  `DEFAULT_V017` → behavior-preserving, existing tests pass unchanged.
 - **Stage 2** — build `doc_graph` from the ANN index with a brute-force fallback.
   Gate: T0 graph nDCG on NFCorpus within tolerance of the brute-force-built graph
   (ANN-derived edges are approximate, so this is an empirical gate, not bit-parity).
@@ -137,6 +182,11 @@ Staged so each stage ships green:
 - **Callers own query expansion.** Agents that relied on in-process expansion must
   expand queries themselves or opt the expander back in. Documented in the 0.18
   release notes.
+- **config.yml becomes the authoritative override; env is deprecated.** Presence
+  knobs move to a `retrieval:` config block (`config > env > default`). The `IR_*`
+  presence env vars keep working as a deprecated convenience layer and are removed
+  progressively in later versions; the daemon logs a note when any override is
+  active. Fine-tuning calibration env vars are unaffected.
 - **Untested regime**: all measurements are monolingual with query↔doc vocabulary
   overlap. The expander's theoretical value is cross-lingual / vocabulary-mismatch
   retrieval, which none of the public corpora exercise. If that regime matters,
@@ -150,6 +200,13 @@ Staged so each stage ships green:
   Six flags flipping across four modules, with gating read at each call site, is
   the same scattered-policy shape that produced the tier-2 filter-bypass bug. A
   single resolved profile (Stage 1) is the smaller long-run surface.
+- **Env-wins precedence (`env > config`)** — considered for benchmark ergonomics
+  (a sweep value must not be silently overridden), rejected. It disagrees with the
+  existing `RoutingConfig` order and lets a stale shell var silently mask an
+  intentional config value — the wrong direction for a product's authoritative
+  source. `config > env > default` plus file-level `--config-path` gives
+  benchmarks reproducible per-candidate config files instead, and keeps one
+  precedence rule across the whole binary.
 - **Keep the two indexes separate** (ANN for query, matmul graph for build) —
   rejected. Deriving the graph from the ANN index removes the O(N²) build and one
   whole index-maintenance path.

@@ -1,3 +1,37 @@
+## [0.18.0] - 2026-08-05
+
+The graph + ANN research from the 0.17.x line becomes the **default** retrieval pipeline. See [research/adr-0001-default-retrieval-pipeline.md](research/adr-0001-default-retrieval-pipeline.md).
+
+### Changed — default pipeline
+
+- **HNSW ANN on by default** for vector kNN — sublinear search, exact brute-force fallback whenever the index is absent or stale (correctness never depends on the index existing).
+- **Tier-0 graph expansion on by default** — BM25 seeds pull in doc-graph neighbours; a zero-harm recall win on sparse-result corpora, inert on saturated ones.
+- **Wide rerank window (100) + keep-window on by default** — the reranker judges a deeper pool and judged docs are kept above the un-judged tail; this is the quality change that makes the no-expander pipeline viable.
+- **LLM query expander off by default** — query expansion is delegated to the calling agent. The expander is still available opt-in for callers that want in-process expansion. Dropping it removes a model from the default footprint and its latency from tier-2.
+- **`ir embed` now builds the ANN index and the doc graph by default** (skipped for empty collections). One-time cost on the next sync after upgrading; incremental thereafter.
+
+Every knob remains overridable. Existing collections upgrade seamlessly: until the next `ir sync`, ANN/graph are absent and search behaves exactly as 0.17; the next sync builds them and search transparently upgrades. No schema migration (`doc_graph`/`ann_keys` have existed since 0.17).
+
+### Added — configuration
+
+- **`retrieval:` config block** in `config.yml` — per-collection (ANN, tier-0 graph, rerank window, keep-window) and a top-level block (`expander`). Every field is optional; omit to take the default. Documented under README → Advanced Configuration.
+- **Single resolved retrieval profile** (`src/search/profile.rs`): one source of truth replacing scattered per-call env reads across the index-build, daemon, and query layers. Precedence **`config > env > default`** — a value set in `config.yml` is authoritative and cannot be silently masked by a stale environment variable (matches the existing per-collection `routing:` rule).
+- **`--config-path <FILE>`** global flag — use an alternate `config.yml` while keeping the data dir (collections, caches) in place, so different pipeline configs can be compared over one embedded corpus. Precedence: `--config-path` > `IR_CONFIG_FILE` > `<config-dir>/config.yml`.
+
+### Deprecated
+
+- The `IR_*` retrieval-pipeline env vars (`IR_ANN`, `IR_GRAPH_T0_EXPAND`, `IR_RERANK_WINDOW_OVERRIDE`, `IR_RERANK_KEEP_WINDOW`, `IR_DISABLE_EXPANDER`) are now a convenience layer beneath `config.yml` and will be removed in a later release; prefer the `retrieval:` config block. Fine-tuning knobs (`IR_ANN_EF`, `IR_GRAPH_DECAY`, …) are unaffected.
+
+### Notes
+
+- Callers relying on in-process query expansion must expand queries themselves or set `retrieval.expander: true`.
+- The O(N·log N) graph-from-ANN build is a follow-up; 0.18.0 builds the doc graph via the existing (correct) exact pass.
+
+### Dev / Benchmark Tooling
+
+- **Bench watchdog swapout tolerance default `0 → 65536` pages (~1 GiB)** (`scripts/bench-env.sh`): the strict `0` aborted large-corpus embeds on benign, system-wide background paging (the swapout counter is cumulative and machine-wide). The `IR_BENCH_MIN_FREE_PCT` floor remains the real guard against genuine memory exhaustion; set `IR_BENCH_MAX_SWAPOUT_DELTA=0` for strict pristine-latency runs.
+- **`scripts/bench.sh` now owns its daemon lifecycle** (`scripts/bench-env.sh` `bench_cleanup` + an `EXIT`/`INT`/`TERM` trap): on any exit it stops the bench's isolated daemon and reaps any in-flight guarded child (`ir embed`), so runs no longer leave orphaned daemons/embeds contending for the GPU. Cleanup targets only the isolated `IR_CONFIG_DIR` socket, so it never touches a real work daemon in another session.
+
 ## [0.17.2] - 2026-08-01
 
 ### Fixes

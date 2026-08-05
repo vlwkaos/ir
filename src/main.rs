@@ -53,6 +53,12 @@ fn run() -> Result<()> {
     // Must happen before any config load.
     unsafe { std::env::set_var("IR_DIR", config::ir_dir()) };
     let cli = Cli::parse();
+    // `--config-path` overrides only the config file (not the data dir). Set the
+    // internal transport var before any Config::load(); the spawned daemon
+    // inherits it, so client and daemon resolve the same config file.
+    if let Some(path) = cli.config_path.as_ref() {
+        unsafe { std::env::set_var("IR_CONFIG_FILE", path) };
+    }
     match cli.command {
         Command::Collection { cmd } => handle_collection(cmd),
         Command::Status => handle_status(),
@@ -250,6 +256,7 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
                     Some(preprocessor)
                 },
                 routing: None,
+                retrieval: None,
             })?;
             config.save()?;
             println!("added collection '{name}'");
@@ -400,6 +407,7 @@ pub(crate) fn search_core(
                 &collection_db_path(&c.name),
                 pp_commands,
                 c.routing.clone(),
+                c.retrieval.clone(),
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -418,9 +426,16 @@ pub(crate) fn search_core(
     };
     let mut bm25_results = search::fan_out::bm25(&dbs, &bm25_req)?;
 
-    // Research: kNN-graph expansion of BM25 seeds (IR_GRAPH_T0_EXPAND=1).
-    // Runs before tier-0 filter so injected docs are filtered like any other.
-    search::graph::maybe_expand_t0(&dbs, &mut bm25_results, fetch_limit);
+    // Tier-0 kNN-graph expansion of BM25 seeds (profile.t0_graph_expand;
+    // config > env > default). Runs before the tier-0 filter so injected docs
+    // are filtered like any other.
+    let t0_profile = search::profile::resolve_for_query(dbs.iter().map(|d| d.retrieval.as_ref()));
+    search::graph::maybe_expand_t0(
+        &dbs,
+        &mut bm25_results,
+        fetch_limit,
+        t0_profile.t0_graph_expand,
+    );
 
     // Tier-0 filter: apply before BM25 strong-signal check
     search::filter::apply(&mut bm25_results, &filter, &dbs)?;
@@ -668,6 +683,7 @@ fn handle_search(
                     &collection_db_path(&c.name),
                     pp_commands,
                     c.routing.clone(),
+                    c.retrieval.clone(),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1191,11 +1207,18 @@ fn handle_sync_phases(
     Ok(())
 }
 
-/// Research: rebuild the kNN document graph after embedding (IR_GRAPH_BUILD=1).
+/// Build the kNN document graph after embedding when a graph consumer is on
+/// (profile.t0_graph_expand; config > env > default). IR_GRAPH_BUILD forces a
+/// build for the research-only graph features (T1/T2) that stay env-gated.
 /// Reads stored chunk embeddings only — no model inference; safe on
 /// already-embedded collections (embed no-op still triggers a rebuild).
 fn maybe_build_graph(db: &db::CollectionDb) -> Result<()> {
-    if !config::env_flag("IR_GRAPH_BUILD") {
+    let profile = search::profile::resolve_for_build(db.retrieval.as_ref());
+    if !profile.t0_graph_expand && !config::env_flag("IR_GRAPH_BUILD") {
+        return Ok(());
+    }
+    // Nothing to build for an empty collection — stay silent (parity with ANN sync).
+    if db.active_doc_count() == 0 {
         return Ok(());
     }
     // Cap k so fetch_m(k) = (k+2)*3+8 can't overflow on a fat-fingered sweep value.
@@ -1210,11 +1233,12 @@ fn maybe_build_graph(db: &db::CollectionDb) -> Result<()> {
     Ok(())
 }
 
-/// Research: sync the HNSW ANN sidecar after embedding (IR_ANN=hnsw).
-/// Incremental — only newly embedded chunks are added; model/dim changes
-/// rebuild from stored vectors without model inference.
+/// Sync the HNSW ANN sidecar after embedding when ANN is on (profile.ann;
+/// config > env > default). Incremental — only newly embedded chunks are added;
+/// model/dim changes rebuild from stored vectors without model inference.
 fn maybe_sync_ann(db: &db::CollectionDb) -> Result<()> {
-    if !db::ann::enabled() {
+    let profile = search::profile::resolve_for_build(db.retrieval.as_ref());
+    if !profile.ann {
         return Ok(());
     }
     let (total, added) = db::ann::sync(db.conn())?;
@@ -1237,6 +1261,7 @@ mod tests {
             description: None,
             preprocessor: None,
             routing: None,
+            retrieval: None,
         }
     }
 

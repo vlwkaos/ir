@@ -25,59 +25,34 @@ BM25 检索无需任何模型。向量/混合检索在首次使用时自动从 H
 
 三层。每层**仅在上一层信心不足时**才运行，因此绝大多数查询在第 0 或第 1 层就返回，不触及 LLM。单个热守护进程将所有模型常驻内存，所有 LLM 输出都缓存在 SQLite 中。
 
-```
-  ir search "query"        ░ one warm daemon · every model resident · all LLM output cached ░
-              │
-              ▼
-  ┌────────────────────────┐
-  │  PREPROCESS   ko/ja/zh │   lindera morpheme tokenize · optional
-  │               ~sub-ms  │   SAME transform at index + query time
-  └───────────┬────────────┘
-              │   without it, CJK BM25 ≈ 0.00
-              ▼
-  ┌────────────────────────┐
-  │  TIER 0   BM25         │   FTS5 · no model · in-process
-  │           ~1 ms        │
-  └───────────┬────────────┘
-              │   top ≥ 0.75 & gap ≥ 0.10 ?   ── yes ─────►  ◎ results
-              │  no
-              ▼
-  ┌────────────────────────┐
-  │  TIER 1   Hybrid       │   + EmbeddingGemma-300M
-  │           ~50 ms       │   score = 0.80·vec + 0.20·bm25
-  └───────────┬────────────┘
-              │   strong fused signal ?       ── yes ─────►  ◎ results
-              │  no
-              ▼
-  ┌────────────────────────┐
-  │  TIER 2   Rerank       │   + Qwen3-Reranker-0.6B
-  │           ~0.3–5 s     │   final = 0.40·fused + 0.60·rerank
-  └───────────┬────────────┘
-              ▼
-           ◎ results
-```
+<p align="center">
+  <img src="research/ir-pipeline.png" alt="ir 0.18 三层检索管线：第 0 层 BM25 + doc-graph 扩展，第 1 层 HNSW ANN + 混合融合，第 2 层重排序器（窗口 100 + keep-window）；强信号捷径提前返回；LLM 扩展器默认关闭并委托给调用方。" width="620">
+</p>
 
 预处理器是中日韩检索成败的关键：它对索引文本和查询做相同的形态素切分，没有它 CJK BM25 分数接近零。
 
-**冷启动 vs 热启动**（M4 Max）：首次查询约 3.0 秒（守护进程加载模型），之后每次查询约 30ms 往返——即使在冷启动期间 BM25 也即时响应。可选的研究路径（图扩展、HNSW ANN、LLM 查询扩展）接入相同的层级，且**默认关闭**——见[版本速览](#版本速览)。
+**冷启动 vs 热启动**（M4 Max）：首次查询约 3.0 秒（守护进程加载模型），之后每次查询约 30ms 往返——即使在冷启动期间 BM25 也即时响应。自 **0.18** 起，HNSW ANN、第 0 层图扩展和更宽的重排序窗口均默认开启，而 LLM 查询扩展器则委托给调用方 agent——所有这些均可在[高级配置](#高级配置)中按集合调整。
 
-## 实测质量（v0.17，nDCG@10）
+## 实测质量（0.18 默认值，nDCG@10）
 
-| 语料库 | 仅 BM25 | 混合融合 | 完整管线 |
-|---|---|---|---|
-| NFCorpus（英文，3.6k 文档，323 查询） | 0.31 | 0.39 | 0.39 |
-| FiQA（英文，57.6k 文档，648 查询） | 0.24 | 0.40 | — |
-| MIRACL-ko 50k 抽样（ko 预处理器，213 查询） | 0.73 | 0.92 | **0.96** |
-| Allganize RAG-eval-KO（韩文，1.4k 页，298 查询） | 0.70 | 0.69 | 0.72 |
+每一阶段都是一次完整的升级步骤——即**查询在该阶段停止时**的得分。`BM25` 和 `Vector` 是单信号基线；`Hybrid` 将二者融合（`0.80·vec + 0.20·bm25`，第 1 层）；`+ Rerank` 在 window-100 候选池上加入 0.6B 重排序器（第 2 层）。LLM 扩展器**默认关闭**。
 
-混合融合仅需 300M 嵌入模型（热启动下 ~50–280ms/查询）。完整管线在需要升级的查询上追加扩展器 + 重排序器。韩文成绩需要 `ko` 预处理器（见下文）——没有它韩文 BM25 几乎为零。
+| 语料库 | BM25 | Vector | Hybrid | + Rerank |
+|---|---|---|---|---|
+| NFCorpus（英文，3.6k 文档，323 查询） | 0.31 | 0.39 | 0.39 | 0.40 |
+| FiQA（英文，57.6k 文档，648 查询） | 0.24 | 0.40 | 0.40 | **0.44** |
+| MIRACL-ko 50k（韩文，213 查询） | 0.73 | — | 0.92 | **0.96** |
+| Allganize RAG-eval-KO（韩文，1.4k 页，298 查询） | 0.70 | — | 0.69 | 0.72 |
+| **中位延迟**（热启动，M 系列） | ~1 ms | ~50 ms | ~50–280 ms | ~2 s |
+
+`BM25` 为原始 FTS5；0.18 默认的第 0 层还会运行 **doc-graph 扩展**，在稀疏语料（NFCorpus，`0.31 → 0.33`）上带来 ≈ +0.02 nDCG@10，在稠密语料（FiQA）上则~中性。FiQA 上 BM25 较弱，故 `Vector ≈ Hybrid`；随后由重排序器带来实质提升（`0.40 → 0.44`）。韩文需要 `ko` 预处理器（否则韩文 BM25 ≈ 0）。韩文 `Vector` 未在此重新测量（—）。
 
 ## 版本速览
 
 - **≤ 0.15** — 核心管线、守护进程、MCP、CJK 预处理器。
 - **0.16** — `ir sync`（索引 + 嵌入一条命令搞定），自愈式增量更新：已删除文件被彻底移除，移动/恢复的内容复用缓存向量。
 - **0.17** — 面向图扩展检索的研究基础设施和可选的 HNSW ANN 索引，以及快得多的基准测试工具链。**全部默认禁用，不改变任何检索行为**——这些是可选实验，不是内置特性。集合数据库在首次写入时新增两个空表；数据库与 0.16 双向完全兼容。
-- **0.18（计划中）** — 上述研究路径成为**默认**流程：向量检索用 HNSW ANN，`doc_graph` 由其派生（图构建从 O(N²) 降到 O(N·log N)），第 0 层图扩展，更宽的重排序窗口，并从默认流程中移除 LLM 查询扩展器（扩展交给调用方 agent）。迁移无缝——现有集合在下次 `ir sync` 时重建索引，在此之前回退到精确检索。理由与实测结果见 [research/adr-0001-default-retrieval-pipeline.md](research/adr-0001-default-retrieval-pipeline.md)。
+- **0.18** — 上述研究路径成为**默认**流程：向量检索用 HNSW ANN、第 0 层图扩展、更宽的重排序窗口（含 keep-window），并从默认流程中移除 LLM 查询扩展器（扩展交给调用方 agent）。一切均可通过 `retrieval:` 配置块按集合调整（[高级配置](#高级配置)）。迁移无缝——现有集合在下次 `ir sync` 时构建其 ANN 索引和 doc graph，在此之前回退到精确检索；无 schema 变更。理由与实测结果见 [research/adr-0001-default-retrieval-pipeline.md](research/adr-0001-default-retrieval-pipeline.md)。*（O(N·log N) 的由 ANN 派生 doc graph 的构建是 0.18.x 的后续工作；0.18.0 通过现有的精确遍历构建该图。）*
 
 ## 文档
 
@@ -250,9 +225,49 @@ cargo test                   # 无需模型
 cargo test -- --ignored      # 依赖模型的测试
 ```
 
-集合级 schema：`content`（哈希 → 文本）、`documents`、`documents_fts`（FTS5）、`vectors_vec`（sqlite-vec，余弦）、`content_vectors`（分块元数据）、`llm_cache`（重排序分数）、`document_metadata`（前言）、`meta`——自 0.17 起另有默认为空的研究表（`doc_graph`、`ann_keys`）。全局 `expander_cache.sqlite` 缓存扩展输出。分阶段异步守护进程设计见 [research/pipeline.md](research/pipeline.md)。
+集合级 schema：`content`（哈希 → 文本）、`documents`、`documents_fts`（FTS5）、`vectors_vec`（sqlite-vec，余弦）、`content_vectors`（分块元数据）、`llm_cache`（重排序分数）、`document_metadata`（前言）、`meta`、`doc_graph`、`ann_keys`。全局 `expander_cache.sqlite` 缓存扩展输出。分阶段异步守护进程设计见 [research/pipeline.md](research/pipeline.md)。
 
 </details>
+
+## 高级配置
+
+检索管线的行为可在 `config.yml` 中按集合（以及全局）通过 `retrieval:` 块配置。每个字段都是可选的——省略即采用 0.18 默认值。解析优先级为 **`config > env > default`**：此处设置的值具有权威性，不会被某个游离的环境变量悄然覆盖。
+
+```yaml
+# ~/.config/ir/config.yml
+
+# 全局（守护进程）：是否加载进程内的 LLM 查询扩展器
+retrieval:
+  expander: false            # 0.18 默认——扩展是调用方 agent 的职责
+
+collections:
+  - name: notes
+    path: ~/notes
+    # 集合级管线覆盖
+    retrieval:
+      ann: true              # 向量 kNN 用 HNSW ANN（未构建时回退到精确检索）
+      t0_graph_expand: true  # 第 0 层 doc-graph 种子扩展
+      rerank_window: 100     # 送入重排序器的候选数
+      rerank_keep_window: true
+```
+
+| 键 | 作用域 | 0.18 默认 | 含义 |
+|---|---|---|---|
+| `ann` | 集合 | `true` | 向量检索的 HNSW ANN 索引；缺失或过期时回退到精确的暴力检索。 |
+| `t0_graph_expand` | 集合 | `true` | BM25 种子将 `doc_graph` 邻居拉入第 0 层候选列表。 |
+| `rerank_window` | 集合 | `100` | 送入第 2 层重排序器的候选数。 |
+| `rerank_keep_window` | 集合 | `true` | 让已评判文档排在未评判尾部之上。 |
+| `expander` | 全局 | `false` | 加载进程内的 LLM 查询扩展器；否则扩展委托给调用方。 |
+
+一起检索的集合必须在某个集合级值上**一致**，该值才会生效；冲突时回退到默认值（与 `routing:` 规则相同）。当相应开关开启时，`ir sync` / `ir embed` 会构建 ANN 索引和 doc graph（空集合会跳过）。要将某集合恢复到 0.18 之前的检索方式，设置 `ann: false`、`t0_graph_expand: false`、`rerank_window: 20`、`rerank_keep_window: false`，并将全局 `expander: true`。
+
+**备用配置文件** — 在不移动数据目录（集合和缓存保持原位）的情况下，让 `ir` 指向另一个 `config.yml`，以便在同一份已嵌入的语料上比较不同的管线配置：
+
+```bash
+ir --config-path ./variant.yml search "query" -c notes
+```
+
+优先级：`--config-path` > `IR_CONFIG_FILE` > `<config-dir>/config.yml`。
 
 ## 许可证
 

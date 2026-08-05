@@ -19,6 +19,11 @@ pub struct Config {
     /// alias → command string (e.g. "ko" → "kiwi-tokenize", "ja" → "mecab -Owakati")
     #[serde(default)]
     pub preprocessors: HashMap<String, String>,
+    /// Global retrieval-pipeline overrides (top-level block). Used for the
+    /// daemon-global `expander` decision; per-collection query knobs live on each
+    /// `Collection`. `None` → built-in defaults. See `search::profile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<crate::types::RetrievalConfig>,
 }
 
 impl Config {
@@ -247,7 +252,19 @@ pub fn portable_path(raw: &str) -> Result<String> {
     }
 }
 
+/// Path to the `config.yml` file.
+///
+/// Precedence: `IR_CONFIG_FILE` (set by the `--config-path` CLI arg, and inherited
+/// by the spawned daemon) > `ir_dir()/config.yml`. This overrides **only the
+/// config file**, not the data dir — collections, caches, and the daemon socket
+/// stay under `ir_dir()`, so a benchmark can vary pipeline config across
+/// candidates while reusing one embedded corpus.
 pub fn config_path() -> PathBuf {
+    if let Ok(val) = std::env::var("IR_CONFIG_FILE")
+        && !val.is_empty()
+    {
+        return expand_path(&val);
+    }
     ir_dir().join("config.yml")
 }
 
@@ -300,6 +317,7 @@ mod tests {
             description: None,
             preprocessor: None,
             routing: None,
+            retrieval: None,
         }
     }
 

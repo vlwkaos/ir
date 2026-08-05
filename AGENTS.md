@@ -41,6 +41,7 @@ Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
 | `IR_LLAMA_LOGS` | unset | Set to `1` to enable llama.cpp verbose logging |
 | `IR_MODEL_DIRS` | `~/local-models/` | Colon-separated extra model search dirs |
 | `IR_CONFIG_DIR` | `~/.config/ir` | Override config/data dir. Supports `~` and `$VAR` expansion. |
+| `IR_CONFIG_FILE` | unset | Override the `config.yml` file path only (data dir unchanged). Set by the `--config-path` CLI arg and inherited by the daemon. Precedence: `--config-path` > `IR_CONFIG_FILE` > `<config-dir>/config.yml`. |
 | `XDG_CONFIG_HOME` | `~/.config` | **Deprecated** — use `IR_CONFIG_DIR` instead. Still works but emits a warning. |
 | `IR_BENCH_SIGNALS` | unset | Research: emit `SIGNAL_FUSED\ttop\tgap` to pipeline log for threshold tuning |
 | `IR_DISABLE_SHORTCUTS` | unset | Research: disable BM25 + fused strong-signal shortcuts for A/B benchmarking |
@@ -53,7 +54,7 @@ Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
 | `IR_ALLOW_EXPANSION_WITHOUT_SCORER` | unset | Research: allow expansion without reranker (harmful in production: -0.53% nDCG on NFCorpus) |
 | `IR_GRAPH_BUILD` | unset | Research: build `doc_graph` cosine-kNN edges during `ir embed` |
 | `IR_GRAPH_K` | `10` | Research: top-k neighbors per doc at graph build |
-| `IR_GRAPH_T0_EXPAND` | unset | Research: tier-0 graph expansion via capped score propagation (wins thin-list corpora only) |
+| `IR_GRAPH_T0_EXPAND` | on (0.18) | Tier-0 graph expansion via capped score propagation. **0.18 default; prefer `retrieval.t0_graph_expand` in config.yml — this env var is a deprecated override.** |
 | `IR_GRAPH_T0_MODE` | `cap` | Research: `rrf` switches tier-0 expansion to RRF fusion (measured harmful; kept for A/B) |
 | `IR_GRAPH_T1_CONSENSUS` | unset | Research: tier-1 neighborhood consensus boost (measured neutral + fire-rate harmful; kept for A/B) |
 | `IR_GRAPH_T2_EXPAND` | unset | Research: GAR-style rerank pool expansion at tier 2; injected docs bypass metadata filters |
@@ -65,15 +66,18 @@ Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
 | `IR_GRAPH_T1_INJECT` | `30` | Research: max docs injected by T1 expand |
 | `IR_GRAPH_T2_INJECT` | `30` | Research: max docs injected by T2 expand (saturates at 30 — inject60 = 323/323 ties) |
 | `IR_GRAPH_AS_EXPANDER` | unset | Research: skip LLM expander at tier 2; graph injection + reranker only (quality ≈ rerank-only) |
-| `IR_RERANK_WINDOW_OVERRIDE` | `20` | Research: tier-2 rerank window size (GAR pool expansion needs window ≥ pool; nfcorpus +0.016 at 100) |
-| `IR_RERANK_KEEP_WINDOW` | unset | Research: judged rerank window always outranks un-judged tail — fixes score-scale mismatch in the no-expansion rerank path (exact no-op on expander path) |
-| `IR_ANN` | unset | Research: `hnsw` enables the usearch ANN sidecar for vector kNN (exact fallback when stale/absent) |
+| `IR_RERANK_WINDOW_OVERRIDE` | `100` (0.18) | Tier-2 rerank window size. **0.18 default 100; prefer `retrieval.rerank_window` — deprecated override.** |
+| `IR_RERANK_KEEP_WINDOW` | on (0.18) | Judged rerank window always outranks un-judged tail. **0.18 default on; prefer `retrieval.rerank_keep_window` — deprecated override.** |
+| `IR_ANN` | on (0.18) | `hnsw` enables the usearch ANN sidecar for vector kNN (exact fallback when stale/absent). **0.18 default on; prefer `retrieval.ann` — deprecated override.** |
+| `IR_DISABLE_EXPANDER` | expander off (0.18) | Legacy inverted flag. **0.18 drops the in-process expander by default; prefer global `retrieval.expander` in config.yml — deprecated override.** |
 | `IR_ANN_M` | `16` | Research: HNSW connectivity (usearch `connectivity`) |
 | `IR_ANN_EF_CONSTRUCTION` | `200` | Research: HNSW build-time expansion |
 | `IR_ANN_EF` | `200` | Research: HNSW search-time expansion (recall knob; 99.2% top-10 overlap, nDCG@10 = exact at default on 50k) |
-| `IR_BENCH_MAX_SWAPOUT_DELTA` | `0` | Research: bench watchdog tolerance for system swapouts before abort (bench-env.sh) |
+| `IR_BENCH_MAX_SWAPOUT_DELTA` | `65536` | Research: bench watchdog tolerance (pages, ~1 GiB) for benign system swapout drift before abort; `free_pct` floor still guards real exhaustion. Set `0` for strictest pristine-latency runs (bench-env.sh) |
 
 Config dir precedence: `IR_CONFIG_DIR` → `XDG_CONFIG_HOME/ir` (deprecated) → `~/.config/ir`
+
+Retrieval profile (0.18): the search-pipeline knobs (`ann`, `t0_graph_expand`, `rerank_window`, `rerank_keep_window`, `expander`) resolve through one `RetrievalProfile` (`src/search/profile.rs`) with precedence **`config > env > default`**. `config.yml` `retrieval:` (per-collection + top-level `expander`) is the authoritative home; the `IR_*` env vars above are a deprecated convenience layer (removed in a later release). Active default = `DEFAULT_V018` (ANN/t0/window-100/keep on, expander off). Fine-tuning knobs (`IR_ANN_EF`, `IR_GRAPH_DECAY`, …) stay env-only.
 
 Model search order: `IR_*_MODEL` env → `IR_MODEL_DIRS` → `~/local-models/` → `~/.cache/ir/models/` → `~/.cache/qmd/models/`
 

@@ -70,10 +70,27 @@ bench_kill_tree_kill() {
     kill -KILL "$pid" 2>/dev/null || true
 }
 
+# Teardown for THIS bench context: reap any in-flight guarded child, then stop
+# the isolated daemon. bench_env_init points IR_CONFIG_DIR at the isolated state
+# dir, so `daemon stop` only ever targets the bench daemon on its own socket —
+# never a real work daemon used by other sessions. Register from the entrypoint:
+#   trap bench_cleanup EXIT INT TERM
+bench_cleanup() {
+    if [[ -n "${BENCH_GUARDED_CHILD:-}" ]]; then
+        bench_kill_tree_term "$BENCH_GUARDED_CHILD"
+        bench_kill_tree_kill "$BENCH_GUARDED_CHILD"
+        BENCH_GUARDED_CHILD=""
+    fi
+    if [[ -n "${BENCH_DAEMON_BIN:-}" && -x "${BENCH_DAEMON_BIN}" ]]; then
+        "${BENCH_DAEMON_BIN}" daemon stop >/dev/null 2>&1 || true
+    fi
+}
+
 bench_run_guarded() {
     local label="$1"
     local daemon_bin="${2:-}"
     shift 2 || true
+    BENCH_DAEMON_BIN="$daemon_bin"   # recorded for bench_cleanup trap teardown
 
     if ! bench_guard_enabled; then
         "$@"
@@ -85,10 +102,11 @@ bench_run_guarded() {
     local max_ir_cpu_pct="${IR_BENCH_MAX_IR_CPU_PCT:-800}"
     local cpu_strikes_limit="${IR_BENCH_CPU_STRIKES:-3}"
     # Pages of cumulative system swapout drift tolerated before aborting.
-    # 0 = any increase aborts (strictest). Long runs on a busy machine see
-    # benign background paging (~50k pages/15min observed); the free-pct floor
-    # still guards real exhaustion when this is raised.
-    local max_swapout_delta="${IR_BENCH_MAX_SWAPOUT_DELTA:-0}"
+    # Default 65536 (~1 GiB) tolerates benign background paging (~50k pages/15min
+    # observed on a busy machine) so large-corpus embeds don't false-abort; the
+    # free-pct floor (IR_BENCH_MIN_FREE_PCT) remains the real guard against
+    # genuine memory exhaustion. Set to 0 for the strictest pristine-latency runs.
+    local max_swapout_delta="${IR_BENCH_MAX_SWAPOUT_DELTA:-65536}"
     local swapouts_start
     swapouts_start="$(bench_swapouts)"
     [[ -n "$swapouts_start" ]] || swapouts_start=0
@@ -98,6 +116,7 @@ bench_run_guarded() {
 
     "$@" &
     local child_pid=$!
+    BENCH_GUARDED_CHILD="$child_pid"   # recorded so bench_cleanup can reap an orphaned child
 
     (
         local cpu_strikes=0
@@ -143,6 +162,7 @@ bench_run_guarded() {
 
     local status=0
     wait "$child_pid" || status=$?
+    BENCH_GUARDED_CHILD=""            # child finished; nothing to reap
     kill "$watchdog_pid" 2>/dev/null || true
     wait "$watchdog_pid" 2>/dev/null || true
 

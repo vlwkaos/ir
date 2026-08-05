@@ -27,63 +27,39 @@ Three tiers. Each fires **only if the previous one wasn't confident**, so the va
 majority of queries return from tier 0 or 1 and never touch an LLM. One warm daemon
 holds every model in memory; every LLM output is cached in SQLite.
 
-```
-  ir search "query"        ░ one warm daemon · every model resident · all LLM output cached ░
-              │
-              ▼
-  ┌────────────────────────┐
-  │  PREPROCESS   ko/ja/zh │   lindera morpheme tokenize · optional
-  │               ~sub-ms  │   SAME transform at index + query time
-  └───────────┬────────────┘
-              │   without it, CJK BM25 ≈ 0.00
-              ▼
-  ┌────────────────────────┐
-  │  TIER 0   BM25         │   FTS5 · no model · in-process
-  │           ~1 ms        │
-  └───────────┬────────────┘
-              │   top ≥ 0.75 & gap ≥ 0.10 ?   ── yes ─────►  ◎ results
-              │  no
-              ▼
-  ┌────────────────────────┐
-  │  TIER 1   Hybrid       │   + EmbeddingGemma-300M
-  │           ~50 ms       │   score = 0.80·vec + 0.20·bm25
-  └───────────┬────────────┘
-              │   strong fused signal ?       ── yes ─────►  ◎ results
-              │  no
-              ▼
-  ┌────────────────────────┐
-  │  TIER 2   Rerank       │   + Qwen3-Reranker-0.6B
-  │           ~0.3–5 s     │   final = 0.40·fused + 0.60·rerank
-  └───────────┬────────────┘
-              ▼
-           ◎ results
-```
+<p align="center">
+  <img src="research/ir-pipeline.png" alt="ir 0.18 three-tier retrieval pipeline: Tier 0 BM25 + doc-graph expansion, Tier 1 HNSW ANN + hybrid fusion, Tier 2 reranker (window 100 + keep-window); strong-signal shortcuts return early; the LLM expander is off by default and delegated to the caller." width="620">
+</p>
 
 The preprocessor is the make-or-break stage for Korean/Japanese/Chinese: it morphologically
 tokenizes both the indexed text and the query, and without it CJK BM25 scores near zero.
 
 **Cold vs warm** (M4 Max): first query ~3.0 s while the daemon loads; every query after,
-~30 ms round-trip — and BM25 stays instant even during cold start. Optional research paths
-(graph expansion, HNSW ANN, LLM query expansion) plug into these same tiers and are
-**off by default** — see [Versions at a glance](#versions-at-a-glance).
+~30 ms round-trip — and BM25 stays instant even during cold start. As of **0.18**, HNSW
+ANN, tier-0 graph expansion, and a wide reranker window are on by default, and the LLM
+query-expander is delegated to the calling agent — all tunable per collection under
+[Advanced Configuration](#advanced-configuration).
 
-## Measured quality (v0.17, nDCG@10)
+## Measured quality (0.18 defaults, nDCG@10)
 
-| Corpus | BM25 only | Hybrid fusion | Full pipeline |
-|---|---|---|---|
-| NFCorpus (en, 3.6k docs, 323 q) | 0.31 | 0.39 | 0.39 |
-| FiQA (en, 57.6k docs, 648 q) | 0.24 | 0.40 | — |
-| MIRACL-ko 50k sample (ko preprocessor, 213 q) | 0.73 | 0.92 | **0.96** |
-| Allganize RAG-eval-KO (ko, 1.4k pages, 298 q) | 0.70 | 0.69 | 0.72 |
+Each stage is a full escalation step — the score **if the query stops there**. `BM25` and `Vector` are the single-signal baselines; `Hybrid` fuses them (`0.80·vec + 0.20·bm25`, tier 1); `+ Rerank` adds the 0.6B reranker over a window-100 pool (tier 2). The LLM expander is **off by default**.
 
-Hybrid fusion needs only the 300M embedder (~50–280ms/query warm). The full pipeline adds the expander + reranker on queries that escalate. Korean numbers require the `ko` preprocessor (see below) — without it Korean BM25 is near zero.
+| Corpus | BM25 | Vector | Hybrid | + Rerank |
+|---|---|---|---|---|
+| NFCorpus (en, 3.6k docs, 323 q) | 0.31 | 0.39 | 0.39 | 0.40 |
+| FiQA (en, 57.6k docs, 648 q) | 0.24 | 0.40 | 0.40 | **0.44** |
+| MIRACL-ko 50k (ko, 213 q) | 0.73 | — | 0.92 | **0.96** |
+| Allganize RAG-eval-KO (ko, 1.4k pages, 298 q) | 0.70 | — | 0.69 | 0.72 |
+| **median latency** (warm, M-series) | ~1 ms | ~50 ms | ~50–280 ms | ~2 s |
+
+`BM25` is raw FTS5; the 0.18 default tier-0 also runs **doc-graph expansion**, which adds ≈ +0.02 nDCG@10 on sparse corpora (NFCorpus, `0.31 → 0.33`) and is ~neutral on dense ones (FiQA). On FiQA, BM25 is weak, so `Vector ≈ Hybrid`; the reranker then adds the real lift (`0.40 → 0.44`). Korean needs the `ko` preprocessor (without it Korean BM25 ≈ 0); Korean `Vector` isn't re-measured here (—).
 
 ## Versions at a glance
 
 - **≤ 0.15** — core pipeline, daemon, MCP, CJK preprocessors.
 - **0.16** — `ir sync` (one command for index + embed), self-healing incremental updates: deleted files are hard-removed and moved/restored content reuses cached vectors.
 - **0.17** — research infrastructure for graph-expanded retrieval and an optional HNSW ANN index, plus a much faster benchmark toolchain. **All of it is disabled by default and changes nothing about search behavior** — these are opt-in experiments, not baked-in features. Collection DBs gain two empty tables on first write; databases remain fully compatible in both directions with 0.16.
-- **0.18 (planned)** — the research paths above become the **default** pipeline: HNSW ANN for vector search, `doc_graph` derived from it (so graph build drops from O(N²) to O(N·log N)), tier-0 graph expansion, a wide reranker window, and the LLM query-expander dropped from the default (expansion moves to the calling agent). Migration is seamless — existing collections rebuild their index on the next `ir sync` and fall back to exact search until then. Rationale and measured results: [research/adr-0001-default-retrieval-pipeline.md](research/adr-0001-default-retrieval-pipeline.md).
+- **0.18** — the research paths above become the **default** pipeline: HNSW ANN for vector search, tier-0 graph expansion, a wide reranker window with keep-window, and the LLM query-expander dropped from the default (expansion moves to the calling agent). Everything is tunable per collection via the `retrieval:` config block ([Advanced Configuration](#advanced-configuration)). Migration is seamless — existing collections build their ANN index and doc graph on the next `ir sync` and fall back to exact search until then; no schema change. Rationale and measured results: [research/adr-0001-default-retrieval-pipeline.md](research/adr-0001-default-retrieval-pipeline.md). *(The O(N·log N) graph-from-ANN build is a 0.18.x follow-up; 0.18.0 builds the graph via the existing exact pass.)*
 
 ## Documentation
 
@@ -256,9 +232,49 @@ cargo test                   # no models required
 cargo test -- --ignored      # model-dependent tests
 ```
 
-Per-collection schema: `content` (hash → text), `documents`, `documents_fts` (FTS5), `vectors_vec` (sqlite-vec, cosine), `content_vectors` (chunk metadata), `llm_cache` (reranker scores), `document_metadata` (frontmatter), `meta` — plus empty-by-default research tables (`doc_graph`, `ann_keys`) as of 0.17. Global `expander_cache.sqlite` caches expansion outputs. See [research/pipeline.md](research/pipeline.md) for the staged-async daemon design.
+Per-collection schema: `content` (hash → text), `documents`, `documents_fts` (FTS5), `vectors_vec` (sqlite-vec, cosine), `content_vectors` (chunk metadata), `llm_cache` (reranker scores), `document_metadata` (frontmatter), `meta`, `doc_graph`, `ann_keys`. Global `expander_cache.sqlite` caches expansion outputs. See [research/pipeline.md](research/pipeline.md) for the staged-async daemon design.
 
 </details>
+
+## Advanced Configuration
+
+Search-pipeline behavior is configured per collection (and globally) in `config.yml` under a `retrieval:` block. Every field is optional — omit it to take the 0.18 default. Resolution precedence is **`config > env > default`**: a value set here is authoritative and won't be silently overridden by a stray environment variable.
+
+```yaml
+# ~/.config/ir/config.yml
+
+# global (daemon): whether to load the in-process LLM query expander
+retrieval:
+  expander: false            # 0.18 default — expansion is the calling agent's job
+
+collections:
+  - name: notes
+    path: ~/notes
+    # per-collection pipeline overrides
+    retrieval:
+      ann: true              # HNSW ANN for vector kNN (exact fallback if unbuilt)
+      t0_graph_expand: true  # tier-0 doc-graph seed expansion
+      rerank_window: 100     # candidates sent to the reranker
+      rerank_keep_window: true
+```
+
+| Key | Scope | 0.18 default | Meaning |
+|---|---|---|---|
+| `ann` | collection | `true` | HNSW ANN index for vector search; exact brute-force fallback when absent or stale. |
+| `t0_graph_expand` | collection | `true` | BM25 seeds pull `doc_graph` neighbours into the tier-0 candidate list. |
+| `rerank_window` | collection | `100` | Number of candidates sent to the tier-2 reranker. |
+| `rerank_keep_window` | collection | `true` | Keep judged docs above the un-judged tail. |
+| `expander` | global | `false` | Load the in-process LLM query expander; otherwise expansion is delegated to the caller. |
+
+Collections searched together must **agree** on a per-collection value for it to apply; a conflict falls back to the default (same rule as `routing:`). `ir sync` / `ir embed` builds the ANN index and doc graph when the corresponding knob is on (skipped for empty collections). To restore pre-0.18 retrieval for a collection, set `ann: false`, `t0_graph_expand: false`, `rerank_window: 20`, `rerank_keep_window: false`, and global `expander: true`.
+
+**Alternate config file** — point `ir` at a different `config.yml` without moving the data dir (collections and caches stay put), so you can compare pipeline configurations over one embedded corpus:
+
+```bash
+ir --config-path ./variant.yml search "query" -c notes
+```
+
+Precedence: `--config-path` > `IR_CONFIG_FILE` > `<config-dir>/config.yml`.
 
 ## License
 

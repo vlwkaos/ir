@@ -50,6 +50,9 @@ pub struct CollectionDb {
     /// Empty if no preprocessing is configured. Used at query time to spawn a PreprocessChain.
     pub preprocessor_commands: Vec<String>,
     pub routing: Option<crate::types::RoutingConfig>,
+    /// Per-collection retrieval-pipeline overrides (resolved into a RetrievalProfile
+    /// at query time). None → env/default. See search::profile.
+    pub retrieval: Option<crate::types::RetrievalConfig>,
     conn: Connection,
     /// Lazily spawned preprocessor chain, reused across BM25 calls within one search request.
     preprocess_chain: RefCell<Option<PreprocessChain>>,
@@ -79,6 +82,7 @@ impl CollectionDb {
             name,
             preprocessor_commands: vec![],
             routing: None,
+            retrieval: None,
             conn,
             preprocess_chain: RefCell::new(None),
         })
@@ -92,6 +96,7 @@ impl CollectionDb {
         db_path: &Path,
         preprocessor_commands: Vec<String>,
         routing: Option<crate::types::RoutingConfig>,
+        retrieval: Option<crate::types::RetrievalConfig>,
     ) -> Result<Self> {
         ensure_sqlite_vec();
 
@@ -103,6 +108,7 @@ impl CollectionDb {
             name: name.into(),
             preprocessor_commands,
             routing,
+            retrieval,
             conn,
             preprocess_chain: RefCell::new(None),
         })

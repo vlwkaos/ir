@@ -4,10 +4,17 @@
 pub mod output;
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "ir", about = "Local markdown search engine", version)]
 pub struct Cli {
+    /// Use an alternate config.yml. Overrides ONLY the config file, not the data
+    /// dir (collections/caches stay put) — lets a benchmark vary pipeline config
+    /// across candidates while reusing one embedded corpus.
+    /// Precedence: this arg > IR_CONFIG_FILE > <config-dir>/config.yml.
+    #[arg(long = "config-path", global = true, value_name = "FILE")]
+    pub config_path: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }

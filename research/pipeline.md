@@ -1,6 +1,53 @@
 
 # ir — Search Pipeline
 
+## Pipeline at a glance (0.18 defaults)
+
+Three-tier escalation. Each tier runs only if the previous tier's signal isn't
+strong enough, so cheap queries stay cheap. 0.18 defaults: ANN on, tier-0 graph
+expansion on, rerank window 100 + keep-window on, LLM expander off (delegated to
+the caller).
+
+```mermaid
+flowchart TD
+    Q(["ir search &quot;query&quot;"]) --> PRE["Preprocess · ko/ja/zh<br/>lindera · optional"]
+    PRE --> T0
+
+    subgraph S0["TIER 0 — no model · in-process · instant"]
+        direction TB
+        T0["BM25 · FTS5"] --> T0G["+ tier-0 graph expand<br/>doc-graph neighbours · NEW in 0.18"]
+    end
+
+    subgraph S1["TIER 1 — embedder · ~50–280ms"]
+        direction TB
+        T1["Vector kNN · HNSW ANN<br/>exact fallback · NEW in 0.18"] --> FUSE["Hybrid fusion<br/>0.80·vec + 0.20·bm25"]
+    end
+
+    subgraph S2["TIER 2 — reranker 0.6B · ~2s"]
+        direction TB
+        RR["Rerank · window 100 + keep-window<br/>NEW in 0.18"] --> BLEND["blend<br/>0.40·fused + 0.60·P(rel)"]
+    end
+
+    T0G -->|"BM25 strong<br/>score≥0.75 ∧ gap≥0.10"| DONE([" ◎ results "])
+    T0G -->|escalate| T1
+    FUSE -->|"fused strong<br/>top·gap≥0.06 ∧ top≥0.40"| DONE
+    FUSE -->|escalate| RR
+    BLEND --> DONE
+
+    EXP["LLM expander 1.7B<br/>OFF by default → caller expands"] -. opt-in .-> RR
+
+    classDef t0 fill:#e8f6ee,stroke:#3f9d68,stroke-width:1px,color:#173a26;
+    classDef t1 fill:#e6f0fb,stroke:#3f7fc0,stroke-width:1px,color:#14304f;
+    classDef t2 fill:#e9e7fb,stroke:#6a5fc0,stroke-width:1px,color:#241f4f;
+    classDef done fill:#12897a,stroke:#0c5f54,stroke-width:1px,color:#ffffff;
+    classDef off fill:#f6ece0,stroke:#c96a1e,stroke-width:1px,color:#5a3410,stroke-dasharray:4 3;
+    class T0,T0G t0;
+    class T1,FUSE t1;
+    class RR,BLEND t2;
+    class DONE done;
+    class EXP off;
+```
+
 ## Staged Async Daemon Design
 
 BM25 runs in-process immediately. Daemon starts in background and signals readiness in two tiers. Client escalates only as far as the query needs.

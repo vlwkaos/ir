@@ -31,6 +31,7 @@ struct CollectionInfo {
     db_path: PathBuf,
     preprocessor_commands: Vec<String>,
     routing: Option<crate::types::RoutingConfig>,
+    retrieval: Option<crate::types::RetrievalConfig>,
 }
 
 // ── Protocol types ────────────────────────────────────────────────────────────
@@ -270,6 +271,7 @@ impl DaemonState {
                         db_path: collection_db_path(&c.name),
                         preprocessor_commands,
                         routing: c.routing.clone(),
+                        retrieval: c.retrieval.clone(),
                     },
                 )
             })
@@ -400,8 +402,14 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
         // Reranker without expander: expansion skipped, but reranking fused results still works.
         // Expander without reranker: expansion is harmful without reranking (-0.53% nDCG on NFCorpus); disabled.
         fn load_dedicated() -> Pair {
-            let exp = if env_flag("IR_DISABLE_EXPANDER") {
-                eprintln!("  note: expander disabled via research override");
+            // Expander presence = the global retrieval profile's `expander`
+            // (config > env > default). config.yml `retrieval.expander` is
+            // authoritative; IR_DISABLE_EXPANDER remains a deprecated env override.
+            let cfg = crate::config::Config::load().unwrap_or_default();
+            let expander_on =
+                crate::search::profile::resolve_for_daemon(cfg.retrieval.as_ref()).expander;
+            let exp = if !expander_on {
+                eprintln!("  note: expander disabled (retrieval profile)");
                 None
             } else {
                 crate::llm::expander::Expander::load_default()
@@ -627,6 +635,7 @@ fn handle_request(
                 &info.db_path,
                 info.preprocessor_commands.clone(),
                 info.routing.clone(),
+                info.retrieval.clone(),
             )
         })
         .collect::<Result<Vec<_>>>()?;

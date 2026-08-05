@@ -40,10 +40,6 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 use crate::config::env_flag;
 
-pub fn t0_expand_enabled() -> bool {
-    env_flag("IR_GRAPH_T0_EXPAND")
-}
-
 /// T0 ranking mode: "cap" (default) = score-capped injection (zero-harm; inert
 /// in saturated lists), "rrf" = rank-based fusion of BM25 rank with graph
 /// activation mass (can displace; effective in dense lists where scores are
@@ -194,11 +190,16 @@ pub fn maybe_expand_t2(dbs: &[CollectionDb], results: &mut Vec<SearchResult>) {
 }
 
 /// T0: expand a BM25 result list with graph neighbors of the top seeds.
-/// No-op unless IR_GRAPH_T0_EXPAND is set and a graph exists. Injected docs are
-/// full SearchResults (snippet-less) scored by activation; existing docs keep
-/// max(direct, activation). Caller applies filters/min_score afterwards.
-pub fn maybe_expand_t0(dbs: &[CollectionDb], results: &mut Vec<SearchResult>, limit: usize) {
-    if !t0_expand_enabled() || results.is_empty() {
+/// No-op unless `enabled` (from the retrieval profile) and a graph exists. Injected
+/// docs are full SearchResults (snippet-less) scored by activation; existing docs
+/// keep max(direct, activation). Caller applies filters/min_score afterwards.
+pub fn maybe_expand_t0(
+    dbs: &[CollectionDb],
+    results: &mut Vec<SearchResult>,
+    limit: usize,
+    enabled: bool,
+) {
+    if !enabled || results.is_empty() {
         return;
     }
     expand_with_activation(dbs, results, limit, /* force_cap */ false);

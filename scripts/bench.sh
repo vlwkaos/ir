@@ -36,6 +36,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 source "$SCRIPT_DIR/bench-env.sh"
 bench_env_init "$REPO_ROOT" "bench"
+# Own the daemon lifecycle: on any exit (success, error, or Ctrl-C) stop this
+# bench's isolated daemon and reap any in-flight guarded child. Safe for other
+# sessions — IR_CONFIG_DIR is the isolated dir, so it never touches a work daemon.
+trap bench_cleanup EXIT INT TERM
 
 _log() { echo "[$(date +%H:%M:%S)] $*"; }
 

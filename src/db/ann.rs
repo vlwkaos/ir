@@ -21,15 +21,6 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
-/// True when the ANN sidecar is enabled for this process.
-/// Accepts `hnsw` (the canonical value) plus the shared boolean spellings.
-pub fn enabled() -> bool {
-    std::env::var("IR_ANN")
-        .ok()
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("hnsw"))
-        || crate::config::env_flag("IR_ANN")
-}
-
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -206,9 +197,15 @@ fn add_missing(conn: &Connection, index: &Index, reserve_total: usize) -> Result
 }
 
 /// ANN kNN. Returns None when the caller must fall back to exact search:
-/// flag off, in-memory DB, sidecar missing, or index stale vs vectors_vec.
-pub fn search(conn: &Connection, query: &[f32], k: usize) -> Option<Vec<VecSearchResult>> {
-    if !enabled() {
+/// `use_ann` off (resolved from the retrieval profile), in-memory DB, sidecar
+/// missing, or index stale vs vectors_vec.
+pub fn search(
+    conn: &Connection,
+    query: &[f32],
+    k: usize,
+    use_ann: bool,
+) -> Option<Vec<VecSearchResult>> {
+    if !use_ann {
         return None;
     }
     let path = index_path(conn)?;
@@ -270,18 +267,8 @@ mod tests {
     use crate::llm::to_bytes;
     use rusqlite::Connection;
 
-    // Serializes tests that mutate IR_ANN (parallel test runner).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    struct EnvGuard;
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe { std::env::remove_var("IR_ANN") };
-        }
-    }
+    // ANN activation is now an explicit `use_ann` arg to search() (resolved from
+    // the retrieval profile), so these tests no longer touch the process env.
 
     fn open_file_db(dir: &std::path::Path) -> Connection {
         crate::db::ensure_sqlite_vec();
@@ -313,8 +300,6 @@ mod tests {
 
     #[test]
     fn sync_and_search_roundtrip() {
-        let _lock = env_lock();
-        let _guard = EnvGuard;
         let dir = tempfile::tempdir().unwrap();
         let conn = open_file_db(dir.path());
         add_vec(&conn, "ha_0", &[1.0, 0.0, 0.0, 0.0]);
@@ -325,8 +310,7 @@ mod tests {
         assert_eq!((total, added), (3, 3));
         assert!(index_path(&conn).unwrap().exists());
 
-        unsafe { std::env::set_var("IR_ANN", "hnsw") };
-        let hits = search(&conn, &[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+        let hits = search(&conn, &[1.0, 0.0, 0.0, 0.0], 2, true).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].hash_seq, "ha_0");
         assert!(hits[0].distance < 1e-4, "self distance ~0");
@@ -337,32 +321,26 @@ mod tests {
 
     #[test]
     fn search_falls_back_when_stale_or_disabled() {
-        let _lock = env_lock();
-        let _guard = EnvGuard;
         let dir = tempfile::tempdir().unwrap();
         let conn = open_file_db(dir.path());
         add_vec(&conn, "ha_0", &[1.0, 0.0, 0.0, 0.0]);
         sync(&conn).unwrap();
 
-        // Disabled → None even with a fresh index.
-        unsafe { std::env::remove_var("IR_ANN") };
-        assert!(search(&conn, &[1.0, 0.0, 0.0, 0.0], 1).is_none());
+        // Disabled (use_ann=false) → None even with a fresh index.
+        assert!(search(&conn, &[1.0, 0.0, 0.0, 0.0], 1, false).is_none());
 
         // New vector not yet synced → stale → None.
-        unsafe { std::env::set_var("IR_ANN", "hnsw") };
         add_vec(&conn, "hb_0", &[0.0, 1.0, 0.0, 0.0]);
-        assert!(search(&conn, &[1.0, 0.0, 0.0, 0.0], 1).is_none());
+        assert!(search(&conn, &[1.0, 0.0, 0.0, 0.0], 1, true).is_none());
 
         // After sync it works again (incremental add).
         let (total, added) = sync(&conn).unwrap();
         assert_eq!((total, added), (2, 1));
-        assert!(search(&conn, &[0.0, 1.0, 0.0, 0.0], 1).is_some());
+        assert!(search(&conn, &[0.0, 1.0, 0.0, 0.0], 1, true).is_some());
     }
 
     #[test]
     fn model_change_triggers_rebuild() {
-        let _lock = env_lock();
-        let _guard = EnvGuard;
         let dir = tempfile::tempdir().unwrap();
         let conn = open_file_db(dir.path());
         add_vec(&conn, "ha_0", &[1.0, 0.0, 0.0, 0.0]);
@@ -376,8 +354,6 @@ mod tests {
 
     #[test]
     fn corrupt_sidecar_triggers_rebuild_not_error() {
-        let _lock = env_lock();
-        let _guard = EnvGuard;
         let dir = tempfile::tempdir().unwrap();
         let conn = open_file_db(dir.path());
         add_vec(&conn, "ha_0", &[1.0, 0.0, 0.0, 0.0]);
@@ -392,8 +368,7 @@ mod tests {
         let (total, added) = sync(&conn).unwrap();
         assert_eq!((total, added), (2, 2), "corrupt file rebuilds from vectors");
 
-        unsafe { std::env::set_var("IR_ANN", "hnsw") };
-        assert!(search(&conn, &[1.0, 0.0, 0.0, 0.0], 1).is_some());
+        assert!(search(&conn, &[1.0, 0.0, 0.0, 0.0], 1, true).is_some());
     }
 
     #[test]

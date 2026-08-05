@@ -357,6 +357,7 @@ fn fill_results_content(results: &mut [SearchResult]) -> IrResult<()> {
                 &collection_db_path(&c.name),
                 pp_commands,
                 c.routing.clone(),
+                c.retrieval.clone(),
             )
         })
         .collect::<crate::error::Result<Vec<_>>>()?;

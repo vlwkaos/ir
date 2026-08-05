@@ -178,8 +178,12 @@ impl HybridSearch {
         let allow_expand_without_scorer = env_flag("IR_ALLOW_EXPANSION_WITHOUT_SCORER");
         let force_tier1_only = env_flag("IR_FORCE_TIER1_ONLY");
 
+        // Resolve the pipeline profile once from the searched collections
+        // (config > env > default) — drives ANN, rerank window, and keep-window.
+        let profile = super::profile::resolve_for_query(dbs.iter().map(|d| d.retrieval.as_ref()));
+
         // 1. Fast retrieval: BM25 + vector + score fusion (~20ms).
-        let fused = score_fusion_two_list(dbs, &self.embedder, req, &mut log)?;
+        let fused = score_fusion_two_list(dbs, &self.embedder, req, profile.ann, &mut log)?;
 
         if fused.is_empty() {
             log.timing("total", t_total.elapsed());
@@ -291,8 +295,7 @@ impl HybridSearch {
         // Research: IR_GRAPH_AS_EXPANDER=1 skips the LLM expander (its ~3.5s is the
         // dominant tier-2 cost) and lets graph injection below supply the extra
         // candidates instead — LADR-style: the index-time graph IS the expansion.
-        let graph_as_expander =
-            super::graph::graph_as_expander_enabled() && self.scorer.is_some();
+        let graph_as_expander = super::graph::graph_as_expander_enabled() && self.scorer.is_some();
         if graph_as_expander && self.expander.is_some() {
             log.info("Graph-as-expander: skipping LLM expansion (research)");
         }
@@ -335,7 +338,15 @@ impl HybridSearch {
                 ));
 
                 (
-                    rrf_from_subqueries(dbs, &self.embedder, &subs, req, fused, &mut log)?,
+                    rrf_from_subqueries(
+                        dbs,
+                        &self.embedder,
+                        &subs,
+                        req,
+                        fused,
+                        profile.ann,
+                        &mut log,
+                    )?,
                     true,
                 )
             } else {
@@ -374,9 +385,9 @@ impl HybridSearch {
             });
         }
 
-        // 4. Rerank top window (default 20) if scorer available.
+        // 4. Rerank top window if scorer available (window/keep-window from profile).
         let final_results = if let Some(scorer) = &self.scorer {
-            let n = enhanced.len().min(rerank_window());
+            let n = enhanced.len().min(profile.rerank_window);
             log.info(format!("Reranking {n} chunks..."));
             let t0 = Instant::now();
             let result = rerank(
@@ -385,6 +396,7 @@ impl HybridSearch {
                 enhanced,
                 dbs,
                 req.limit,
+                &profile,
                 &mut log,
             )?;
             log.timing("rerank", t0.elapsed());
@@ -409,6 +421,7 @@ fn score_fusion_two_list(
     dbs: &[CollectionDb],
     embedder: &Embedder,
     req: &HybridRequest,
+    use_ann: bool,
     log: &mut Logger,
 ) -> Result<Vec<SearchResult>> {
     let fetch_n = if req.filter.is_empty() {
@@ -438,7 +451,7 @@ fn score_fusion_two_list(
     let emb = embedder.embed_query(req.query)?;
     log.timing("embed", t0.elapsed());
     let t0 = Instant::now();
-    let vec_list = vec_across(dbs, &emb, fetch_n)?;
+    let vec_list = vec_across(dbs, &emb, fetch_n, use_ann)?;
     log.timing("knn", t0.elapsed());
 
     // Union of both lists keyed by (collection, path).
@@ -482,6 +495,7 @@ fn rrf_from_subqueries(
     sub_queries: &[SubQuery],
     req: &HybridRequest,
     base_results: Vec<SearchResult>,
+    use_ann: bool,
     log: &mut Logger,
 ) -> Result<Vec<SearchResult>> {
     let mut ranked_lists: Vec<RankedList> = Vec::new();
@@ -531,7 +545,7 @@ fn rrf_from_subqueries(
 
         let t0 = Instant::now();
         for (emb, &(_, weight)) in embeddings.iter().zip(&vec_subs) {
-            let results = vec_across(dbs, emb, fetch_n)?;
+            let results = vec_across(dbs, emb, fetch_n, use_ann)?;
             if !results.is_empty() {
                 ranked_lists.push(RankedList { results, weight });
             }
@@ -579,9 +593,14 @@ fn bm25_across(dbs: &[CollectionDb], query: &str, limit: usize) -> Result<Vec<Se
         .map(|vv| vv.into_iter().flatten().collect())
 }
 
-fn vec_across(dbs: &[CollectionDb], embedding: &[f32], limit: usize) -> Result<Vec<SearchResult>> {
+fn vec_across(
+    dbs: &[CollectionDb],
+    embedding: &[f32],
+    limit: usize,
+    use_ann: bool,
+) -> Result<Vec<SearchResult>> {
     dbs.iter()
-        .map(|db| vectors::search(db.conn(), embedding, &db.name, limit))
+        .map(|db| vectors::search(db.conn(), embedding, &db.name, limit, use_ann))
         .collect::<Result<Vec<Vec<_>>>>()
         .map(|vv| vv.into_iter().flatten().collect())
 }
@@ -677,16 +696,6 @@ fn apply_min_score(
     results
 }
 
-/// Rerank window size (default 20). `IR_RERANK_WINDOW_OVERRIDE` is research-only:
-/// GAR-style pool expansion may be starved by a small window (literature uses 100+).
-fn rerank_window() -> usize {
-    std::env::var("IR_RERANK_WINDOW_OVERRIDE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(20)
-}
-
 /// Rerank the top window using LLM scorer; blend with fusion scores (fused×0.4 + rerank×0.6).
 /// Checks llm_cache before inference and writes new scores back.
 fn rerank(
@@ -695,9 +704,10 @@ fn rerank(
     mut candidates: Vec<SearchResult>,
     dbs: &[CollectionDb],
     limit: usize,
+    profile: &super::profile::RetrievalProfile,
     log: &mut Logger,
 ) -> Result<Vec<SearchResult>> {
-    let top_n = candidates.len().min(rerank_window());
+    let top_n = candidates.len().min(profile.rerank_window);
     let (to_rerank, rest) = candidates.split_at_mut(top_n);
 
     // Build cache keys: sha256(model_id + "\0" + query + "\0" + content_hash)
@@ -780,9 +790,10 @@ fn rerank(
     }
 
     let mut all: Vec<SearchResult>;
-    if rerank_keep_window() {
-        // Research (IR_RERANK_KEEP_WINDOW=1): judged docs always outrank the
-        // un-judged tail; the blend only orders WITHIN the window. Avoids
+    if profile.rerank_keep_window {
+        // keep-window (profile; env override IR_RERANK_KEEP_WINDOW): judged docs
+        // always outrank the un-judged tail; the blend only orders WITHIN the
+        // window. Avoids
         // comparing 0.4-shrunk blended scores against raw fused tail scores —
         // without RRF's flat score scale that mismatch demotes every judged
         // doc whose rerank P isn't high (measured: R@100 0.35→0.24 on
@@ -801,14 +812,6 @@ fn rerank(
     }
     all.truncate(limit);
     Ok(all)
-}
-
-/// Research flag: keep the reranked window above the un-judged tail (see rerank()).
-fn rerank_keep_window() -> bool {
-    matches!(
-        std::env::var("IR_RERANK_KEEP_WINDOW").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
 }
 
 fn fetch_doc_text(dbs: &[CollectionDb], hash: &str, collection: &str) -> Option<String> {
@@ -1040,6 +1043,7 @@ mod tests {
                 bm25_strong_floor: None,
                 bm25_strong_gap: None,
             }),
+            retrieval: None,
         };
         let a = make("a");
         let b = make("b");
@@ -1065,6 +1069,7 @@ mod tests {
                 bm25_strong_floor: None,
                 bm25_strong_gap: None,
             }),
+            retrieval: None,
         };
         let b = Collection {
             name: "b".into(),
@@ -1074,6 +1079,7 @@ mod tests {
             description: None,
             preprocessor: None,
             routing: None,
+            retrieval: None,
         };
         let cols = vec![&a, &b];
         assert_eq!(

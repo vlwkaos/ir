@@ -12,6 +12,34 @@ pub struct RoutingConfig {
     pub bm25_strong_gap: Option<f64>,
 }
 
+/// Per-collection (and, at the top level, global) overrides for the resolved
+/// retrieval pipeline. Every field is `Option`: `None` defers to the built-in
+/// default. Resolution precedence is `config > env > default` — see
+/// `search::profile`. Query-time knobs apply only when all searched collections
+/// agree on the same value (same rule as `RoutingConfig`); `expander` is resolved
+/// globally from the top-level block because the model loads once per process.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RetrievalConfig {
+    /// Use the HNSW ANN sidecar for vector kNN (exact fallback when absent/stale).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ann: Option<bool>,
+    /// Build `doc_graph` from the ANN index (per-doc self-query) instead of matmul.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_build_from_ann: Option<bool>,
+    /// Tier-0 graph expansion: BM25 seeds pull graph neighbors into the candidate list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t0_graph_expand: Option<bool>,
+    /// Tier-2 rerank window size (docs sent to the reranker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_window: Option<usize>,
+    /// Keep the reranked window above the un-judged tail (score-scale fix).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_keep_window: Option<bool>,
+    /// Load and use the in-process LLM query expander (global; top-level block).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expander: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Collection {
     pub name: String,
@@ -30,6 +58,10 @@ pub struct Collection {
     /// Applies only when all searched collections agree on the same override value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingConfig>,
+    /// Optional per-collection retrieval-pipeline overrides (ANN, graph, rerank window).
+    /// Applies only when all searched collections agree; `config > env > default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<RetrievalConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

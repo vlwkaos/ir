@@ -827,6 +827,7 @@ mod tests {
             description: None,
             preprocessor: None,
             routing: None,
+            retrieval: None,
         }
     }
 
