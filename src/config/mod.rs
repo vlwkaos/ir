@@ -288,6 +288,13 @@ pub fn daemon_tier2_path() -> PathBuf {
     ir_dir().join("daemon.tier2")
 }
 
+/// Negative counterpart of `daemon_tier2_path`: written when the daemon has
+/// determined tier-2 will never load (no scorer — reranker disabled or absent),
+/// so clients can degrade immediately instead of polling to the timeout.
+pub fn daemon_tier2_unavailable_path() -> PathBuf {
+    ir_dir().join("daemon.tier2_unavailable")
+}
+
 pub fn daemon_lock_path() -> PathBuf {
     ir_dir().join("daemon.lock")
 }

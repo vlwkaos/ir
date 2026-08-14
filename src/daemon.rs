@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -195,16 +195,66 @@ pub fn is_tier2_ready() -> bool {
     config::daemon_tier2_path().exists()
 }
 
-/// Poll for tier-2 readiness or `timeout_ms` elapses. Returns true if ready.
-pub fn wait_tier2(timeout_ms: u64) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
-    while std::time::Instant::now() < deadline {
-        if is_tier2_ready() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
+/// Returns true once the daemon has determined tier-2 will never load (no
+/// scorer available — reranker disabled or its model absent). Distinct from
+/// "still loading": this is a terminal state for the daemon's lifetime.
+pub fn is_tier2_unavailable() -> bool {
+    config::daemon_tier2_unavailable_path().exists()
+}
+
+/// Tier-2 readiness resolved from the two signal files.
+#[derive(Debug, PartialEq, Eq)]
+enum Tier2Signal {
+    /// Scorer loaded — reranking available.
+    Ready,
+    /// Daemon determined no scorer will load (reranker disabled/absent) —
+    /// terminal for this daemon's lifetime; clients should degrade now.
+    Unavailable,
+    /// Neither signal yet — models still loading; keep waiting.
+    Loading,
+}
+
+/// Resolve tier-2 state from the two signal files. `Ready` wins if both somehow
+/// exist (defensive — the daemon only ever writes one).
+fn tier2_state(ready: &Path, unavailable: &Path) -> Tier2Signal {
+    if ready.exists() {
+        Tier2Signal::Ready
+    } else if unavailable.exists() {
+        Tier2Signal::Unavailable
+    } else {
+        Tier2Signal::Loading
     }
-    false
+}
+
+/// Poll for tier-2 readiness. Returns true if ready; false if `timeout_ms`
+/// elapses OR the daemon has signalled tier-2 is permanently unavailable — in
+/// the latter case it returns immediately so a hybrid query degrades to the
+/// best ready tier instead of blocking the full timeout for a signal that will
+/// never come.
+pub fn wait_tier2(timeout_ms: u64) -> bool {
+    let ready = config::daemon_tier2_path();
+    let unavailable = config::daemon_tier2_unavailable_path();
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        match tier2_state(&ready, &unavailable) {
+            Tier2Signal::Ready => return true,
+            Tier2Signal::Unavailable => return false,
+            Tier2Signal::Loading => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// Remove both tier-2 signal files. They always travel together — exactly one
+/// is written per daemon run, and both are cleared on teardown so a later run
+/// never observes a stale signal. Centralised so no teardown site can forget one.
+fn clear_tier2_signals() {
+    let _ = std::fs::remove_file(config::daemon_tier2_path());
+    let _ = std::fs::remove_file(config::daemon_tier2_unavailable_path());
 }
 
 /// Tier-2 models sent from background loader to main accept loop via sync_channel.
@@ -306,6 +356,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     let sock_path = config::daemon_socket_path();
     let pid_path = config::daemon_pid_path();
     let tier2_path = config::daemon_tier2_path();
+    let tier2_unavail_path = config::daemon_tier2_unavailable_path();
 
     if let Some(parent) = sock_path.parent() {
         std::fs::create_dir_all(parent).map_err(Error::Io)?;
@@ -329,7 +380,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     if sock_path.exists() {
         std::fs::remove_file(&sock_path).map_err(Error::Io)?;
     }
-    let _ = std::fs::remove_file(&tier2_path);
+    clear_tier2_signals();
 
     // Validate + pre-download env-configured models before loading.
     // When invoked via start_in_background, the client already ran this and
@@ -384,6 +435,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     // fires on the next connection after tier2_path appears, so models are always present.
     let (tx, rx) = std::sync::mpsc::sync_channel::<Tier2>(1);
     let tier2_path_bg = tier2_path.clone();
+    let tier2_unavail_bg = tier2_unavail_path.clone();
     std::thread::spawn(move || {
         type ExpBox = Box<dyn crate::llm::expander::QueryExpander>;
         type ScoBox = Box<dyn crate::llm::scoring::Scorer>;
@@ -502,6 +554,9 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
             let _ = std::fs::write(&tier2_path_bg, "");
             eprintln!("  tier-2 ready");
         } else {
+            // Signal permanent unavailability so hybrid clients degrade
+            // immediately instead of polling wait_tier2 to its deadline.
+            let _ = std::fs::write(&tier2_unavail_bg, "");
             eprintln!("  tier-2 skipped (no scorer available)");
         }
     });
@@ -512,7 +567,6 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
         let last = Arc::clone(&last_activity);
         let sock = sock_path.clone();
         let pid = pid_path.clone();
-        let t2 = tier2_path.clone();
         std::thread::spawn(move || {
             let check_every = (timeout_secs / 10).clamp(1, 30);
             loop {
@@ -522,7 +576,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
                     eprintln!("daemon: idle for {idle}s, shutting down");
                     let _ = std::fs::remove_file(&sock);
                     let _ = std::fs::remove_file(&pid);
-                    let _ = std::fs::remove_file(&t2);
+                    clear_tier2_signals();
                     std::process::exit(0);
                 }
             }
@@ -705,7 +759,7 @@ pub fn stop() -> Result<()> {
         // Tier-1 may be up (socket bound) but tier-2 still loading (no PID yet).
         if sock_path.exists() {
             let _ = std::fs::remove_file(&sock_path);
-            let _ = std::fs::remove_file(config::daemon_tier2_path());
+            clear_tier2_signals();
             eprintln!("daemon stopping (tier-2 still loading, socket removed)");
         } else {
             eprintln!("daemon not running (no pid file)");
@@ -735,7 +789,7 @@ pub fn stop() -> Result<()> {
 
     let _ = std::fs::remove_file(&pid_path);
     let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_file(config::daemon_tier2_path());
+    clear_tier2_signals();
     eprintln!("daemon stopped (pid {pid})");
     Ok(())
 }
@@ -743,9 +797,75 @@ pub fn stop() -> Result<()> {
 pub fn status() -> Result<()> {
     if is_running() {
         let pid = std::fs::read_to_string(config::daemon_pid_path()).unwrap_or_else(|_| "?".into());
-        println!("running  pid={}", pid.trim());
+        let tier2 = if is_tier2_ready() {
+            "tier-2 ready"
+        } else if is_tier2_unavailable() {
+            "tier-2 unavailable (hybrid degrades to fusion)"
+        } else {
+            "tier-2 loading"
+        };
+        println!("running  pid={}  {tier2}", pid.trim());
     } else {
         println!("not running");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Tier2Signal, tier2_state};
+
+    /// Unique temp dir per test — no shared global state, no env mutation.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ir-t2-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn tier2_state_loading_when_no_signal() {
+        let dir = scratch("loading");
+        // Neither file exists → still loading (keep waiting).
+        assert_eq!(
+            tier2_state(&dir.join("t2"), &dir.join("t2u")),
+            Tier2Signal::Loading
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tier2_state_ready_signal() {
+        let dir = scratch("ready");
+        let ready = dir.join("t2");
+        std::fs::write(&ready, "").unwrap();
+        assert_eq!(tier2_state(&ready, &dir.join("t2u")), Tier2Signal::Ready);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tier2_state_unavailable_is_decided_not_loading() {
+        let dir = scratch("unavail");
+        let unavail = dir.join("t2u");
+        std::fs::write(&unavail, "").unwrap();
+        // The whole point of the fix: unavailable is a decided negative,
+        // distinct from Loading — so wait_tier2 returns at once instead of
+        // polling to the deadline.
+        assert_eq!(
+            tier2_state(&dir.join("t2"), &unavail),
+            Tier2Signal::Unavailable
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tier2_state_ready_wins_over_unavailable() {
+        let dir = scratch("both");
+        let ready = dir.join("t2");
+        let unavail = dir.join("t2u");
+        std::fs::write(&ready, "").unwrap();
+        std::fs::write(&unavail, "").unwrap();
+        assert_eq!(tier2_state(&ready, &unavail), Tier2Signal::Ready);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

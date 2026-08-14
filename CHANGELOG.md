@@ -1,3 +1,13 @@
+## [Unreleased]
+
+### Fixed
+
+- **Hybrid queries no longer stall ~7s when tier-2 is unavailable.** When the reranker is disabled or its model is absent, the daemon now writes a tier-2-unavailable signal so a hybrid query degrades to fusion immediately instead of polling `wait_tier2` to its full timeout. Previously any hybrid query that didn't hit a strong-signal shortcut (e.g. Korean, where BM25 is near-zero) blocked the whole timeout waiting for a readiness signal that would never arrive. Affects CLI and MCP identically (both go through `search_core`). No change when the reranker is present.
+
+### Changed
+
+- `ir daemon status` now reports tier-2 state: `tier-2 ready`, `tier-2 loading`, or `tier-2 unavailable (hybrid degrades to fusion)`.
+
 ## [0.18.0] - 2026-08-05
 
 The graph + ANN research from the 0.17.x line becomes the **default** retrieval pipeline. See [research/adr-0001-default-retrieval-pipeline.md](research/adr-0001-default-retrieval-pipeline.md).
