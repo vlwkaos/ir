@@ -190,3 +190,6 @@ CI handles: build, GitHub release, Homebrew tap update, and crates.io publish.
 - bench_env_init preprocessors symlink: state dirs get a symlink to the live source preprocessors on each init, replacing stale real directories; after ir preprocessor install, bench scopes that ran before the install have stale config.yml — delete scope's config.yml to force re-copy on next run
 
 - Uncertain about project term/schema/convention/prior decision → `/seek <topic>` first (lightweight KB lookup; same tier as grep/Glob).
+
+seek.collections.auto: ir rust
+seek.collections.extra:   # allowlist; pass only when the task needs this expertise
