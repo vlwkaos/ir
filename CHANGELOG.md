@@ -40,7 +40,7 @@
 
 ### Dev / Tooling
 
-- **New workflow "CI - evaluation"** (`.github/workflows/ci-evaluation.yml`): runs the model, daemon and network tests and the full `scripts/preship.sh` on CPU runners (Linux arm64, macOS), nightly and on demand. It is separate from the release workflow.
+- **New workflow "CI - evaluation"** (`.github/workflows/ci-evaluation.yml`): runs the model, daemon and network tests and the retrieval-quality checks of `scripts/preship.sh` on CPU runners (Linux arm64, macOS), nightly and on demand. It is separate from the release workflow.
 - **Workflows renamed:** "CI" is now "CI - check" and "Release" is now "CD - release". File paths are unchanged.
 - **Release candidates:** a tag with a `-` (e.g. `v0.19.0-rc.1`) creates a GitHub prerelease with the artifacts only. It does not update the Homebrew tap or publish to crates.io.
 - **The release check fails when the tag does not match the Cargo.toml version.**
