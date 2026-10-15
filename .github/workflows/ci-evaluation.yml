@@ -93,5 +93,11 @@ jobs:
         if: matrix.preship
         # ^ Retrieval quality only. The stability wall clock and speed floors are
         #   calibrated on a local GPU; CPU runners miss them with correct code.
+        #   miracl-ko-mini is BM25 only: its 213 Korean queries all reach the
+        #   reranker, about 5 s each on CPU, which outlasts the job timeout.
         #   Run the full preship locally before a release. Exit 2 is drift warnings.
-        run: bash scripts/preship.sh --only perf || [ $? -eq 2 ]
+        run: |
+          ok() { s=0; "$@" || s=$?; [ "$s" -eq 0 ] || [ "$s" -eq 2 ]; }
+          ok bash scripts/preship.sh --only perf --bm25-only --fixture miracl-ko-mini
+          ok bash scripts/preship.sh --only perf --fixture synthetic-en
+          ok bash scripts/preship.sh --only perf --fixture synthetic-zh
