@@ -1,7 +1,8 @@
 # ir
 
 [![crates.io](https://img.shields.io/crates/v/ir-search.svg)](https://crates.io/crates/ir-search)
-[![CI](https://github.com/vlwkaos/ir/actions/workflows/ci.yml/badge.svg)](https://github.com/vlwkaos/ir/actions/workflows/ci.yml)
+[![CI - check](https://github.com/vlwkaos/ir/actions/workflows/ci.yml/badge.svg)](https://github.com/vlwkaos/ir/actions/workflows/ci.yml)
+[![CI - evaluation](https://github.com/vlwkaos/ir/actions/workflows/ci-evaluation.yml/badge.svg)](https://github.com/vlwkaos/ir/actions/workflows/ci-evaluation.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [ENG](README.md) | [한국어](README.ko.md) | [中文](README.zh.md)
@@ -109,6 +110,18 @@ ir embed [notes] [--force]   # 向量修复 / 重新嵌入
 
 索引为增量式、内容寻址（SHA-256）：仅重新处理变更文件，相同内容去重，已删除文件被移除，移动/恢复的内容复用缓存向量而无需重新推理。
 
+`ir update` 会输出集合路径、扫描到的文件数，以及仍然没有向量的文档数：
+
+```
+updating 'notes' (/Users/me/notes)…
+  321 scanned: 1 added, 0 updated, 0 deactivated
+  1 pending embedding (run `ir embed` or `ir sync`)
+```
+
+`0 scanned` 表示路径或 glob 没有匹配到任何文件。`ir update --force` 会重建文本索引并删除该集合已存储的向量，因此在运行 `ir embed` 或 `ir sync` 之前，所有文档都处于待嵌入状态。
+
+如果集合的预处理器无法启动或在运行中停止，`ir update` 会给出警告并按原文建立索引，因此所有文件仍可被搜索。预处理器恢复后，下一次 `ir update` 会重新索引这些文件。多个 `ir` 进程（CLI 运行、MCP 服务器）可以同时更新同一个集合。当另一个进程正在嵌入同一个集合时，`ir sync` 和 `ir embed` 会等待。
+
 **搜索：**
 
 ```bash
@@ -138,6 +151,8 @@ ir daemon start|stop|status   # 首次搜索时自动启动
 ```
 
 热启动查询经 Unix 套接字往返约 30ms。冷启动时首个查询可在模型后台加载期间立即返回 BM25 结果。
+
+升级 `ir` 之后，下一次搜索会自动替换由旧二进制启动的守护进程，该次查询按冷启动方式返回结果。Homebrew 和 `cargo install` 可在 `ir` 运行时升级。如果手动复制二进制文件，请替换文件（`mv` 或 `install`），不要直接覆盖写入：Linux 拒绝写入正在运行的程序（"Text file busy"）。`--mode bm25` 搜索不会启动或连接守护进程。守护进程在 120 秒内没有应答时，搜索停止等待并返回已有的结果。
 
 </details>
 
@@ -174,6 +189,10 @@ ir preprocessor bind ko wiki  # 绑定到集合并重新索引
 ```
 
 工具：`search`（支持 `mode`、`limit`、`min_score`、`collections`、`filter`）、`get`、`multi_get`、`status`、`update`。
+
+`update` 仅处理文本：它只刷新 BM25 索引，不计算嵌入。每个结果包含 `path`、`scanned`、`added`、`updated`、`deactivated`、`pending_embeddings` 和 `notes`。要嵌入待处理的文档，请在终端运行 `ir embed` 或 `ir sync`。`force: true` 会删除该集合现有的向量，直到运行上述命令为止。
+
+`update` 结果中的 `notes`，以及 `search` 结果之后的第二个 `notes:` 块，包含 `ir` 在终端打印的警告，例如无法启动的预处理器、尚未索引的集合，或模型加载期间仅返回 BM25 结果。没有需要报告的内容时，它们为空或不出现。
 
 HTTP 模式用于远程/多客户端场景：
 

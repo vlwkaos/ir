@@ -7,6 +7,14 @@ use rusqlite::Connection;
 const SCHEMA_VERSION: i64 = 2;
 
 pub fn init(conn: &Connection, collection_name: &str, has_preprocessor: bool) -> Result<()> {
+    // ^ One transaction: processes opening a new collection at the same time
+    //   otherwise interleave DDL and fail with "no such table".
+    super::write_txn(conn, || {
+        init_locked(conn, collection_name, has_preprocessor)
+    })
+}
+
+fn init_locked(conn: &Connection, collection_name: &str, has_preprocessor: bool) -> Result<()> {
     conn.execute_batch(include_str!("schema_base.sql"))?;
 
     if has_preprocessor {
@@ -54,7 +62,7 @@ pub fn init(conn: &Connection, collection_name: &str, has_preprocessor: bool) ->
 /// Backfill `document_metadata` from YAML frontmatter stored in `content.doc`.
 /// Idempotent via `INSERT OR IGNORE`; safe to re-run.
 fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
-    // Collect active document IDs + content before opening the write transaction
+    // Collect active document IDs + content before inserting
     // (rusqlite can't run a SELECT iterator and INSERT statements on the same connection simultaneously).
     let docs: Vec<(i64, String)> = {
         let mut stmt = conn.prepare(
@@ -69,20 +77,19 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
         .collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    // document_metadata table already created by schema_base.sql (CREATE TABLE IF NOT EXISTS)
-    let tx = conn.unchecked_transaction()?;
+    // document_metadata table already created by schema_base.sql (CREATE TABLE IF NOT EXISTS).
+    // Runs inside init's transaction.
     for (doc_id, content) in &docs {
         let Some(mapping) = crate::frontmatter::extract(content) else {
             continue;
         };
         for (key, value) in crate::frontmatter::flatten(&mapping) {
-            tx.execute(
+            conn.execute(
                 "INSERT OR IGNORE INTO document_metadata (document_id, key, value) \
                  VALUES (?1, ?2, ?3)",
                 rusqlite::params![doc_id, key, value],
             )?;
         }
     }
-    tx.commit()?;
     Ok(())
 }

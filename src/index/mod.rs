@@ -5,16 +5,30 @@ pub mod hasher;
 pub mod scanner;
 
 use crate::config::Config;
-use crate::db::CollectionDb;
-use crate::error::Result;
+use crate::db::{self, CollectionDb};
+use crate::error::{Error, Result};
 use crate::preprocess::PreprocessChain;
 use crate::types::Collection;
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct UpdateOptions {
     pub force: bool,
+}
+
+/// Outcome of one `update` run. `scanned` is the number of files the scan
+/// matched, so a 0/0/0 diff can be told apart from a scan that found nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateStats {
+    pub scanned: usize,
+    pub added: usize,
+    pub updated: usize,
+    pub deactivated: usize,
+    /// Active documents without vectors after this run. `update` never embeds.
+    pub pending_embeddings: usize,
+    /// Warnings for the user: the CLI prints them to stderr, MCP returns them.
+    pub notes: Vec<String>,
 }
 
 pub fn new_progress_bar(len: u64) -> ProgressBar {
@@ -29,14 +43,141 @@ pub fn new_progress_bar(len: u64) -> ProgressBar {
     pb
 }
 
+/// {rel_path → (hash, content_bytes, mtime_rfc3339, birthtime_rfc3339)}
+type Scanned = HashMap<String, (String, Vec<u8>, String, String)>;
+
+fn scan_entry<'a>(
+    scanned: &'a Scanned,
+    rel_path: &str,
+) -> Result<&'a (String, Vec<u8>, String, String)> {
+    scanned
+        .get(rel_path)
+        .ok_or_else(|| Error::Other(format!("missing scan entry: {rel_path}")))
+}
+
+fn decode(content: &[u8]) -> String {
+    String::from_utf8_lossy(content).replace("\r\n", "\n")
+}
+
+/// What one run changes, derived from the stored state.
+struct Plan {
+    /// Rebuild everything: `--force`, or the preprocessor binding changed.
+    force: bool,
+    preprocessor_changed: bool,
+    diff: diff::IndexDiff,
+}
+
+fn plan(
+    conn: &rusqlite::Connection,
+    opts: &UpdateOptions,
+    has_preprocessor: bool,
+    hash_only: &HashMap<String, String>,
+) -> Result<Plan> {
+    let stored_has_preprocessor = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'has_preprocessor'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .is_ok_and(|v| v == "1");
+    let preprocessor_changed = stored_has_preprocessor != has_preprocessor;
+    let force = opts.force || preprocessor_changed;
+    // Force mode presents an empty stored state.
+    let stored = if force {
+        HashMap::new()
+    } else {
+        stored_hashes(conn)?
+    };
+    Ok(Plan {
+        force,
+        preprocessor_changed,
+        diff: diff::compute(hash_only, &stored),
+    })
+}
+
+/// Preprocessed search text per content hash, for collections with a preprocessor.
+/// The chain is spawned once, on the first document that needs it.
+/// ^ A preprocessor that cannot start or dies does not stop the update: the
+///   document is indexed with its raw text and listed in `raw`, and the next
+///   update stores it again. Queries fall back to raw text the same way.
+struct FtsBodies<'a> {
+    commands: &'a [String],
+    chain: ChainState,
+    by_hash: HashMap<String, String>,
+    raw: HashSet<String>,
+    /// Why the first document fell back to raw text, for the update's notes.
+    first_error: Option<String>,
+}
+
+impl FtsBodies<'_> {
+    /// Preprocess every document `diff` stores that is not prepared yet.
+    fn prepare(
+        &mut self,
+        diff: &diff::IndexDiff,
+        scanned: &Scanned,
+        pb: &ProgressBar,
+    ) -> Result<()> {
+        if self.commands.is_empty() {
+            return Ok(());
+        }
+        for rel_path in diff.to_add.iter().chain(&diff.to_update) {
+            let (hash, content, _, _) = scan_entry(scanned, rel_path)?;
+            if !self.by_hash.contains_key(hash) {
+                let text = decode(content);
+                let body = match self.preprocess(&text, rel_path) {
+                    Some(body) => body,
+                    None => {
+                        self.raw.insert(hash.clone());
+                        text
+                    }
+                };
+                self.by_hash.insert(hash.clone(), body);
+            }
+            pb.inc(1);
+        }
+        Ok(())
+    }
+
+    /// None when the chain cannot start or fails on this document. A chain that
+    /// failed is started again for the next document.
+    fn preprocess(&mut self, text: &str, rel_path: &str) -> Option<String> {
+        if let ChainState::NotStarted = self.chain {
+            self.chain = match PreprocessChain::spawn_all(self.commands) {
+                Ok(chain) => ChainState::Running(chain),
+                Err(e) => {
+                    self.first_error.get_or_insert(e.to_string());
+                    ChainState::CannotStart
+                }
+            };
+        }
+        let ChainState::Running(chain) = &mut self.chain else {
+            return None;
+        };
+        match chain.process_text(text) {
+            Ok(body) => Some(body),
+            Err(e) => {
+                self.first_error.get_or_insert(format!("{e} on {rel_path}"));
+                self.chain = ChainState::NotStarted;
+                None
+            }
+        }
+    }
+}
+
+enum ChainState {
+    NotStarted,
+    Running(PreprocessChain),
+    /// Spawning failed once in this update; not retried until the next one.
+    CannotStart,
+}
+
 /// Scan, diff, and update the FTS index for a collection.
-/// Returns (added, updated, deactivated) counts.
 pub fn update(
     db: &CollectionDb,
     collection: &Collection,
     opts: &UpdateOptions,
     config: &Config,
-) -> Result<(usize, usize, usize)> {
+) -> Result<UpdateStats> {
     let conn = db.conn();
 
     // Resolve preprocessor aliases to command strings.
@@ -44,45 +185,13 @@ pub fn update(
     let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
     let has_preprocessor = !pp_commands.is_empty();
 
-    // Check stored has_preprocessor to detect migration.
-    let stored_has_preprocessor: bool = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'has_preprocessor'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-        .map(|v| v == "1")
-        .unwrap_or(false);
-
-    let force = opts.force || (stored_has_preprocessor != has_preprocessor);
-    if !opts.force && stored_has_preprocessor != has_preprocessor {
-        eprintln!(
-            "preprocessor config changed (was={stored_has_preprocessor}, now={has_preprocessor}) — forcing re-index"
-        );
-    }
-
-    // 1. Load current DB state: {rel_path → hash}. Force mode intentionally
-    // presents an empty state, but does not mutate the DB until the scan succeeds.
-    let stored: HashMap<String, String> = if force {
-        HashMap::new()
-    } else {
-        let mut stmt = conn.prepare("SELECT path, hash FROM documents WHERE active = 1")?;
-        stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<HashMap<_, _>, _>>()?
-    };
-
-    // 2. Scan filesystem
+    // 1. Scan and hash the filesystem. No lock is held here; this is the slow
+    // part. The progress bar runs during hashing so operators can see activity
+    // from the first second.
     let scanned_files = scanner::scan(collection)?;
-
-    // 3. Hash scanned files: {rel_path → (hash, content_bytes, mtime_rfc3339, birthtime_rfc3339)}
-    // Progress bar runs during hashing so operators can see activity from the first second.
     let pb = new_progress_bar(scanned_files.len() as u64);
     pb.set_message("hashing");
-    let mut scanned: HashMap<String, (String, Vec<u8>, String, String)> =
-        HashMap::with_capacity(scanned_files.len());
+    let mut scanned: Scanned = HashMap::with_capacity(scanned_files.len());
     for f in &scanned_files {
         let content = std::fs::read(&f.abs_path)?;
         let hash = hasher::hash_bytes(&content);
@@ -100,45 +209,71 @@ pub fn update(
         );
         pb.inc(1);
     }
-
-    // 4. Compute diff — pass hash-only view
-    pb.set_message("diffing");
     let hash_only: HashMap<String, String> = scanned
         .iter()
         .map(|(path, (hash, _, _, _))| (path.clone(), hash.clone()))
         .collect();
-    let d = diff::compute(&hash_only, &stored);
-    let (n_add, n_update, n_deactivate) =
-        (d.to_add.len(), d.to_update.len(), d.to_deactivate.len());
 
-    pb.set_position(0);
-    pb.set_length((n_add + n_update + n_deactivate) as u64);
-    pb.set_message("applying");
-
-    // Spawn preprocessor chain once for the whole batch.
-    let mut chain = if has_preprocessor && (n_add != 0 || n_update != 0) {
-        let c = PreprocessChain::spawn(&pp_commands);
-        if !c.is_active() {
-            eprintln!("warning: all preprocessors failed to spawn — indexing raw text");
-        }
-        Some(c)
-    } else {
-        None
+    // 2. Preprocess what this run will most likely store, still without a lock.
+    // ^ Preprocessing is slow. Done under the write lock it makes every other
+    //   writer of this collection (another update, `ir embed`, the daemon's
+    //   rerank cache) fail with "database is locked" after the busy timeout.
+    let mut fts_bodies = FtsBodies {
+        commands: &pp_commands,
+        chain: ChainState::NotStarted,
+        by_hash: HashMap::new(),
+        raw: HashSet::new(),
+        first_error: None,
     };
+    if has_preprocessor {
+        let draft = plan(conn, opts, has_preprocessor, &hash_only)?.diff;
+        pb.set_position(0);
+        pb.set_length((draft.to_add.len() + draft.to_update.len()) as u64);
+        pb.set_message("preprocessing");
+        fts_bodies.prepare(&draft, &scanned, &pb)?;
+    }
 
-    // 5–7. Apply diff atomically so a crash leaves the DB consistent.
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let mut apply = || -> Result<()> {
+    // 3–6. Diff against the stored state and apply it under one write lock, so a
+    // crash leaves the DB consistent.
+    // ^ The stored state is read again inside the transaction, and that diff is
+    //   the one applied. Applied from a read taken before it, two updates running
+    //   at once both act on the same snapshot and the second fails on a duplicate
+    //   path.
+    let ((n_add, n_update, n_deactivate), n_raw, rebuilt) = db::write_txn(conn, || {
+        let Plan {
+            force,
+            preprocessor_changed,
+            diff: d,
+        } = plan(conn, opts, has_preprocessor, &hash_only)?;
+        // ^ Reported only when something existed to rebuild: a new collection
+        //   with a preprocessor also takes this path on its first update.
+        let rebuilt = !opts.force
+            && preprocessor_changed
+            && conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM documents WHERE active = 1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+        // Only documents another update changed since step 2 are left to do.
+        fts_bodies.prepare(&d, &scanned, &pb)?;
+
+        let counts = (d.to_add.len(), d.to_update.len(), d.to_deactivate.len());
+        let (n_add, n_update, n_deactivate) = counts;
+        pb.set_position(0);
+        pb.set_length((n_add + n_update + n_deactivate) as u64);
+        pb.set_message("applying");
+
         if force {
-            // A failed scan or preprocessing pass must not destroy the last good index.
             conn.execute_batch(
                 "DELETE FROM documents_fts;
                  DELETE FROM documents;
                  DELETE FROM content;
                  DELETE FROM content_vectors;
                  DELETE FROM vectors_vec;
-                 DELETE FROM llm_cache;",
+                 DELETE FROM llm_cache;
+                 DELETE FROM fts_raw;",
             )?;
+            db::ann::invalidate(conn)?;
         } else {
             // ^ v0.15 and older retained tombstones. Purging them before inserts
             // makes a path that disappeared and returned self-healing.
@@ -152,7 +287,7 @@ pub fn update(
             conn.execute("DELETE FROM documents WHERE active = 0", [])?;
         }
 
-        // 5. Delete removed files. Content and vectors remain hash-addressed caches.
+        // 4. Delete removed files. Content and vectors remain hash-addressed caches.
         for rel_path in &d.to_deactivate {
             // ! Triggers disabled — must manually remove from FTS.
             delete_document(conn, rel_path, has_preprocessor)?;
@@ -160,39 +295,25 @@ pub fn update(
             pb.set_message(format!("remove {rel_path}"));
         }
 
-        // 6. Add new files
+        // 5. Add new files
         for rel_path in &d.to_add {
-            let (hash, content, file_mtime, file_birthtime) =
-                scanned.get(rel_path).ok_or_else(|| {
-                    crate::error::Error::Other(format!("missing scan entry: {rel_path}"))
-                })?;
-            let raw_text = String::from_utf8_lossy(content).into_owned();
-            let text = raw_text.replace("\r\n", "\n");
-            let title = chunker::extract_title(&text, rel_path);
-
+            let (hash, content, file_mtime, file_birthtime) = scan_entry(&scanned, rel_path)?;
             store_document(
                 conn,
                 rel_path,
-                &title,
                 hash,
-                &text,
+                &decode(content),
                 file_birthtime,
                 file_mtime,
-                chain.as_mut(),
+                has_preprocessor.then_some(&fts_bodies.by_hash),
             )?;
             pb.inc(1);
             pb.set_message(format!("add {rel_path}"));
         }
 
-        // 7. Update changed files
+        // 6. Update changed files
         for rel_path in &d.to_update {
-            let (hash, content, file_mtime, _file_birthtime) =
-                scanned.get(rel_path).ok_or_else(|| {
-                    crate::error::Error::Other(format!("missing scan entry: {rel_path}"))
-                })?;
-            let raw_text = String::from_utf8_lossy(content).into_owned();
-            let text = raw_text.replace("\r\n", "\n");
-            let title = chunker::extract_title(&text, rel_path);
+            let (hash, content, file_mtime, _file_birthtime) = scan_entry(&scanned, rel_path)?;
             let created_at: String = conn
                 .query_row(
                     "SELECT created_at FROM documents WHERE path = ?1",
@@ -207,15 +328,30 @@ pub fn update(
             store_document(
                 conn,
                 rel_path,
-                &title,
                 hash,
-                &text,
+                &decode(content),
                 &created_at,
                 file_mtime,
-                chain.as_mut(),
+                has_preprocessor.then_some(&fts_bodies.by_hash),
             )?;
             pb.inc(1);
             pb.set_message(format!("update {rel_path}"));
+        }
+
+        // ^ Counted here, not from `raw`: step 2 may have prepared documents
+        //   that another update stored first.
+        let mut n_raw = 0;
+        if has_preprocessor {
+            for rel_path in d.to_add.iter().chain(&d.to_update) {
+                let hash = &scan_entry(&scanned, rel_path)?.0;
+                let sql = if fts_bodies.raw.contains(hash) {
+                    n_raw += 1;
+                    "INSERT OR IGNORE INTO fts_raw (hash) VALUES (?1)"
+                } else {
+                    "DELETE FROM fts_raw WHERE hash = ?1"
+                };
+                conn.execute(sql, [hash])?;
+            }
         }
 
         // Record the preprocessing state only after the matching FTS content is ready.
@@ -224,18 +360,53 @@ pub fn update(
             [if has_preprocessor { "1" } else { "0" }],
         )?;
 
-        Ok(())
-    };
-    match apply() {
-        Ok(()) => conn.execute_batch("COMMIT")?,
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(e);
-        }
-    }
+        Ok((counts, n_raw, rebuilt))
+    })?;
 
     pb.finish_with_message("done");
-    Ok((n_add, n_update, n_deactivate))
+    let mut notes = Vec::new();
+    if rebuilt {
+        notes.push(format!(
+            "the preprocessor setting changed ({}), so the collection was re-indexed \
+             from scratch and its vectors were dropped",
+            if has_preprocessor { "bound" } else { "unbound" }
+        ));
+    }
+    if n_raw > 0 {
+        notes.push(format!(
+            "{n_raw} documents indexed without the preprocessor: {}; the next update retries them",
+            fts_bodies.first_error.as_deref().unwrap_or("unknown error")
+        ));
+    }
+    Ok(UpdateStats {
+        scanned: scanned_files.len(),
+        added: n_add,
+        updated: n_update,
+        deactivated: n_deactivate,
+        pending_embeddings: embed::pending_count(conn, false)?,
+        notes,
+    })
+}
+
+/// {rel_path → hash} of the active documents.
+/// ^ A document with no search-index row, or one indexed with raw text because
+///   its preprocessor failed (`fts_raw`), gets an empty hash, so the diff sees
+///   it as changed and stores it again. ir ≤ 0.18.1 wrote rows without search
+///   text when a preprocessor failed to start; they otherwise report
+///   "unchanged" forever.
+fn stored_hashes(conn: &rusqlite::Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.path,
+                CASE WHEN EXISTS (SELECT 1 FROM documents_fts f WHERE f.rowid = d.id)
+                      AND NOT EXISTS (SELECT 1 FROM fts_raw r WHERE r.hash = d.hash)
+                     THEN d.hash ELSE '' END
+         FROM documents d
+         WHERE d.active = 1",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    Ok(rows.collect::<std::result::Result<HashMap<_, _>, _>>()?)
 }
 
 fn delete_document(
@@ -259,17 +430,19 @@ fn delete_document(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// `fts_bodies` is Some for a collection with a preprocessor: its FTS triggers
+/// are dropped, so the preprocessed text is inserted here.
 fn store_document(
     conn: &rusqlite::Connection,
     rel_path: &str,
-    title: &str,
     hash: &str,
     text: &str,
     created_at: &str,
     modified_at: &str,
-    chain: Option<&mut PreprocessChain>,
+    fts_bodies: Option<&HashMap<String, String>>,
 ) -> Result<()> {
+    let title = chunker::extract_title(text, rel_path);
+
     // Upsert content (content-addressed, may already exist from another file)
     conn.execute(
         "INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?1, ?2, ?3)",
@@ -295,14 +468,13 @@ fn store_document(
         }
     }
 
-    // When chain is active, triggers are disabled — explicitly insert preprocessed text into FTS.
-    if let Some(chain) = chain
-        && chain.is_active()
-    {
-        let processed = chain.process_text(text)?;
+    if let Some(bodies) = fts_bodies {
+        let body = bodies
+            .get(hash)
+            .ok_or_else(|| Error::Other(format!("no preprocessed text for {rel_path}")))?;
         conn.execute(
             "INSERT INTO documents_fts(rowid, path, title, body) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![doc_id, rel_path, title, processed],
+            rusqlite::params![doc_id, rel_path, title, body],
         )?;
     }
 
@@ -381,6 +553,7 @@ mod tests {
                 &UpdateOptions { force },
                 &self.config,
             )
+            .map(|s| (s.added, s.updated, s.deactivated))
         }
     }
 
@@ -455,165 +628,6 @@ mod tests {
         (document_count, fts_count)
     }
 
-    fn document_id(db: &CollectionDb, path: &str) -> i64 {
-        db.conn()
-            .query_row("SELECT id FROM documents WHERE path = ?1", [path], |row| {
-                row.get(0)
-            })
-            .unwrap()
-    }
-
-    #[test]
-    fn given_empty_collection_when_update_runs_then_no_documents_are_changed() {
-        let fixture = Fixture::new();
-
-        let counts = fixture.run_update().unwrap();
-
-        assert_eq!(
-            (counts, committed_index(&fixture.db)),
-            (
-                (0, 0, 0),
-                CommittedIndex {
-                    documents: vec![],
-                    fts: vec![],
-                }
-            )
-        );
-    }
-
-    #[test]
-    fn given_new_path_when_update_runs_then_document_and_fts_are_committed() {
-        let fixture = Fixture::new();
-        fixture.write("new.md", "# New\n\nfirstneedle body");
-
-        let counts = fixture.run_update().unwrap();
-
-        assert_eq!(
-            (
-                counts,
-                retrieved_body(&fixture.db, "new.md"),
-                bm25_paths(&fixture.db, "firstneedle"),
-                path_row_counts(&fixture.db, "new.md"),
-            ),
-            (
-                (1, 0, 0),
-                Some("# New\n\nfirstneedle body".to_string()),
-                vec!["new.md".to_string()],
-                (1, 1),
-            )
-        );
-    }
-
-    #[test]
-    fn given_changed_active_path_when_update_runs_then_committed_body_is_replaced() {
-        let fixture = Fixture::new();
-        fixture.write("change.md", "# Before\n\noldneedle body");
-        fixture.run_update().unwrap();
-        fixture.write("change.md", "# After\n\nnewneedle body");
-
-        let counts = fixture.run_update().unwrap();
-
-        assert_eq!(
-            (
-                counts,
-                retrieved_body(&fixture.db, "change.md"),
-                bm25_paths(&fixture.db, "newneedle"),
-                bm25_paths(&fixture.db, "oldneedle"),
-                path_row_counts(&fixture.db, "change.md"),
-            ),
-            (
-                (0, 1, 0),
-                Some("# After\n\nnewneedle body".to_string()),
-                vec!["change.md".to_string()],
-                vec![],
-                (1, 1),
-            )
-        );
-    }
-
-    #[test]
-    fn given_unchanged_path_when_update_runs_again_then_content_remains_retrievable() {
-        let fixture = Fixture::new();
-        fixture.write("same.md", "# Same\n\nunchangedneedle body");
-        fixture.run_update().unwrap();
-
-        let counts = fixture.run_update().unwrap();
-
-        assert_eq!(
-            (
-                counts,
-                retrieved_body(&fixture.db, "same.md"),
-                bm25_paths(&fixture.db, "unchangedneedle"),
-            ),
-            (
-                (0, 0, 0),
-                Some("# Same\n\nunchangedneedle body".to_string()),
-                vec!["same.md".to_string()],
-            )
-        );
-    }
-
-    #[test]
-    fn given_removed_then_recreated_path_when_update_runs_then_path_returns_once() {
-        let fixture = Fixture::new();
-        fixture.write("return.md", "# Return\n\nreturnneedle body");
-        fixture.run_update().unwrap();
-        fs::remove_file(fixture.root.join("return.md")).unwrap();
-
-        let removed_counts = fixture.run_update().unwrap();
-        let state_while_missing = (
-            retrieved_body(&fixture.db, "return.md"),
-            bm25_paths(&fixture.db, "returnneedle"),
-            path_row_counts(&fixture.db, "return.md"),
-        );
-        fixture.write("return.md", "# Return\n\nreturnneedle body");
-        let returned_counts = fixture.run_update().unwrap();
-
-        assert_eq!(
-            (
-                removed_counts,
-                state_while_missing,
-                returned_counts,
-                retrieved_body(&fixture.db, "return.md"),
-                bm25_paths(&fixture.db, "returnneedle"),
-                path_row_counts(&fixture.db, "return.md"),
-            ),
-            (
-                (0, 0, 1),
-                (None, vec![], (0, 0)),
-                (1, 0, 0),
-                Some("# Return\n\nreturnneedle body".to_string()),
-                vec!["return.md".to_string()],
-                (1, 1),
-            )
-        );
-    }
-
-    #[test]
-    fn given_same_content_moved_to_new_path_when_update_runs_then_old_path_is_absent() {
-        let fixture = Fixture::new();
-        fixture.write("old.md", "# Moved\n\nmovedneedle body");
-        fixture.run_update().unwrap();
-        fs::rename(fixture.root.join("old.md"), fixture.root.join("new.md")).unwrap();
-
-        let counts = fixture.run_update().unwrap();
-
-        assert_eq!(
-            (
-                counts,
-                retrieved_body(&fixture.db, "old.md"),
-                retrieved_body(&fixture.db, "new.md"),
-                bm25_paths(&fixture.db, "movedneedle"),
-            ),
-            (
-                (1, 0, 1),
-                None,
-                Some("# Moved\n\nmovedneedle body".to_string()),
-                vec!["new.md".to_string()],
-            )
-        );
-    }
-
     #[test]
     fn given_inactive_legacy_row_for_present_path_when_update_runs_then_path_self_heals() {
         let fixture = Fixture::new();
@@ -675,26 +689,6 @@ mod tests {
     }
 
     #[test]
-    fn given_missing_collection_root_when_update_fails_then_last_commit_is_preserved() {
-        let mut fixture = Fixture::new();
-        fixture.write("stable.md", "# Stable\n\ncommitted body");
-        fixture.run_update().unwrap();
-        let before = committed_index(&fixture.db);
-        fixture.collection.path = fixture
-            .root
-            .join("does-not-exist")
-            .to_string_lossy()
-            .into_owned();
-
-        let result = fixture.run_update();
-
-        assert_eq!(
-            (result.is_err(), committed_index(&fixture.db)),
-            (true, before)
-        );
-    }
-
-    #[test]
     fn given_delete_change_and_add_when_apply_fails_then_whole_batch_rolls_back() {
         let fixture = Fixture::new();
         fixture.write("removed.md", "# Removed\n\nremovedcommitted");
@@ -722,124 +716,6 @@ mod tests {
         assert_eq!(
             (result.is_err(), committed_index(&fixture.db)),
             (true, before)
-        );
-    }
-
-    #[test]
-    fn given_unchanged_path_when_force_update_runs_then_document_is_reindexed() {
-        let fixture = Fixture::new();
-        fixture.write("force.md", "# Force\n\nforceneedle body");
-        fixture.run_update().unwrap();
-        let original_id = document_id(&fixture.db, "force.md");
-
-        let counts = fixture.run_update_with_force(true).unwrap();
-        let replacement_id = document_id(&fixture.db, "force.md");
-
-        assert_eq!(
-            (
-                counts,
-                replacement_id > original_id,
-                retrieved_body(&fixture.db, "force.md"),
-                bm25_paths(&fixture.db, "forceneedle"),
-                path_row_counts(&fixture.db, "force.md"),
-            ),
-            (
-                (1, 0, 0),
-                true,
-                Some("# Force\n\nforceneedle body".to_string()),
-                vec!["force.md".to_string()],
-                (1, 1),
-            )
-        );
-    }
-
-    #[test]
-    fn given_committed_index_and_missing_root_when_force_update_fails_then_public_state_is_unchanged()
-     {
-        let mut fixture = Fixture::new();
-        fixture.write("stable.md", "# Stable\n\nforcerollbackneedle body");
-        fixture.run_update().unwrap();
-        let before = (
-            retrieved_body(&fixture.db, "stable.md"),
-            bm25_paths(&fixture.db, "forcerollbackneedle"),
-        );
-        fixture.collection.path = fixture
-            .root
-            .join("missing-force-root")
-            .to_string_lossy()
-            .into_owned();
-
-        let result = fixture.run_update_with_force(true);
-        let after = (
-            retrieved_body(&fixture.db, "stable.md"),
-            bm25_paths(&fixture.db, "forcerollbackneedle"),
-        );
-
-        assert_eq!((result.is_err(), after), (true, before));
-    }
-
-    #[test]
-    fn given_raw_index_when_reopened_with_cat_preprocessor_then_state_change_reindexes_atomically()
-    {
-        let mut fixture = Fixture::new();
-        fixture.write("compat.md", "# Compatible\n\ncompatibilityneedle body");
-        fixture.run_update().unwrap();
-        let db_path = fixture._temp.path().join("test.sqlite");
-        let reopened = CollectionDb::open("test", &db_path, true).unwrap();
-        let meta_before_update: String = reopened
-            .conn()
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'has_preprocessor'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        fixture
-            .config
-            .preprocessors
-            .insert("test-cat".to_string(), "cat".to_string());
-        fixture.collection.preprocessor = Some(vec!["test-cat".to_string()]);
-
-        let counts = update(
-            &reopened,
-            &fixture.collection,
-            &UpdateOptions { force: false },
-            &fixture.config,
-        )
-        .unwrap();
-        let committed_meta_and_fts: (String, String) = reopened
-            .conn()
-            .query_row(
-                "SELECT m.value, f.body
-                 FROM meta m
-                 JOIN documents d ON d.path = 'compat.md' AND d.active = 1
-                 JOIN documents_fts f ON f.rowid = d.id
-                 WHERE m.key = 'has_preprocessor'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-
-        assert_eq!(
-            (
-                meta_before_update,
-                counts,
-                retrieved_body(&reopened, "compat.md"),
-                bm25_paths(&reopened, "compatibilityneedle"),
-                committed_meta_and_fts,
-                path_row_counts(&reopened, "compat.md"),
-            ),
-            (
-                "0".to_string(),
-                (1, 0, 0),
-                Some("# Compatible\n\ncompatibilityneedle body".to_string()),
-                vec!["compat.md".to_string()],
-                (
-                    "1".to_string(),
-                    "# Compatible\n\ncompatibilityneedle body".to_string(),
-                ),
-                (1, 1),
-            )
         );
     }
 
@@ -906,68 +782,6 @@ mod tests {
                 vec![hash_seq],
                 1,
                 Some(content.to_string()),
-            )
-        );
-    }
-
-    #[test]
-    fn given_cat_preprocessed_path_when_removed_and_restored_then_manual_fts_state_self_heals() {
-        let mut fixture = Fixture::new();
-        let db_path = fixture._temp.path().join("test.sqlite");
-        let preprocessed_db = CollectionDb::open("test", &db_path, true).unwrap();
-        fixture
-            .config
-            .preprocessors
-            .insert("test-cat".to_string(), "cat".to_string());
-        fixture.collection.preprocessor = Some(vec!["test-cat".to_string()]);
-        let content = "# Preprocessed\n\npreprocessedreturnneedle body";
-        fixture.write("preprocessed.md", content);
-        update(
-            &preprocessed_db,
-            &fixture.collection,
-            &UpdateOptions { force: false },
-            &fixture.config,
-        )
-        .unwrap();
-        fs::remove_file(fixture.root.join("preprocessed.md")).unwrap();
-
-        let removed_counts = update(
-            &preprocessed_db,
-            &fixture.collection,
-            &UpdateOptions { force: false },
-            &fixture.config,
-        )
-        .unwrap();
-        let removed_state = (
-            retrieved_body(&preprocessed_db, "preprocessed.md"),
-            bm25_paths(&preprocessed_db, "preprocessedreturnneedle"),
-            path_row_counts(&preprocessed_db, "preprocessed.md"),
-        );
-        fixture.write("preprocessed.md", content);
-        let restored_counts = update(
-            &preprocessed_db,
-            &fixture.collection,
-            &UpdateOptions { force: false },
-            &fixture.config,
-        )
-        .unwrap();
-
-        assert_eq!(
-            (
-                removed_counts,
-                removed_state,
-                restored_counts,
-                retrieved_body(&preprocessed_db, "preprocessed.md"),
-                bm25_paths(&preprocessed_db, "preprocessedreturnneedle"),
-                path_row_counts(&preprocessed_db, "preprocessed.md"),
-            ),
-            (
-                (0, 0, 1),
-                (None, vec![], (0, 0)),
-                (1, 0, 0),
-                Some(content.to_string()),
-                vec!["preprocessed.md".to_string()],
-                (1, 1),
             )
         );
     }

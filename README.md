@@ -1,7 +1,8 @@
 # ir
 
 [![crates.io](https://img.shields.io/crates/v/ir-search.svg)](https://crates.io/crates/ir-search)
-[![CI](https://github.com/vlwkaos/ir/actions/workflows/ci.yml/badge.svg)](https://github.com/vlwkaos/ir/actions/workflows/ci.yml)
+[![CI - check](https://github.com/vlwkaos/ir/actions/workflows/ci.yml/badge.svg)](https://github.com/vlwkaos/ir/actions/workflows/ci.yml)
+[![CI - evaluation](https://github.com/vlwkaos/ir/actions/workflows/ci-evaluation.yml/badge.svg)](https://github.com/vlwkaos/ir/actions/workflows/ci-evaluation.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [ENG](README.md) | [한국어](README.ko.md) | [中文](README.zh.md)
@@ -116,6 +117,18 @@ ir embed [notes] [--force]   # vector repair / re-embedding
 
 Indexing is incremental and content-addressed (SHA-256): only changed files are reprocessed, identical content is deduplicated, deleted files are removed, and moved/restored content reuses cached vectors without re-inference.
 
+`ir update` prints the collection path, how many files the scan matched, and how many documents still have no vectors:
+
+```
+updating 'notes' (/Users/me/notes)…
+  321 scanned: 1 added, 0 updated, 0 deactivated
+  1 pending embedding (run `ir embed` or `ir sync`)
+```
+
+`0 scanned` means the path or globs matched no files. `ir update --force` rebuilds the text index and drops the collection's stored vectors, so every document is pending until `ir embed` or `ir sync` runs.
+
+If a collection's preprocessor cannot start or stops mid-run, `ir update` warns and indexes the raw text, so every file stays searchable. The next `ir update` with a working preprocessor indexes those files again. Several `ir` processes (CLI runs, MCP servers) can update one collection at the same time. `ir sync` and `ir embed` wait while another process is embedding the same collection.
+
 **Search:**
 
 ```bash
@@ -145,6 +158,8 @@ ir daemon start|stop|status   # auto-starts on first search
 ```
 
 Warm queries round-trip the Unix socket in ~30ms. On a cold start the first query can return BM25 results immediately while models load in the background.
+
+After you upgrade `ir`, the next search replaces the daemon that the old binary started; that query is answered like a cold start. Homebrew and `cargo install` upgrade while `ir` runs. If you copy the binary by hand, replace the file (`mv` or `install`) instead of writing over it: Linux refuses to write to a running program ("Text file busy"). `--mode bm25` searches never start or contact the daemon. A search stops waiting for a daemon that does not answer within 120 seconds and returns the results it already has.
 
 </details>
 
@@ -181,6 +196,10 @@ Any executable can be a preprocessor: UTF-8 lines on stdin → 0-or-1 tokenized 
 ```
 
 Tools: `search` (with `mode`, `limit`, `min_score`, `collections`, `filter`), `get`, `multi_get`, `status`, `update`.
+
+`update` is text-only: it refreshes the BM25 index and never computes embeddings. Each result reports `path`, `scanned`, `added`, `updated`, `deactivated`, `pending_embeddings`, and `notes`. Run `ir embed` or `ir sync` in a terminal to embed pending documents. `force: true` drops the collection's existing vectors until then.
+
+`notes` (on `update`) and a second `notes:` block after the `search` results carry the warnings `ir` prints to the terminal, for example a preprocessor that could not start, a collection that is not indexed, or BM25-only results while models load. Both are empty or absent when there is nothing to report.
 
 HTTP mode for remote/multi-client setups:
 

@@ -1,3 +1,50 @@
+## [Unreleased]
+
+### Fixed
+
+- **`ir update` no longer records a file as indexed without its search text.** When a collection's preprocessor could not start, the update stored the file's hash but wrote nothing to the full-text index. The file was then not searchable, and every later update reported `0 added, 0 updated, 0 deactivated` until `--force`. Now a preprocessor that cannot start, or stops mid-run, prints a warning and the document is indexed with its raw text, so it stays searchable. The next `ir update` with a working preprocessor stores those documents again (counted as `updated`); their vectors are kept. Indexes already damaged this way repair themselves the same way.
+- **Concurrent updates of one collection apply each change exactly once.** Two updates at the same moment (several `ir mcp` servers, parallel tool calls in one server, or CLI runs) could fail with `UNIQUE constraint failed: documents.path`, or with `no such table: documents` on a new collection.
+- **A very long line no longer hangs `ir update`** for collections whose preprocessor streams its output (lines above the OS pipe buffer size).
+- **`config.yml` edits are no longer lost.** Commands that change the config (`collection add|rm|rename|set-path`, `preprocessor add|bind|unbind|remove|install`) now run one at a time across processes, and the file is replaced atomically, so the daemon and MCP servers never read a half-written file.
+- **`ir daemon stop` never signals a stale pid.** After a crash or reboot the pid file could name an unrelated process, which then received SIGTERM. Stop now signals only when the daemon socket answers; otherwise it removes the stale files.
+- **Search skips a collection that was never indexed** instead of failing the whole query with `unable to open database file`.
+- **`ir collection rename` moves the index** to the new name. Before, the renamed collection was empty and the old index was orphaned.
+- **`ir collection rm --purge` removes every index file** (WAL, SHM and the ANN sidecar), not only the `.sqlite` file.
+- **`ir preprocessor install` re-indexes bound collections with the new preprocessor.** It re-indexed before saving the binding, so the first re-index ran without it.
+- **`ir preprocessor install` succeeds without a terminal.** When collections existed, a script or agent run failed with `prompt: IO error: not a terminal` after the install was saved. It now skips the bind prompt and prints the `ir preprocessor bind` command to use.
+- **Per-collection `retrieval:` settings now apply when `ir sync` / `ir embed` build the doc graph and ANN index.** They were ignored at build time (only env and defaults were used).
+- The daemon drops a client that connects and then stalls for 10 seconds, so one stuck client cannot block every other search.
+- **A slow preprocessor no longer locks other writers out of the collection.** `ir update` preprocessed documents while it held the index write lock, so a second update, `ir embed`, or the daemon failed with `database is locked` after 5 seconds. Preprocessing now runs before the lock is taken.
+- **A search no longer hangs on a daemon that does not answer.** After 120 seconds the search returns the results it already has.
+- **Reranking no longer stalls while a collection is being indexed.** Saving rerank scores to the cache waited up to 5 seconds for the index write lock; the scores are now skipped when the index is locked.
+- The ANN index is rebuilt after the stored vectors are dropped (`ir update --force`, or a model with another vector size). Before, vectors that were dropped and embedded again with ANN turned off could leave a sidecar that matched by count only.
+
+### Changed
+
+- **The daemon is replaced automatically after an upgrade.** A daemon started by the previous binary kept serving until `ir daemon stop`. Now the next search (or `ir daemon start`) notices that the daemon's executable was replaced or removed, or that the daemon runs an older version, stops that daemon and starts a new one. That query is answered like a cold start. `ir daemon status` marks such a daemon. An older or different `ir` binary never replaces the daemon, so two installs sharing one config dir do not restart it in turns. A long-running `ir mcp` started before the upgrade keeps working: it starts the daemon from the upgraded binary, and it no longer leaves exited daemons behind as zombie processes.
+- **`ir search --mode bm25` no longer starts the daemon.** It needs no model, so it does not load one in the background.
+- **`ir sync` and `ir embed` wait when another process is embedding the same collection.** The second run then finds nothing pending instead of loading the model and embedding the same documents again.
+
+- **`ir update` output now explains an empty result.** The header line includes the collection path, the counts line starts with the number of files the scan matched, and a third line reports documents that still have no vectors:
+
+  ```
+  updating 'notes' (/Users/me/notes)…
+    321 scanned: 1 added, 0 updated, 0 deactivated
+    1 pending embedding (run `ir embed` or `ir sync`)
+  ```
+
+  `0 scanned` means the path or globs matched no files. `ir sync` and `ir embed` print the same header and counts lines (without the pending line, because they embed next). This output is meant to be read, not parsed; a script that matched the old lines exactly needs updating.
+- **MCP `update` result has four new fields per collection:** `path`, `scanned`, `pending_embeddings`, and `notes`. Existing fields are unchanged.
+- **MCP callers now get the warnings the CLI prints.** `update` returns them in `notes`. `search` adds a second text block, `notes:`, after the results when the answer was degraded (a collection not indexed, BM25 only while models load, a preprocessor that could not start). The first block is unchanged. Each warning now also says why: a preprocessor that cannot start names the command and the error.
+- **MCP `update` tool description now states its limits:** it is text-only (no embeddings), and `force: true` drops the collection's existing vectors until `ir embed` or `ir sync` runs. This matches the existing behavior of `ir update --force`; no behavior changed.
+
+### Dev / Tooling
+
+- **New workflow "CI - evaluation"** (`.github/workflows/ci-evaluation.yml`): runs the model, daemon and network tests and the full `scripts/preship.sh` on CPU runners (Linux arm64, macOS), nightly and on demand. It is separate from the release workflow.
+- **Workflows renamed:** "CI" is now "CI - check" and "Release" is now "CD - release". File paths are unchanged.
+- **Release candidates:** a tag with a `-` (e.g. `v0.19.0-rc.1`) creates a GitHub prerelease with the artifacts only. It does not update the Homebrew tap or publish to crates.io.
+- **The release check fails when the tag does not match the Cargo.toml version.**
+
 ## [0.18.1] - 2026-08-14
 
 ### Fixed

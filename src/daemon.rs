@@ -19,8 +19,8 @@ use crate::types::SearchMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,15 +75,6 @@ pub struct QueryResponse {
     pub log: Vec<String>,
 }
 
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|raw| {
-        matches!(
-            raw.to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct DaemonResult {
     pub collection: String,
@@ -104,42 +95,149 @@ pub fn is_running() -> bool {
     UnixStream::connect(config::daemon_socket_path()).is_ok()
 }
 
-fn open_lock_file() -> Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(config::daemon_lock_path())
-        .map_err(Error::Io)
+/// Returns true if a daemon is reachable and still runs the binary on disk.
+/// False for a daemon left over from before an upgrade: `start_in_background`
+/// replaces it.
+pub fn is_current() -> bool {
+    is_running() && !is_outdated()
 }
 
-/// Try a non-blocking exclusive flock on `daemon.lock`.
-/// Returns the open File (lock held as long as it's alive) or None if already locked.
-fn try_lock_daemon() -> Result<Option<std::fs::File>> {
-    let file = open_lock_file()?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(None); // another process holds the lock
-        }
-        return Err(Error::Io(err));
+/// "<dev>:<inode>:<mtime ns>:<size>" of the file at `exe`; None when it cannot
+/// be read.
+/// ^ The inode catches an install that renames a copy over the old file: macOS
+///   `clonefile` and `cp -p` keep the old mtime, and a rebuild can keep the size.
+fn exe_stamp(exe: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(exe).ok()?;
+    let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some(format!(
+        "{}:{}:{}:{}",
+        meta.dev(),
+        meta.ino(),
+        mtime.as_nanos(),
+        meta.len()
+    ))
+}
+
+/// Stamp recorded when the daemon cannot read its own executable.
+const UNKNOWN_STAMP: &str = "unknown";
+
+/// What a starting daemon records about itself: "<path>\n<stamp>\n<version>".
+/// ^ Always written, with `UNKNOWN_STAMP` when the executable cannot be read:
+///   a missing record means "started by ir ≤ 0.18.1" and gets the daemon
+///   replaced, so a daemon that wrote none would be replaced on every search.
+fn build_record() -> String {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let stamp = exe_stamp(&exe).unwrap_or_else(|| UNKNOWN_STAMP.to_string());
+    format!("{}\n{stamp}\n{}", exe.display(), env!("CARGO_PKG_VERSION"))
+}
+
+/// "x.y.z" as numbers; pre-release and build suffixes are ignored.
+fn parse_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let core = raw.trim().split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+/// True when the running daemon should be replaced by this ir:
+/// - it was started by ir ≤ 0.18.1 (no record), or
+/// - the file it was started from has since been replaced or removed, or
+/// - this ir is a newer version (an upgrade that left the old file in place,
+///   e.g. Homebrew on Linux keeping old kegs).
+///
+/// ^ Never because the caller is merely a different or older binary, so two ir
+///   binaries sharing one config dir do not restart the daemon in turns.
+/// ^ Only meaningful while holding the startup lock or after `is_running()`: a
+///   starting daemon writes the record before it releases that lock.
+fn is_outdated() -> bool {
+    let Ok(record) = std::fs::read_to_string(config::daemon_build_path()) else {
+        return true;
+    };
+    let mut lines = record.lines();
+    let (exe, stamp, version) = (lines.next(), lines.next(), lines.next());
+    let newer_client = match (
+        version.and_then(parse_version),
+        parse_version(env!("CARGO_PKG_VERSION")),
+    ) {
+        (Some(daemon), Some(client)) => client > daemon,
+        _ => false,
+    };
+    let file_changed = match (exe, stamp) {
+        (_, Some(UNKNOWN_STAMP)) => false,
+        (Some(exe), Some(stamp)) => exe_stamp(Path::new(exe)).as_deref() != Some(stamp),
+        _ => true,
+    };
+    newer_client || file_changed
+}
+
+fn remove_runtime_files() {
+    let _ = std::fs::remove_file(config::daemon_pid_path());
+    let _ = std::fs::remove_file(config::daemon_socket_path());
+    let _ = std::fs::remove_file(config::daemon_build_path());
+    clear_tier2_signals();
+}
+
+/// A daemon's own cleanup on exit.
+/// ^ A daemon that was replaced without being signalled (its pid file was
+///   missing) still exits later; by then the files belong to its successor.
+fn remove_own_runtime_files() {
+    let owner = std::fs::read_to_string(config::daemon_pid_path()).unwrap_or_default();
+    if owner.trim() == std::process::id().to_string() {
+        remove_runtime_files();
     }
-    Ok(Some(file))
 }
 
-/// Acquire a blocking exclusive flock on `daemon.lock`.
-/// Blocks until the lock is available; returns the File (lock held as long as it's alive).
-fn lock_daemon() -> Result<std::fs::File> {
-    let file = open_lock_file()?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+/// Terminate the daemon whose socket just answered and remove its files.
+/// Returns its pid, or None when the pid file is missing or invalid.
+/// ^ Call only after `is_running()` returned true. A pid file left by a crash or
+///   reboot may name an unrelated process and must never be signalled.
+fn terminate_running() -> Option<i32> {
+    let pid = std::fs::read_to_string(config::daemon_pid_path())
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i32>().ok());
+    remove_runtime_files();
+    let pid = pid?;
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        eprintln!("warning: kill({pid}) failed — process may already be gone");
     }
-    Ok(file)
+    Some(pid)
 }
 
-/// Spawn `ir daemon start` as a detached background process.
+/// Replace a daemon left over from before an upgrade. Caller holds the startup lock.
+fn retire_outdated() {
+    let Some(pid) = terminate_running() else {
+        return;
+    };
+    // Give the old process a moment to release its models before the new
+    // daemon loads its own.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The executable to start the daemon from: this process's own file.
+/// ^ On Linux a process whose file was replaced by an upgrade sees
+///   "/path/ir (deleted)". The upgraded ir at "/path/ir" is used instead, so a
+///   long-running `ir mcp` can still start the daemon. Never a PATH lookup: that
+///   could find an older ir, which this one would then replace on every search.
+fn daemon_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe().map_err(Error::Io)?;
+    if exe.exists() {
+        return Ok(exe);
+    }
+    let raw = exe.to_string_lossy();
+    match raw.strip_suffix(" (deleted)").map(PathBuf::from) {
+        Some(replaced) if replaced.exists() => Ok(replaced),
+        _ => Err(Error::Other(format!(
+            "{} was removed; restart this ir process",
+            exe.display()
+        ))),
+    }
+}
+
+/// Spawn `ir daemon start` as a detached background process, unless a current
+/// daemon is running. A daemon left over from before an upgrade is replaced.
 /// Stderr is redirected to `~/.config/ir/daemon.log`.
 /// Uses a non-blocking flock so parallel `ir search` invocations don't each
 /// spawn their own daemon — only the first one wins; the rest skip and call
@@ -147,14 +245,17 @@ fn lock_daemon() -> Result<std::fs::File> {
 pub fn start_in_background() -> Result<()> {
     // Try non-blocking lock. If another process is already starting the daemon,
     // skip the spawn — wait_ready() will pick up the socket once it's live.
-    match try_lock_daemon()? {
+    match crate::lock::try_exclusive(&config::daemon_lock_path())? {
         None => return Ok(()), // another process is starting the daemon
         Some(_lock) => {
             // Double-check under the lock — daemon may have come up while we waited.
             if is_running() {
-                return Ok(());
+                if !is_outdated() {
+                    return Ok(());
+                }
+                retire_outdated();
             }
-            let exe = std::env::current_exe().map_err(Error::Io)?;
+            let exe = daemon_exe()?;
             let log_path = config::daemon_socket_path()
                 .parent()
                 .unwrap_or(std::path::Path::new("/tmp"))
@@ -164,13 +265,17 @@ pub fn start_in_background() -> Result<()> {
                 .append(true)
                 .open(&log_path)
                 .map_err(Error::Io)?;
-            std::process::Command::new(exe)
+            let mut child = std::process::Command::new(exe)
                 .args(["daemon", "start"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(log_file)
                 .spawn()
                 .map_err(|e| Error::Other(format!("spawn daemon: {e}")))?;
+            // ^ Reap it when it exits. A long-running `ir mcp` would otherwise
+            //   keep every daemon it started (idle timeout, replacement after an
+            //   upgrade) as a zombie. A short CLI run exits first; init reaps.
+            std::thread::spawn(move || child.wait());
             // _lock dropped here — daemon process will acquire its own lock in start_server
         }
     }
@@ -263,11 +368,22 @@ struct Tier2 {
     scorer: Option<Box<dyn crate::llm::scoring::Scorer>>,
 }
 
+/// Longest a client waits for the daemon's reply. A tier-2 query on CPU, queued
+/// behind another client's, can take tens of seconds; a daemon that is silent
+/// for this long is hung, and the caller falls back to the results it has.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Send a search request to the daemon and return parsed results + pipeline log.
 pub fn query(req: &DaemonRequest) -> Result<QueryResponse> {
     let sock = config::daemon_socket_path();
     let stream =
         UnixStream::connect(&sock).map_err(|e| Error::Other(format!("daemon connect: {e}")))?;
+    stream
+        .set_read_timeout(Some(REPLY_TIMEOUT))
+        .map_err(Error::Io)?;
+    stream
+        .set_write_timeout(Some(REPLY_TIMEOUT))
+        .map_err(Error::Io)?;
 
     let mut writer = stream.try_clone().map_err(Error::Io)?;
     let reader = BufReader::new(stream);
@@ -281,7 +397,13 @@ pub fn query(req: &DaemonRequest) -> Result<QueryResponse> {
         .lines()
         .next()
         .ok_or_else(|| Error::Other("daemon closed connection".into()))?
-        .map_err(Error::Io)?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Error::Other(format!(
+                "daemon did not answer within {}s",
+                REPLY_TIMEOUT.as_secs()
+            )),
+            _ => Error::Io(e),
+        })?;
 
     let resp: serde_json::Value =
         serde_json::from_str(&line).map_err(|e| Error::Other(format!("parse response: {e}")))?;
@@ -357,6 +479,9 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     let pid_path = config::daemon_pid_path();
     let tier2_path = config::daemon_tier2_path();
     let tier2_unavail_path = config::daemon_tier2_unavailable_path();
+    // ^ Taken before the slow model load: an upgrade that lands while this
+    //   process starts must leave it marked as outdated.
+    let build_record = build_record();
 
     if let Some(parent) = sock_path.parent() {
         std::fs::create_dir_all(parent).map_err(Error::Io)?;
@@ -368,12 +493,16 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     // Acquire exclusive lock before touching the socket file.
     // Blocks if a client's start_in_background is mid-flight; prevents two
     // servers from racing to remove/bind the same socket path.
-    let startup_lock = lock_daemon()?;
+    let startup_lock = crate::lock::exclusive(&config::daemon_lock_path())?;
 
     // Under the lock: bail if another daemon already won the race.
     if is_running() {
-        eprintln!("daemon: already running, exiting");
-        return Ok(());
+        if !is_outdated() {
+            eprintln!("daemon: already running, exiting");
+            return Ok(());
+        }
+        eprintln!("daemon: replacing a daemon started before ir was upgraded");
+        retire_outdated();
     }
 
     // Remove stale files; safe — we hold the lock.
@@ -414,6 +543,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
         .map_err(Error::Io)?;
     // Write PID immediately so stop() works from tier-1 onward.
     std::fs::write(&pid_path, std::process::id().to_string()).map_err(Error::Io)?;
+    std::fs::write(config::daemon_build_path(), &build_record).map_err(Error::Io)?;
 
     // Socket is live — release the startup lock so any waiting clients can
     // proceed (is_running() will now return true, preventing duplicate spawns).
@@ -472,7 +602,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
                         Box::new(e) as ExpBox
                     })
             };
-            let rer = if env_flag("IR_DISABLE_RERANKER") {
+            let rer = if config::env_flag("IR_DISABLE_RERANKER") {
                 eprintln!("  note: reranker disabled via research override");
                 None
             } else {
@@ -484,7 +614,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
                         Box::new(r) as ScoBox
                     })
             };
-            let allow_expand_without_scorer = env_flag("IR_ALLOW_EXPANSION_WITHOUT_SCORER");
+            let allow_expand_without_scorer = config::env_flag("IR_ALLOW_EXPANSION_WITHOUT_SCORER");
             match (&exp, &rer) {
                 (Some(_), Some(_)) => eprintln!("  tier-2: dedicated mode"),
                 (Some(_), None) if allow_expand_without_scorer => {
@@ -565,8 +695,6 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
     let last_activity = Arc::new(AtomicU64::new(unix_now()));
     if timeout_secs > 0 {
         let last = Arc::clone(&last_activity);
-        let sock = sock_path.clone();
-        let pid = pid_path.clone();
         std::thread::spawn(move || {
             let check_every = (timeout_secs / 10).clamp(1, 30);
             loop {
@@ -574,9 +702,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
                 let idle = unix_now().saturating_sub(last.load(Ordering::Relaxed));
                 if idle >= timeout_secs {
                     eprintln!("daemon: idle for {idle}s, shutting down");
-                    let _ = std::fs::remove_file(&sock);
-                    let _ = std::fs::remove_file(&pid);
-                    clear_tier2_signals();
+                    remove_own_runtime_files();
                     std::process::exit(0);
                 }
             }
@@ -604,9 +730,7 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
         }
     }
 
-    let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_file(&pid_path);
-    let _ = std::fs::remove_file(&tier2_path);
+    remove_own_runtime_files();
     Ok(())
 }
 
@@ -623,6 +747,15 @@ fn handle_connection(
     state: &DaemonState,
 ) -> Result<()> {
     const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+    // ^ The accept loop serves one connection at a time. A peer that connects
+    //   and then stalls must not block every other search forever.
+    const PEER_IO_TIMEOUT: Duration = Duration::from_secs(10);
+    stream
+        .set_read_timeout(Some(PEER_IO_TIMEOUT))
+        .map_err(Error::Io)?;
+    stream
+        .set_write_timeout(Some(PEER_IO_TIMEOUT))
+        .map_err(Error::Io)?;
     let mut writer = stream.try_clone().map_err(Error::Io)?;
     let mut reader = BufReader::new(stream.take(MAX_REQUEST_BYTES));
 
@@ -752,45 +885,26 @@ fn handle_request(
 // ── Stop / status ─────────────────────────────────────────────────────────────
 
 pub fn stop() -> Result<()> {
-    let pid_path = config::daemon_pid_path();
-    let sock_path = config::daemon_socket_path();
-
-    if !pid_path.exists() {
-        // Tier-1 may be up (socket bound) but tier-2 still loading (no PID yet).
-        if sock_path.exists() {
-            let _ = std::fs::remove_file(&sock_path);
-            clear_tier2_signals();
-            eprintln!("daemon stopping (tier-2 still loading, socket removed)");
+    // ^ No listener means no daemon. A pid file left by a crash or reboot may by
+    //   now name an unrelated process, so it is never signalled — only removed.
+    if !is_running() {
+        let stale = config::daemon_pid_path().exists() || config::daemon_socket_path().exists();
+        remove_runtime_files();
+        if stale {
+            eprintln!("daemon not running (removed stale files)");
         } else {
-            eprintln!("daemon not running (no pid file)");
+            eprintln!("daemon not running");
         }
         return Ok(());
     }
 
-    let pid_str = std::fs::read_to_string(&pid_path).map_err(Error::Io)?;
-    let pid: i32 = pid_str
-        .trim()
-        .parse()
-        .map_err(|_| Error::Other(format!("invalid pid file: {pid_str:?}")))?;
-
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
+    match terminate_running() {
+        Some(pid) => eprintln!("daemon stopped (pid {pid})"),
+        None => eprintln!(
+            "daemon is running but its pid file is missing or invalid — socket removed; \
+             the process exits after its idle timeout"
+        ),
     }
-    // Probe first (sig=0): verifies the process exists without sending a signal.
-    if unsafe { kill(pid, 0) } != 0 {
-        eprintln!("warning: pid {pid} not found — removing stale pid file");
-        let _ = std::fs::remove_file(&pid_path);
-        return Ok(());
-    }
-    let rc = unsafe { kill(pid, 15) }; // SIGTERM
-    if rc != 0 {
-        eprintln!("warning: kill({pid}) failed — process may already be gone");
-    }
-
-    let _ = std::fs::remove_file(&pid_path);
-    let _ = std::fs::remove_file(&sock_path);
-    clear_tier2_signals();
-    eprintln!("daemon stopped (pid {pid})");
     Ok(())
 }
 
@@ -804,7 +918,12 @@ pub fn status() -> Result<()> {
         } else {
             "tier-2 loading"
         };
-        println!("running  pid={}  {tier2}", pid.trim());
+        let outdated = if is_outdated() {
+            "  (started before ir was upgraded; replaced on the next search)"
+        } else {
+            ""
+        };
+        println!("running  pid={}  {tier2}{outdated}", pid.trim());
     } else {
         println!("not running");
     }

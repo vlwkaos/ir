@@ -16,8 +16,10 @@ git config core.hooksPath .githooks   # activate pre-commit clippy hook (once pe
 ```bash
 cargo build                        # dev build
 cargo build --release --bin ir     # release build
-cargo test                         # unit tests (fast, no models needed)
+cargo test                         # in-crate + end-to-end tests (fast, no models needed)
 cargo test -- --ignored            # includes LLM tests (require model files)
+cargo test --test e2e_daemon -- --ignored   # real-daemon scenarios (load the embedding and rerank models; one waits 120 s)
+cargo test --test e2e_ops -- --ignored      # preprocessor install (downloads lindera from GitHub)
 ```
 
 Benchmark runner (drives the real `ir` binary; requires BEIR dataset):
@@ -27,6 +29,15 @@ scripts/bench.sh fiqa v0.9.0       # compare HEAD vs v0.9.0
 scripts/bench.sh miracl-ko         # Korean MIRACL benchmark
 ```
 Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
+
+## Testing
+
+- New tests are end-to-end only: drive the compiled `ir` binary (CLI, or `ir mcp` over stdio) against real files and an isolated config dir. No new unit tests and no mocks.
+- Use the shared apparatus in `tests/support/mod.rs` (`Env`, `Mcp`); scenarios live in `tests/e2e_*.rs` and `tests/sync_cli.rs`.
+- When a scenario covers what an in-crate test checks, delete the in-crate test in the same change.
+- Scenarios that need a real daemon go in `tests/e2e_daemon.rs`, are `#[ignore]`d, and use `Env::with_real_models`. Run them in your own terminal, never from a sandboxed shell.
+- The oracle for "indexed" is a real BM25 search (`Env::bm25_paths`), never a row count.
+- Scenarios must not load a model: `Env` points model lookups at an invalid path. The only exception is `tests/e2e_daemon.rs`.
 
 ## Environment Variables
 
@@ -93,6 +104,8 @@ Note: `IR_DIR` is set internally at startup (= resolved `ir_dir()` value). It ap
 - Collection DBs: `~/.config/ir/collections/{name}.sqlite`
 - Expander cache: `~/.config/ir/expander_cache.sqlite`
 - Daemon socket: `~/.config/ir/daemon.sock`
+- Daemon build record: `~/.config/ir/daemon.build` (executable path and stamp; a mismatch with the file on disk means ir was upgraded and the daemon is replaced)
+- Locks (flock, `src/lock.rs`): `config.yml.lock` (config edits), `collections/{name}.embed.lock` (one embedding process per collection), `daemon.lock` (daemon startup)
 
 ## Architecture
 
@@ -124,9 +137,11 @@ Idle timeout: 3600s (configurable via `ir daemon start --timeout`).
 - **LLM tests are `#[ignore]`**: `cargo test` skips them. Run `cargo test -- --ignored` only when model files are present.
 - **sqlite-vec must be registered before any connection opens**: `ensure_sqlite_vec()` uses `sqlite3_auto_extension` (process-global). Called once via `OnceLock` in `db/mod.rs`.
 - **`LlamaBackend` is a singleton**: `OnceLock<LlamaBackend>` in `src/llm/mod.rs`. Loading a second model in the same process does NOT call `init()` again — this is intentional.
-- **Daemon requires restart after binary change**: `ir search` auto-starts the daemon but won't restart a running one. Kill it with `ir daemon stop` after rebuilding.
+- **A rebuilt binary replaces its daemon on the next search**: the daemon records its executable, stamp and version in `daemon.build`; `daemon::is_outdated` replaces it when that file changed or a newer version asks. A daemon started from another path with the same version (installed `ir` vs `target/debug/ir`) is not replaced; use `ir daemon stop` to switch. Never make "caller differs" or "record unreadable" a replacement reason: both restart the daemon on every search (`tests/e2e_daemon.rs` guards this).
 - **`ir embed` prints "GPU context unavailable, falling back to CPU"** in sandboxed environments — normal, not an error.
 - **Never run embedding or LLM inference in background shell tasks** — sandboxed shells have no Metal access, so they fall back to CPU and peg it. Hand these off to the user's terminal instead.
+- **Build fails in `cpp-httplib` with OpenSSL 4** (`X509_get_subject_name` const error in `llama-cpp-sys-2`): build with `CMAKE_DISABLE_FIND_PACKAGE_OpenSSL=TRUE cargo …`. After a failed attempt remove `target/debug/build/llama-cpp-sys-2-*` first, or cmake keeps the old configuration.
+- **Cargo cannot build inside the Claude Code sandbox** (cargo registry and Xcode compiler cache are write-blocked): run cargo commands outside it.
 - **Strong-signal shortcut**: raw BM25 top ≥ 0.75 AND gap ≥ 0.10 skips all LLM work (`is_bm25_strong_signal`); fused top*gap ≥ 0.06 AND top ≥ 0.40 skips tier-2 (`is_strong_signal`). Both in `src/search/hybrid.rs`.
 
 ## Release
@@ -139,7 +154,9 @@ release.flow: rust-ci
 - Resolve changelog commit URLs with `git rev-parse HEAD`; never manually expand an abbreviated hash
 - If `git push origin main` is rejected as non-fast-forward, do not push the release tag. Fetch and inspect `origin/main`, rebase clean unpushed release commits, rerun affected checks, update rebased changelog hashes, and recreate the local tag before retrying
 
-`.github/workflows/release.yml` is the release source of truth. A pushed `v*` tag runs checks, builds release artifacts, creates the GitHub release, updates the Homebrew tap, and publishes `ir-search` to crates.io. Do not also run `cargo publish`, `gh release create`, or update the tap manually.
+`.github/workflows/ci-evaluation.yml` ("CI - evaluation") runs the `#[ignore]`d model, daemon and network tests and the full `scripts/preship.sh` on CPU runners (Linux arm64 and macOS). It runs nightly and from the Actions tab (`workflow_dispatch`). It is not part of `release.yml`: run it on `main` and wait for it to pass before tagging.
+
+`.github/workflows/release.yml` is the release source of truth. A pushed `v*` tag runs checks, builds release artifacts, creates the GitHub release, updates the Homebrew tap, and publishes `ir-search` to crates.io. The tag must equal `v` + the Cargo.toml version, or the check job fails. A tag with a `-` (e.g. `v0.19.0-rc.1`, Cargo.toml `0.19.0-rc.1`) is a release candidate: it builds the artifacts and creates a GitHub prerelease with the Unreleased notes, and skips the Homebrew tap and crates.io. Do not finalize CHANGELOG for an rc. Do not also run `cargo publish`, `gh release create`, or update the tap manually.
 
 ```bash
 # Bump version
@@ -165,9 +182,10 @@ CI handles: build, GitHub release, Homebrew tap update, and crates.io publish.
 - README.md + README.ko.md + README.zh.md must all be updated for any user-facing feature (CLI flags, env vars, output formats)
 - CHANGELOG.md Unreleased section must cover: new CLI flags, env var renames/deprecations, breaking behavior changes
 - Enum variants in types.rs must be wired to a CLI flag or MCP field — check with `rg 'Variant::' src/ | grep -v test`
-- Preprocessor protocol tests must use `cat` only — `rev` uses full stdio buffering in pipe mode on macOS and deadlocks. `tr`, `sed`, `sort` also buffer.
+- MCP parity: a warning the user should act on goes into `UpdateStats.notes` (`index::update`) or the `notes` of `search_core`, never straight to stderr from those paths. The CLI prints them; MCP returns them (`update` field `notes`, `search` second text block). `tests/e2e_mcp.rs` compares both.
+- Prefer degrading over failing: a preprocessor that fails to start or exits must not fail `ir update`. The document is indexed with raw text, listed in `fts_raw`, and stored again by the next update; it is never committed without an FTS row. `tests/e2e_index.rs` covers both. Preprocessor protocol tests must use `cat` only — `rev` uses full stdio buffering in pipe mode on macOS and deadlocks. `tr`, `sed`, `sort` also buffer.
 - IR_COMBINED_MODEL is the canonical combined-model env var; IR_QWEN_MODEL is a deprecated alias — do not promote the alias in new docs
-- src/search/filter.rs must have unit tests for eval_clause + match_op — these are pure functions with no DB dependency; easy to test, and zero coverage is a gap [resolved v0.10.0: 9 tests added]
+- src/search/filter.rs eval_clause + match_op have in-crate tests (added v0.10.0); new filter coverage goes through `ir search -f` scenarios in `tests/` (see Testing)
 - FilterOp::Ne on multi-valued fields uses any-match semantics (same as all ops): `meta.tags!=rust` passes if ANY tag != "rust"; document this in README filter table, not just code comments [resolved v0.10.0: documented in both READMEs and tested]
 - items_after_test_module: in Rust files, keep non-test items (impl fns, helper fns) BEFORE any #[cfg(test)] mod block — clippy::items_after_test_module will fail the build
 - build_query_natural in db/fts.rs is used for all production BM25 queries; uses OR + stop word stripping for natural-language queries, AND for short keyword queries
@@ -176,7 +194,7 @@ CI handles: build, GitHub release, Homebrew tap update, and crates.io publish.
 - `cargo test` does not guarantee `target/debug/ir` is refreshed; run `cargo build --bin ir` before CLI smoke tests
 - warn_stale_preprocessor() in src/main.rs is a migration shim for ≤0.9.x users — removed at v0.13.0
 - Research-only env vars (IR_BENCH_SIGNALS, IR_DISABLE_SHORTCUTS, IR_FORCE_TIER1_ONLY, IR_STRONG_SIGNAL_*_OVERRIDE, IR_BM25_STRONG_*_OVERRIDE, IR_ALLOW_EXPANSION_WITHOUT_SCORER) must NOT appear in README; CHANGELOG may name them only under "Dev / Benchmark Tooling"; document in CLAUDE.md env table
-- preprocess.rs sentinel protocol (IRSENTINEL): process_line() sends content line + IRSENTINEL, reads until IRSENTINEL — prevents pipe deadlock when lindera emits no stdout for all-filtered lines (e.g. punctuation-only). Custom preprocessors must pass ASCII-only single-word lines through unchanged. When any preprocessor command changes (new binary, flags, or external tool replacing custom code): run probe `printf '.\n안녕하세요\ntest\n' | <new_command> 2>/dev/null | wc -l` — must equal 3, or WARN and confirm sentinel covers the 0-output case. Test suite must include at least one test where process_line() is called with a line the subprocess drops.
+- preprocess.rs sentinel protocol (IRSENTINEL): process_line() sends content line + IRSENTINEL, reads until IRSENTINEL — prevents pipe deadlock when lindera emits no stdout for all-filtered lines (e.g. punctuation-only). Custom preprocessors must pass ASCII-only single-word lines through unchanged. When any preprocessor command changes (new binary, flags, or external tool replacing custom code): run probe `printf '.\n안녕하세요\ntest\n' | <new_command> 2>/dev/null | wc -l` — must equal 3, or WARN and confirm sentinel covers the 0-output case. `tests/e2e_index.rs` must keep a scenario where the preprocessor drops a line (`preprocessor_that_drops_a_line_does_not_stall_the_update`).
 - IR_DIR is set internally at startup (= resolved ir_dir() value); appears in preprocessor commands as $IR_DIR/preprocessors/... for portability — do not expose in user-facing docs
 - All path env vars (IR_CONFIG_DIR, IR_MODEL_DIRS, IR_*_MODEL) support ~ and $VAR expansion via expand_path() in src/config/mod.rs — tests for this must use ENV_LOCK mutex to prevent parallel env var interference
 - scripts/preship.sh must pass (exit 0 or 2) before any signal-sweep run or release; run `--bm25-only` for fast CI gate, full for pre-release

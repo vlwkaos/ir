@@ -7,6 +7,7 @@ mod frontmatter;
 mod get;
 mod index;
 mod llm;
+mod lock;
 mod mcp;
 mod preprocess;
 mod search;
@@ -225,6 +226,10 @@ fn handle_multi_get(
 }
 
 fn handle_collection(cmd: CollectionCmd) -> Result<()> {
+    let _edit = match cmd {
+        CollectionCmd::Ls => None,
+        _ => Some(Config::lock_for_edit()?),
+    };
     let mut config = Config::load()?;
     match cmd {
         CollectionCmd::Add {
@@ -265,9 +270,19 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
             config.remove_collection(&name)?;
             config.save()?;
             if purge {
-                let db_path = collection_db_path(&name);
-                if db_path.exists() {
-                    std::fs::remove_file(&db_path)?;
+                let had_db = collection_db_path(&name).exists();
+                // ^ A WAL or ANN sidecar left behind would be picked up by a
+                //   later collection of the same name.
+                for file in config::collection_index_files(&name) {
+                    match std::fs::remove_file(&file) {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                            eprintln!("warning: could not delete {}: {e}", file.display())
+                        }
+                        _ => {}
+                    }
+                }
+                let _ = std::fs::remove_file(config::collection_embed_lock_path(&name));
+                if had_db {
                     println!("removed collection '{name}' and deleted database");
                 } else {
                     println!("removed collection '{name}'");
@@ -278,7 +293,34 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
         }
         CollectionCmd::Rename { old, new } => {
             config.rename_collection(&old, &new)?;
-            config.save()?;
+            // ^ The index is stored under the collection name. Move it, or the
+            //   renamed collection is empty and the old index is orphaned.
+            let moves: Vec<_> = config::collection_index_files(&old)
+                .into_iter()
+                .zip(config::collection_index_files(&new))
+                .filter(|(from, _)| from.exists())
+                .collect();
+            if let Some((_, taken)) = moves.iter().find(|(_, to)| to.exists()) {
+                return Err(error::Error::Other(format!(
+                    "cannot rename: {} already exists (left by a removed collection?)",
+                    taken.display()
+                )));
+            }
+            for (done, (from, to)) in moves.iter().enumerate() {
+                if let Err(e) = std::fs::rename(from, to) {
+                    // ^ Put moved files back so the old name keeps its whole index.
+                    for (from, to) in &moves[..done] {
+                        let _ = std::fs::rename(to, from);
+                    }
+                    return Err(e.into());
+                }
+            }
+            if let Err(e) = config.save() {
+                for (from, to) in &moves {
+                    let _ = std::fs::rename(to, from);
+                }
+                return Err(e);
+            }
             println!("renamed '{old}' → '{new}'");
         }
         CollectionCmd::SetPath { name, path } => {
@@ -333,7 +375,14 @@ fn handle_update(collection: Option<String>, force: bool) -> Result<()> {
     let cols = index_collections(&config, collection.as_deref())?;
 
     for col in cols {
-        update_collection(&config, col, force)?;
+        // ^ update never embeds; say so, because a forced update also drops stored vectors.
+        let (_, stats) = update_collection(&config, col, force)?;
+        let pending = stats.pending_embeddings;
+        if pending == 0 {
+            println!("  0 pending embedding");
+        } else {
+            println!("  {pending} pending embedding (run `ir embed` or `ir sync`)");
+        }
     }
     Ok(())
 }
@@ -342,19 +391,19 @@ fn update_collection(
     config: &Config,
     collection: &Collection,
     force: bool,
-) -> Result<db::CollectionDb> {
-    let db_path = collection_db_path(&collection.name);
-    let pp_aliases = collection.preprocessor.as_deref().unwrap_or(&[]);
-    let has_preprocessor = !config.resolve_preprocessor_commands(pp_aliases).is_empty();
-    let db = db::CollectionDb::open(&collection.name, &db_path, has_preprocessor)?;
-    println!("updating '{}'…", collection.name);
+) -> Result<(db::CollectionDb, index::UpdateStats)> {
+    let db = db::CollectionDb::open_for_index(config, collection)?;
+    println!("updating '{}' ({})…", collection.name, collection.path);
     let opts = index::UpdateOptions { force };
-    let (added, updated, deactivated) = index::update(&db, collection, &opts, config)?;
+    let stats = index::update(&db, collection, &opts, config)?;
     println!(
-        "  {} added, {} updated, {} deactivated",
-        added, updated, deactivated
+        "  {} scanned: {} added, {} updated, {} deactivated",
+        stats.scanned, stats.added, stats.updated, stats.deactivated
     );
-    Ok(db)
+    for note in &stats.notes {
+        eprintln!("warning: {note}");
+    }
+    Ok((db, stats))
 }
 
 fn index_collections<'a>(
@@ -373,6 +422,10 @@ fn index_collections<'a>(
 /// Search core: runs the tier-0/1/2 pipeline and returns ranked results.
 /// Used by both `ir search` and `ir mcp`. Does not print to stdout.
 /// `verbosity` controls stderr output -- see `types::Verbosity`.
+/// `notes` receives what the user should know about how the query was answered
+/// (a skipped collection, BM25 only, a preprocessor that could not run); the
+/// CLI prints them, MCP returns them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn search_core(
     query: &str,
     mode: &str,
@@ -381,11 +434,29 @@ pub(crate) fn search_core(
     collection_filter: &[String],
     verbosity: types::Verbosity,
     filter: types::Filter,
+    notes: &mut Vec<String>,
 ) -> Result<Vec<types::SearchResult>> {
     let config = Config::load()?;
-    let collection_names = resolve_collections(&config, collection_filter)?;
+    let mut collection_names = resolve_collections(&config, collection_filter)?;
     let search_mode: SearchMode = mode.parse().map_err(error::Error::Other)?;
-    let daemon_was_running = daemon::is_running();
+    // ^ A registered collection that was never indexed has no DB file. Skip it
+    //   instead of failing the search of every other collection.
+    collection_names.retain(|name| {
+        let indexed = collection_db_path(name).exists();
+        if !indexed {
+            notes.push(format!(
+                "collection '{name}' is not indexed — run `ir update {name}`"
+            ));
+        }
+        indexed
+    });
+    if collection_names.is_empty() {
+        return Ok(vec![]);
+    }
+    // ^ BM25 needs no model: such a search never starts or contacts the daemon.
+    //   A daemon left over from before an upgrade counts as not running; the
+    //   warmup below replaces it and this query is answered like a cold start.
+    let daemon_was_running = search_mode == SearchMode::Bm25 || daemon::is_current();
     let daemon_warmup_error = if daemon_was_running {
         None
     } else {
@@ -399,17 +470,7 @@ pub(crate) fn search_core(
         .collect();
     let dbs: Vec<db::CollectionDb> = cols
         .iter()
-        .map(|c| {
-            let pp_aliases = c.preprocessor.as_deref().unwrap_or(&[]);
-            let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
-            db::CollectionDb::open_rw(
-                &c.name,
-                &collection_db_path(&c.name),
-                pp_commands,
-                c.routing.clone(),
-                c.retrieval.clone(),
-            )
-        })
+        .map(|c| db::CollectionDb::open_for_search(&config, c))
         .collect::<Result<Vec<_>>>()?;
 
     // Tier-0: BM25 with over-fetch when filter is active
@@ -425,6 +486,15 @@ pub(crate) fn search_core(
         min_score: None, // ^ applied after tier-0 filter below
     };
     let mut bm25_results = search::fan_out::bm25(&dbs, &bm25_req)?;
+    for db in &dbs {
+        if let Some(e) = db.query_preprocessor_error() {
+            notes.push(format!(
+                "the preprocessor of collection '{}' could not start, so the query was \
+                 matched as raw text: {e}",
+                db.name
+            ));
+        }
+    }
 
     // Tier-0 kNN-graph expansion of BM25 seeds (profile.t0_graph_expand;
     // config > env > default). Runs before the tier-0 filter so injected docs
@@ -489,28 +559,23 @@ pub(crate) fn search_core(
     }
 
     if daemon_warmup_started && !bm25_results.is_empty() {
-        if verbosity.show_progress() {
-            eprintln!("note: daemon warming in background — returning BM25 for this query");
-        }
+        notes.push("daemon warming in background — returning BM25 for this query".to_string());
         return Ok(bm25_results);
     }
 
     if !daemon::is_running() {
         if let Err(e) = daemon::start_in_background() {
-            if verbosity.show_progress() {
-                eprintln!("note: could not start daemon ({e})");
-                if bm25_results.is_empty() {
-                    eprintln!(
-                        "note: BM25 also found nothing — run `ir embed <collection>` to enable vector search"
-                    );
-                }
+            notes.push(format!("could not start daemon ({e})"));
+            if bm25_results.is_empty() {
+                notes.push(
+                    "BM25 also found nothing — run `ir embed <collection>` to enable vector search"
+                        .to_string(),
+                );
             }
             return Ok(bm25_results);
         }
-    } else if let Some(err) = daemon_warmup_error
-        && verbosity.show_progress()
-    {
-        eprintln!("note: background daemon warmup failed ({err})");
+    } else if let Some(err) = daemon_warmup_error {
+        notes.push(format!("background daemon warmup failed ({err})"));
     }
 
     let req = daemon::DaemonRequest {
@@ -547,11 +612,12 @@ pub(crate) fn search_core(
     if !daemon::wait_ready(wait_ms) {
         if verbosity.show_progress() {
             eprintln!();
-            if bm25_results.is_empty() {
-                eprintln!(
-                    "note: BM25 found no results and daemon not ready — try `ir embed <collection>` or check model paths"
-                );
-            }
+        }
+        if bm25_results.is_empty() {
+            notes.push(
+                "BM25 found no results and daemon not ready — try `ir embed <collection>` or check model paths"
+                    .to_string(),
+            );
         }
         return Ok(bm25_results);
     }
@@ -562,10 +628,11 @@ pub(crate) fn search_core(
         Ok(r) => r,
         Err(e) => {
             if verbosity.show_progress() {
-                eprintln!("\nnote: daemon query error: {e}");
-                if bm25_results.is_empty() {
-                    eprintln!("note: BM25 also found nothing — check collection embeddings");
-                }
+                eprintln!();
+            }
+            notes.push(format!("daemon query error: {e}"));
+            if bm25_results.is_empty() {
+                notes.push("BM25 also found nothing — check collection embeddings".to_string());
             }
             return Ok(bm25_results);
         }
@@ -654,6 +721,7 @@ fn handle_search(
         output::Format::Pretty
     };
 
+    let mut notes = Vec::new();
     let mut results = search_core(
         &query,
         &mode,
@@ -662,32 +730,16 @@ fn handle_search(
         &collection_filter,
         verbosity,
         filter,
+        &mut notes,
     )?;
+    if verbosity.show_progress() {
+        for note in &notes {
+            eprintln!("note: {note}");
+        }
+    }
 
     if full {
-        let config = Config::load()?;
-        let cols: Vec<_> = results
-            .iter()
-            .map(|r| r.collection.as_str())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .filter_map(|name| config.get_collection(name))
-            .collect();
-        let dbs: Vec<db::CollectionDb> = cols
-            .iter()
-            .map(|c| {
-                let pp_aliases = c.preprocessor.as_deref().unwrap_or(&[]);
-                let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
-                db::CollectionDb::open_rw(
-                    &c.name,
-                    &collection_db_path(&c.name),
-                    pp_commands,
-                    c.routing.clone(),
-                    c.retrieval.clone(),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        fill_content(&mut results, &dbs);
+        fill_content(&mut results)?;
     } else if chunk {
         get::populate_chunk_content(&mut results)?;
     }
@@ -717,7 +769,18 @@ fn to_search_results(daemon_results: Vec<daemon::DaemonResult>) -> Vec<types::Se
         .collect()
 }
 
-pub(crate) fn fill_content(results: &mut [types::SearchResult], dbs: &[db::CollectionDb]) {
+/// Attach full document text to each result. Used by `ir search --full` and
+/// the MCP `search` tool.
+pub(crate) fn fill_content(results: &mut [types::SearchResult]) -> Result<()> {
+    let config = Config::load()?;
+    let dbs: Vec<db::CollectionDb> = results
+        .iter()
+        .map(|r| r.collection.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .filter_map(|name| config.get_collection(name))
+        .map(|c| db::CollectionDb::open_for_search(&config, c))
+        .collect::<Result<Vec<_>>>()?;
     let db_map: std::collections::HashMap<&str, &db::CollectionDb> =
         dbs.iter().map(|d| (d.name.as_str(), d)).collect();
 
@@ -748,6 +811,7 @@ pub(crate) fn fill_content(results: &mut [types::SearchResult], dbs: &[db::Colle
     for r in results.iter_mut() {
         r.content = content_cache.get(&r.hash).cloned();
     }
+    Ok(())
 }
 
 fn resolve_collections(config: &Config, filter: &[String]) -> Result<Vec<String>> {
@@ -775,6 +839,10 @@ fn resolve_collections(config: &Config, filter: &[String]) -> Result<Vec<String>
 }
 
 fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
+    let _edit = match cmd {
+        PreprocessorCmd::List => None,
+        _ => Some(Config::lock_for_edit()?),
+    };
     let mut config = Config::load()?;
     match cmd {
         PreprocessorCmd::Add { alias, command } => {
@@ -835,21 +903,7 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
                 None => pick_collections_for_bind(&config, &alias)?,
             };
             for name in targets {
-                let col = config
-                    .collections
-                    .iter_mut()
-                    .find(|c| c.name == name)
-                    .ok_or_else(|| error::Error::Other(format!("collection '{name}' not found")))?;
-                let pp = col.preprocessor.get_or_insert_with(Vec::new);
-                if !pp.contains(&alias) {
-                    pp.push(alias.clone());
-                }
-                apply_bind_defaults(col, &alias);
-                config.save()?;
-                println!("bound '{alias}' to '{name}', re-indexing…");
-                if let Err(e) = handle_update(Some(name.clone()), false) {
-                    eprintln!("warning: re-index failed for '{name}': {e}");
-                }
+                bind_and_reindex(&mut config, &alias, &name)?;
             }
         }
         PreprocessorCmd::Unbind { alias, collection } => {
@@ -890,6 +944,28 @@ fn handle_preprocessor(cmd: PreprocessorCmd) -> Result<()> {
             }
             println!("removed preprocessor '{alias}'");
         }
+    }
+    Ok(())
+}
+
+/// Bind `alias` to a collection, save, then re-index it with the new chain.
+/// ^ Save first: `handle_update` reads config.yml from disk, so an unsaved
+///   binding would re-index without the preprocessor.
+fn bind_and_reindex(config: &mut Config, alias: &str, name: &str) -> Result<()> {
+    let col = config
+        .collections
+        .iter_mut()
+        .find(|c| c.name == name)
+        .ok_or_else(|| error::Error::Other(format!("collection '{name}' not found")))?;
+    let pp = col.preprocessor.get_or_insert_with(Vec::new);
+    if !pp.iter().any(|a| a == alias) {
+        pp.push(alias.to_string());
+    }
+    apply_bind_defaults(col, alias);
+    config.save()?;
+    println!("bound '{alias}' to '{name}', re-indexing…");
+    if let Err(e) = handle_update(Some(name.to_string()), false) {
+        eprintln!("warning: re-index failed for '{name}': {e}");
     }
     Ok(())
 }
@@ -1019,24 +1095,16 @@ fn install_preprocessor(config: &mut Config, lang: &str) -> Result<()> {
 
     if !config.collections.is_empty() {
         println!();
+        // ^ The install is saved; a script or agent without a terminal must not
+        //   see it fail on the optional bind prompt.
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            println!("bind it with: ir preprocessor bind {alias} <collection>");
+            return Ok(());
+        }
         let targets = pick_collections_for_bind(config, alias)?;
         for name in targets {
-            let col = config
-                .collections
-                .iter_mut()
-                .find(|c| c.name == name)
-                .unwrap();
-            let pp = col.preprocessor.get_or_insert_with(Vec::new);
-            if !pp.contains(&alias.to_string()) {
-                pp.push(alias.to_string());
-            }
-            apply_bind_defaults(col, alias);
-            println!("bound '{alias}' to '{name}', re-indexing…");
-            if let Err(e) = handle_update(Some(name.clone()), false) {
-                eprintln!("warning: re-index failed for '{name}': {e}");
-            }
+            bind_and_reindex(config, alias, &name)?;
         }
-        config.save()?;
     }
 
     Ok(())
@@ -1171,35 +1239,35 @@ fn handle_sync_phases(
     let mut pending = Vec::with_capacity(cols.len());
 
     for col in &cols {
-        let db = update_collection(&config, col, force_update)?;
+        let (db, _) = update_collection(&config, col, force_update)?;
+        // ^ One embedding process per collection. A second `ir sync` waits here
+        //   and then finds nothing pending, instead of loading the model and
+        //   embedding the same documents again. Held until the collection is done.
+        let lock = lock::exclusive_or_wait(
+            &config::collection_embed_lock_path(&col.name),
+            &format!("another ir process that is embedding '{}'", col.name),
+        )?;
         let count = index::embed::pending_count(db.conn(), force_embed)?;
-        pending.push((db, count));
+        pending.push((db, count, lock));
     }
 
-    if pending.iter().all(|(_, count)| *count == 0) {
-        for (db, _) in pending {
-            println!("embedding '{}'…", db.name);
-            println!("  0 documents, 0 chunks embedded");
-            maybe_build_graph(&db)?;
-            maybe_sync_ann(&db)?;
-        }
-        return Ok(());
-    }
+    let embedder = if pending.iter().any(|(_, count, _)| *count > 0) {
+        llm::download::prepare_model_envs()?;
+        println!("loading embedding model…");
+        Some(llm::embedding::Embedder::load_default()?)
+    } else {
+        None
+    };
 
-    llm::download::prepare_model_envs()?;
-    println!("loading embedding model…");
-    let embedder = llm::embedding::Embedder::load_default()?;
-
-    for (db, count) in pending {
+    for (db, count, _lock) in pending {
         println!("embedding '{}'…", db.name);
-        if count == 0 {
-            println!("  0 documents, 0 chunks embedded");
-            maybe_build_graph(&db)?;
-            maybe_sync_ann(&db)?;
-            continue;
-        }
-        let opts = index::embed::EmbedOptions { force: force_embed };
-        let (docs, chunks) = index::embed::embed(&db, &embedder, &opts, llm::models::EMBEDDING)?;
+        let (docs, chunks) = match &embedder {
+            Some(embedder) if count > 0 => {
+                let opts = index::embed::EmbedOptions { force: force_embed };
+                index::embed::embed(&db, embedder, &opts, llm::models::EMBEDDING)?
+            }
+            _ => (0, 0),
+        };
         println!("  {} documents, {} chunks embedded", docs, chunks);
         maybe_build_graph(&db)?;
         maybe_sync_ann(&db)?;
@@ -1246,44 +1314,4 @@ fn maybe_sync_ann(db: &db::CollectionDb) -> Result<()> {
         println!("  ann index: {total} vectors ({added} added)");
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_collection() -> Collection {
-        Collection {
-            name: "c".into(),
-            path: "/tmp".into(),
-            globs: vec![],
-            excludes: vec![],
-            description: None,
-            preprocessor: None,
-            routing: None,
-            retrieval: None,
-        }
-    }
-
-    #[test]
-    fn ko_bind_applies_default_routing() {
-        let mut col = test_collection();
-        apply_bind_defaults(&mut col, "ko");
-        assert_eq!(col.routing, Some(ko_default_routing()));
-    }
-
-    #[test]
-    fn non_ko_bind_leaves_routing_untouched() {
-        let mut col = test_collection();
-        apply_bind_defaults(&mut col, "ja");
-        assert_eq!(col.routing, None);
-    }
-
-    #[test]
-    fn ko_unbind_clears_only_auto_default() {
-        let mut col = test_collection();
-        col.routing = Some(ko_default_routing());
-        clear_bind_defaults_if_auto(&mut col, "ko");
-        assert_eq!(col.routing, None);
-    }
 }

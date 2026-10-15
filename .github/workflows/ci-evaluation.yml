@@ -1,0 +1,93 @@
+name: CI - evaluation
+
+# Checks too slow or too heavy for every push: real models (CPU), the real
+# daemon, network installs, and the preship regression gate. They run nightly
+# and on demand. Not part of release.yml: run this on main before tagging.
+# Models download from Hugging Face on first use; runners have no GPU.
+
+on:
+  schedule:
+    - cron: '17 18 * * *' # daily, 03:17 KST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-evaluation-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  models:
+    name: Models and daemon (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            features: --no-default-features --features llama-openmp
+            preship: true
+          # ^ macOS has its own install and upgrade paths (clonefile, symlinked
+          #   executables), which the daemon scenarios cover.
+          - os: macos-14
+            features: ''
+            preship: false
+    env:
+      IR_FORCE_CPU_BACKEND: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ci-evaluation
+
+      - name: Build
+        run: |
+          cargo build --release --bin ir ${{ matrix.features }}
+          cargo build --bin ir ${{ matrix.features }}
+          cargo test --no-run ${{ matrix.features }}
+
+      - name: Download models
+        # ^ One real sync and search, so the scenarios below do not spend their
+        #   startup timeouts on downloads.
+        run: |
+          set -euo pipefail
+          IR=target/release/ir
+          export IR_CONFIG_DIR="$RUNNER_TEMP/warmup"
+          mkdir -p "$RUNNER_TEMP/warmup-docs"
+          printf '# Warmup\n\nload the models once\n' > "$RUNNER_TEMP/warmup-docs/a.md"
+          $IR collection add warmup "$RUNNER_TEMP/warmup-docs"
+          $IR sync warmup
+          IR_DISABLE_SHORTCUTS=1 $IR search -c warmup "model warmup"
+          for _ in $(seq 1 90); do
+            status=$($IR daemon status)
+            case "$status" in *"tier-2 ready"*|*"tier-2 unavailable"*) break ;; esac
+            sleep 10
+          done
+          echo "$status"
+          cat "$IR_CONFIG_DIR/daemon.log" || true
+          $IR daemon stop
+
+      - name: Install preprocessors
+        run: |
+          target/release/ir preprocessor install ko
+          target/release/ir preprocessor install zh
+
+      - name: Model and network tests
+        run: cargo test ${{ matrix.features }} --lib --bins --test e2e_ops -- --ignored
+
+      - name: Daemon scenarios
+        # ^ One at a time: each starts its own daemon, and one compares timings.
+        run: cargo test ${{ matrix.features }} --test e2e_daemon -- --ignored --test-threads=1
+
+      - name: Preship
+        if: matrix.preship
+        # ^ Exit 2 is drift warnings only; AGENTS.md accepts 0 or 2.
+        run: bash scripts/preship.sh || [ $? -eq 2 ]

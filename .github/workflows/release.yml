@@ -1,4 +1,4 @@
-name: Release
+name: CD - release
 
 on:
   push:
@@ -23,6 +23,18 @@ jobs:
         with:
           tool: cargo-shear
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # ^ The binary reports Cargo.toml's version, and the daemon upgrade rule
+      #   compares it, so a tag that disagrees would ship a mislabeled build.
+      - name: Tag matches Cargo.toml
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          CRATE=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          if [ "${TAG#v}" != "$CRATE" ]; then
+            echo "tag $TAG does not match Cargo.toml version $CRATE" >&2
+            exit 1
+          fi
 
       - name: Build
         run: cargo build --no-default-features --features llama-openmp
@@ -177,10 +189,23 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           VERSION=${TAG#v}
-          awk "/^## \[$VERSION\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md > release-notes.md
-          gh release create "$TAG" --notes-file release-notes.md *.tar.gz SHA256SUMS
+          case "$TAG" in
+            *-*)
+              # ^ Release candidate: notes come from Unreleased, and a
+              #   prerelease is never "latest", so nothing installs it by default.
+              awk '/^## \[Unreleased\]/{found=1; next} found && /^## \[/{exit} found{print}' CHANGELOG.md > release-notes.md
+              gh release create "$TAG" --prerelease --notes-file release-notes.md *.tar.gz SHA256SUMS
+              ;;
+            *)
+              awk "/^## \[$VERSION\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md > release-notes.md
+              gh release create "$TAG" --notes-file release-notes.md *.tar.gz SHA256SUMS
+              ;;
+          esac
 
+      # ^ Release candidates (tags with a "-", e.g. v0.19.0-rc.1) stop here:
+      #   no Homebrew tap update and no crates.io publish.
       - name: Update Homebrew tap
+        if: ${{ !contains(github.ref_name, '-') }}
         env:
           GH_TOKEN: ${{ secrets.TAP_TOKEN }}
           TAG: ${{ github.ref_name }}
@@ -228,6 +253,7 @@ jobs:
   publish:
     name: Publish to crates.io
     needs: [release]
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

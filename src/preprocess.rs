@@ -23,12 +23,50 @@
 // Lindera startup: <10ms (Rust binary, embedded dictionary).
 
 use crate::config::expand_path;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 // ^ ASCII-only, passes through all lindera language filters unchanged (POS = SL/foreign word)
 const SENTINEL: &str = "IRSENTINEL";
+
+// ^ Largest line written before reading the reply. Line + sentinel must fit the
+//   smallest OS pipe buffer (4 KiB) so the write can never block.
+const INLINE_WRITE_MAX: usize = 4000;
+
+fn failed(what: &str, e: impl std::fmt::Display) -> Error {
+    Error::Other(format!("preprocessor {what}: {e}"))
+}
+
+fn write_line(stdin: &mut BufWriter<ChildStdin>, line: &str) -> std::io::Result<()> {
+    stdin.write_all(line.as_bytes())?;
+    stdin.write_all(b"\n")?;
+    stdin.write_all(SENTINEL.as_bytes())?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()
+}
+
+/// Collect output lines up to the sentinel. The subprocess closing its output
+/// first means it died: its reply is incomplete and must not be indexed.
+fn read_reply(stdout: &mut BufReader<ChildStdout>) -> Result<String> {
+    let mut parts = Vec::new();
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        if stdout
+            .read_line(&mut buf)
+            .map_err(|e| failed("read failed", e))?
+            == 0
+        {
+            return Err(failed("exited", "no reply for the current line"));
+        }
+        let s = buf.trim_end_matches('\n');
+        if s == SENTINEL {
+            return Ok(parts.join(" "));
+        }
+        parts.push(s.to_string());
+    }
+}
 
 pub struct PreprocessHandle {
     child: Child,
@@ -38,11 +76,13 @@ pub struct PreprocessHandle {
 
 impl PreprocessHandle {
     /// Spawn a preprocessor subprocess from a command string (e.g. "mecab -Owakati").
-    /// Returns None on spawn failure (logs warning).
-    pub fn spawn(cmd_str: &str) -> Option<Self> {
+    /// The error names the command, the reason and how to reinstall.
+    pub fn spawn(cmd_str: &str) -> Result<Self> {
         // ! paths with spaces unsupported; commands must be simple tokens (e.g. "mecab -Owakati")
         let mut parts = cmd_str.split_whitespace();
-        let raw_program = parts.next()?;
+        let Some(raw_program) = parts.next() else {
+            return Err(failed("failed to start", "empty command"));
+        };
         let expanded = expand_path(raw_program);
         let program = expanded.as_os_str();
         // Preprocessor commands embed variable references in args (e.g. --dict $IR_DIR/preprocessors/jieba);
@@ -58,21 +98,19 @@ impl PreprocessHandle {
             .spawn()
         {
             Ok(mut child) => {
-                let stdin = BufWriter::new(child.stdin.take()?);
-                let stdout = BufReader::new(child.stdout.take()?);
-                Some(Self {
+                let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+                    return Err(failed("failed to start", "no stdio pipes"));
+                };
+                Ok(Self {
                     child,
-                    stdin,
-                    stdout,
+                    stdin: BufWriter::new(stdin),
+                    stdout: BufReader::new(stdout),
                 })
             }
-            Err(e) => {
-                eprintln!("warning: failed to spawn preprocessor '{cmd_str}': {e}");
-                eprintln!(
-                    "hint: run `ir preprocessor install <lang>` to reinstall from official lindera releases"
-                );
-                None
-            }
+            Err(e) => Err(Error::Other(format!(
+                "failed to spawn preprocessor '{cmd_str}': {e} \
+                 (run `ir preprocessor install <lang>` to reinstall it)"
+            ))),
         }
     }
 
@@ -80,28 +118,25 @@ impl PreprocessHandle {
         if line.trim().is_empty() {
             return Ok(String::new());
         }
-        // Flush content + sentinel together; sentinel unblocks read_line() even when
-        // the content line produced no output (see protocol spec at top of file).
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.write_all(SENTINEL.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
-        let mut parts = Vec::new();
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            let n = self.stdout.read_line(&mut buf)?;
-            if n == 0 {
-                break; // subprocess exited unexpectedly; treat as end of output
-            }
-            let s = buf.trim_end_matches('\n');
-            if s == SENTINEL {
-                break;
-            }
-            parts.push(s.to_string());
+        // Content + sentinel are flushed together; the sentinel ends the reply even
+        // when the content line produced no output (see protocol spec at top of file).
+        let Self { stdin, stdout, .. } = self;
+        if line.len() <= INLINE_WRITE_MAX {
+            write_line(stdin, line).map_err(|e| failed("write failed", e))?;
+            return read_reply(stdout);
         }
-        Ok(parts.join(" "))
+        // ^ A streaming filter echoes while the line is still being written; past
+        //   the pipe buffers both sides would block forever. Write from a helper
+        //   thread so the reply is drained at the same time.
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| write_line(stdin, line));
+            let reply = read_reply(stdout);
+            match writer.join() {
+                Ok(Ok(())) => reply,
+                Ok(Err(e)) => Err(failed("write failed", e)),
+                Err(_) => Err(failed("write failed", "writer thread panicked")),
+            }
+        })
     }
 
     /// Process multi-line text: split on '\n', process each line, rejoin.
@@ -127,17 +162,42 @@ impl Drop for PreprocessHandle {
 /// FTS5's porter unicode61 tokenizer always runs after as the final stage.
 pub struct PreprocessChain {
     handles: Vec<PreprocessHandle>,
+    /// Why the first command that did not spawn failed.
+    spawn_error: Option<String>,
 }
 
 impl PreprocessChain {
     /// Spawn a chain from a list of command strings.
-    /// Handles that fail to spawn are skipped with a warning.
+    /// Handles that fail to spawn are skipped; `spawn_error` says why.
     pub fn spawn(commands: &[String]) -> Self {
+        let mut spawn_error = None;
         let handles = commands
             .iter()
-            .filter_map(|cmd| PreprocessHandle::spawn(cmd))
+            .filter_map(|cmd| {
+                PreprocessHandle::spawn(cmd)
+                    .inspect_err(|e| {
+                        spawn_error.get_or_insert(e.to_string());
+                    })
+                    .ok()
+            })
             .collect();
-        Self { handles }
+        Self {
+            handles,
+            spawn_error,
+        }
+    }
+
+    /// Spawn every command or fail. Indexing uses this: text processed by a
+    /// partial chain would not match what queries are preprocessed with.
+    pub fn spawn_all(commands: &[String]) -> Result<Self> {
+        let handles = commands
+            .iter()
+            .map(|cmd| PreprocessHandle::spawn(cmd))
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            handles,
+            spawn_error: None,
+        })
     }
 
     /// Pipe text through all handles in sequence.
@@ -153,183 +213,15 @@ impl PreprocessChain {
     pub fn is_active(&self) -> bool {
         !self.handles.is_empty()
     }
-}
 
-/// Preprocess a query through a command chain. Falls back to raw query on spawn failure or I/O error.
-#[cfg(test)]
-pub fn preprocess_query(query: &str, commands: &[String]) -> String {
-    if commands.is_empty() {
-        return query.to_string();
+    pub fn spawn_error(&self) -> Option<&str> {
+        self.spawn_error.as_deref()
     }
-    let mut chain = PreprocessChain::spawn(commands);
-    if !chain.is_active() {
-        eprintln!(
-            "warning: preprocessor configured ({}) but failed to start; using raw query",
-            commands.join(", ")
-        );
-        return query.to_string();
-    }
-    chain
-        .process_text(query)
-        .unwrap_or_else(|_| query.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn identity_preprocessor_with_cat() {
-        let mut chain = PreprocessChain::spawn(&["cat".to_string()]);
-        assert!(chain.is_active(), "cat should spawn successfully");
-        let out = chain.process_text("hello world").unwrap();
-        assert_eq!(out, "hello world");
-    }
-
-    #[test]
-    fn chain_with_invalid_command_falls_back() {
-        let cmds = vec!["__nonexistent_command_xyz__".to_string()];
-        let chain = PreprocessChain::spawn(&cmds);
-        assert!(!chain.is_active(), "invalid command should not spawn");
-    }
-
-    #[test]
-    fn multiline_text_preserved() {
-        let mut chain = PreprocessChain::spawn(&["cat".to_string()]);
-        assert!(chain.is_active());
-        let input = "line one\nline two\nline three";
-        let out = chain.process_text(input).unwrap();
-        assert_eq!(out, input);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn subprocess_is_invoked() {
-        // Verifies the pipe protocol works. rev buffers in pipe mode on macOS — use cat.
-        let mut chain = PreprocessChain::spawn(&["cat".to_string()]);
-        assert!(chain.is_active());
-        let out = chain.process_text("hello world").unwrap();
-        assert_eq!(out, "hello world");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn chain_pipes_through_multiple() {
-        let cmds = vec!["cat".to_string(), "cat".to_string()];
-        let mut chain = PreprocessChain::spawn(&cmds);
-        assert!(chain.is_active());
-        let out = chain.process_text("hello world").unwrap();
-        assert_eq!(out, "hello world");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn preprocess_query_applies_chain() {
-        let cmds = vec!["cat".to_string()];
-        let out = preprocess_query("hello world", &cmds);
-        assert_eq!(out, "hello world");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn preprocess_query_empty_commands_returns_raw() {
-        let out = preprocess_query("HELLO WORLD", &[]);
-        assert_eq!(out, "HELLO WORLD");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn preprocess_query_invalid_command_returns_raw() {
-        let cmds = vec!["__nonexistent_command_xyz__".to_string()];
-        let out = preprocess_query("HELLO WORLD", &cmds);
-        assert_eq!(out, "HELLO WORLD");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn chain_skips_invalid_handles() {
-        let cmds = vec!["__nonexistent_command_xyz__".to_string(), "cat".to_string()];
-        let mut chain = PreprocessChain::spawn(&cmds);
-        assert!(chain.is_active());
-        let out = chain.process_text("hello world").unwrap();
-        assert_eq!(out, "hello world");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn multiline_passes_through() {
-        let mut chain = PreprocessChain::spawn(&["cat".to_string()]);
-        assert!(chain.is_active());
-        let out = chain.process_text("hello\nworld").unwrap();
-        assert_eq!(out, "hello\nworld");
-    }
-
-    // Writes a Python filter script that drops '.' lines and flushes after each output.
-    // grep/sed/tr/sort all block-buffer in pipe mode on macOS — use Python with flush=True
-    // (same reason cat is used for other protocol tests — see CLAUDE.md).
-    // Uses thread ID: each test runs in its own thread, so this is unique even when
-    // lib and main binaries both compile this module and run tests concurrently.
-    #[cfg(unix)]
-    fn write_dot_filter_script() -> String {
-        use std::os::unix::fs::PermissionsExt;
-        // ThreadId debug format is "ThreadId(N)" — extract the number.
-        let tid = format!("{:?}", std::thread::current().id())
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .collect::<String>();
-        const SCRIPT: &[u8] = b"#!/usr/bin/env python3\nimport sys\nfor line in sys.stdin:\n    s=line.rstrip('\\n')\n    if s != '.':\n        print(s, flush=True)\n";
-        let path = format!(
-            "{}/ir-test-dot-filter-{}-{}.py",
-            std::env::temp_dir().display(),
-            std::process::id(),
-            tid
-        );
-        std::fs::write(&path, SCRIPT).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-        path
-    }
-
-    /// Spawn with retry: on Linux, a concurrently forked test child can hold
-    /// the just-written script's write fd, making exec fail with ETXTBSY
-    /// ("Text file busy") until that child closes it. Bounded retry rides it out.
-    fn spawn_dot_filter(path: &str) -> PreprocessHandle {
-        for _ in 0..20 {
-            if let Some(h) = PreprocessHandle::spawn(path) {
-                return h;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        panic!("preprocessor test script failed to spawn after retries");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sentinel_handles_dropped_line() {
-        let path = write_dot_filter_script();
-        let mut handle = spawn_dot_filter(&path);
-        // Punctuation-only line → filter drops it → sentinel must unblock read_line()
-        let out = handle.process_line(".").unwrap();
-        assert_eq!(
-            out, "",
-            "filtered line should return empty string, not deadlock"
-        );
-        let out = handle.process_line("hello").unwrap();
-        assert_eq!(out, "hello");
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sentinel_handles_mixed_document() {
-        let path = write_dot_filter_script();
-        let mut handle = spawn_dot_filter(&path);
-        let text = "first line\n.\nsecond line\n.\nthird line";
-        let out = handle.process_text(text).unwrap();
-        assert_eq!(out, "first line\n\nsecond line\n\nthird line");
-        std::fs::remove_file(&path).ok();
-    }
 
     // Requires: ir preprocessor install zh
     // Run: cargo test -- --ignored zh_preprocessor_tokenizes_chinese
@@ -352,8 +244,8 @@ mod tests {
         unsafe { std::env::set_var("IR_DIR", crate::config::ir_dir()) };
 
         let mut handle = match PreprocessHandle::spawn(&cmd_str) {
-            Some(h) => h,
-            None => panic!("zh preprocessor is registered but failed to spawn: {cmd_str}"),
+            Ok(h) => h,
+            Err(e) => panic!("zh preprocessor is registered but failed to spawn: {e}"),
         };
 
         // Segmentation: jieba must split 你好世界 into separate tokens

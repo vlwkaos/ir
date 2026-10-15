@@ -18,7 +18,6 @@ use crate::{
     db,
     get::{MultiGetResult, fetch_document, fetch_document_with_config, open_readonly},
     index,
-    types::SearchResult,
 };
 
 // ^ don't import crate::error::Result here — macro-generated code uses
@@ -65,7 +64,8 @@ struct SearchInput {
 struct UpdateInput {
     /// Only update this collection name (default: all collections)
     collection: Option<String>,
-    /// Force full re-index from scratch (default: false)
+    /// Force full text re-index from scratch (default: false). Drops all existing
+    /// vectors of the collection until `ir embed` or `ir sync` runs.
     force: Option<bool>,
 }
 
@@ -113,9 +113,17 @@ struct StatusOutput {
 #[derive(Serialize)]
 struct UpdateResult {
     collection: String,
+    /// Collection root that was scanned.
+    path: String,
+    /// Files matched by the scan; 0 means the path or globs matched nothing.
+    scanned: usize,
     added: usize,
     updated: usize,
     deactivated: usize,
+    /// Active documents without vectors. `update` never embeds.
+    pending_embeddings: usize,
+    /// Warnings the CLI prints to stderr; empty when there are none.
+    notes: Vec<String>,
 }
 
 // ── server ────────────────────────────────────────────────────────────────────
@@ -144,9 +152,11 @@ impl IrMcpServer {
         Set include_chunk=true to include the best-matching chunk text inline (vector results only). \
         Use get or multi_get to retrieve full document text by path. \
         Use filter to narrow results by metadata: fields path, modified_at, created_at, meta.<name>; \
-        ops =, !=, >, >=, <, <=, ~ (contains), !~ (not-contains); multiple clauses are ANDed."
+        ops =, !=, >, >=, <, <=, ~ (contains), !~ (not-contains); multiple clauses are ANDed. \
+        When the answer was degraded (e.g. BM25 only while models load, a collection not indexed, \
+        a preprocessor that could not run), a second text block starting with \"notes:\" says so."
     )]
-    async fn search(&self, params: Parameters<SearchInput>) -> Result<String, String> {
+    async fn search(&self, params: Parameters<SearchInput>) -> Result<CallToolResult, String> {
         let SearchInput {
             query,
             mode,
@@ -173,7 +183,8 @@ impl IrMcpServer {
                 })
                 .collect(),
         );
-        spawn_tool(move || {
+        let (results, notes) = run_blocking(move || {
+            let mut notes = Vec::new();
             let mut results = crate::search_core(
                 &query,
                 &mode,
@@ -182,15 +193,22 @@ impl IrMcpServer {
                 &collections,
                 crate::types::Verbosity::Quiet,
                 filter,
+                &mut notes,
             )?;
             if full && !results.is_empty() {
-                fill_results_content(&mut results)?;
+                crate::fill_content(&mut results)?;
             } else if include_chunk {
                 crate::get::populate_chunk_content(&mut results)?;
             }
-            Ok(results)
+            Ok((results, notes))
         })
-        .await
+        .await?;
+        // ^ The results stay the first block, unchanged, for clients that read only it.
+        let mut content = vec![Content::text(ok_json(&results)?)];
+        if !notes.is_empty() {
+            content.push(Content::text(format!("notes:\n{}", notes.join("\n"))));
+        }
+        Ok(CallToolResult::success(content))
     }
 
     #[tool(
@@ -202,8 +220,14 @@ impl IrMcpServer {
     }
 
     #[tool(
-        description = "Re-index document collections so newly added or changed files \
-        become searchable. Runs synchronously — may take seconds to minutes for large collections."
+        description = "Re-index the text (BM25) index of document collections so newly added \
+        or changed files become searchable. Text only: it does not compute embeddings, so new or \
+        changed files have no vectors until `ir embed` or `ir sync` runs in a terminal. \
+        force=true rebuilds from scratch and drops all existing vectors of the collection until \
+        `ir embed` or `ir sync` runs. Each result reports path, scanned (files matched on disk), \
+        added, updated, deactivated, pending_embeddings (documents without vectors), and notes: \
+        warnings to act on or relay to the user, e.g. a preprocessor that could not run. \
+        Runs synchronously — may take seconds to minutes for large collections."
     )]
     async fn update(&self, params: Parameters<UpdateInput>) -> Result<String, String> {
         let UpdateInput { collection, force } = params.0;
@@ -294,9 +318,17 @@ where
     F: FnOnce() -> IrResult<T> + Send + 'static,
     T: Serialize + Send + 'static,
 {
+    ok_json(&run_blocking(f).await?)
+}
+
+/// Run a blocking function on a thread pool; errors become tool error text.
+async fn run_blocking<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> IrResult<T> + Send + 'static,
+    T: Send + 'static,
+{
     match tokio::task::spawn_blocking(f).await {
-        Ok(Ok(v)) => ok_json(&v),
-        Ok(Err(e)) => Err(e.to_string()),
+        Ok(result) => result.map_err(|e| e.to_string()),
         Err(e) => Err(format!("internal: {e}")),
     }
 }
@@ -335,35 +367,12 @@ fn build_instructions() -> String {
         "ir local search engine. Collections: {}. \
         Use `search` for hybrid BM25+vector retrieval, `get` or `multi_get` to retrieve \
         full document text by path, `status` for index health, \
-        `update` to re-index after file changes.",
+        `update` to re-index text after file changes (no embeddings).",
         cols.join("; ")
     )
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-
-fn fill_results_content(results: &mut [SearchResult]) -> IrResult<()> {
-    let config = Config::load()?;
-    let col_names: std::collections::HashSet<&str> =
-        results.iter().map(|r| r.collection.as_str()).collect();
-    let dbs: Vec<db::CollectionDb> = col_names
-        .iter()
-        .filter_map(|name| config.get_collection(name))
-        .map(|c| {
-            let pp_aliases = c.preprocessor.as_deref().unwrap_or(&[]);
-            let pp_commands = config.resolve_preprocessor_commands(pp_aliases);
-            db::CollectionDb::open_rw(
-                &c.name,
-                &collection_db_path(&c.name),
-                pp_commands,
-                c.routing.clone(),
-                c.retrieval.clone(),
-            )
-        })
-        .collect::<crate::error::Result<Vec<_>>>()?;
-    crate::fill_content(results, &dbs);
-    Ok(())
-}
 
 fn count_docs(db_path: &std::path::Path) -> Option<usize> {
     db::ensure_sqlite_vec();
@@ -413,17 +422,17 @@ fn run_update(collection: Option<&str>, force: bool) -> IrResult<Vec<UpdateResul
 
     let mut results = Vec::new();
     for col in cols {
-        let db_path = collection_db_path(&col.name);
-        let pp_aliases = col.preprocessor.as_deref().unwrap_or(&[]);
-        let has_preprocessor = !config.resolve_preprocessor_commands(pp_aliases).is_empty();
-        let db_conn = db::CollectionDb::open(&col.name, &db_path, has_preprocessor)?;
-        let opts = index::UpdateOptions { force };
-        let (added, updated, deactivated) = index::update(&db_conn, col, &opts, &config)?;
+        let db = db::CollectionDb::open_for_index(&config, col)?;
+        let stats = index::update(&db, col, &index::UpdateOptions { force }, &config)?;
         results.push(UpdateResult {
             collection: col.name.clone(),
-            added,
-            updated,
-            deactivated,
+            path: col.path.clone(),
+            scanned: stats.scanned,
+            added: stats.added,
+            updated: stats.updated,
+            deactivated: stats.deactivated,
+            pending_embeddings: stats.pending_embeddings,
+            notes: stats.notes,
         });
     }
     Ok(results)

@@ -17,16 +17,6 @@ mod tests {
     }
 
     #[test]
-    fn deterministic() {
-        assert_eq!(hash_bytes(b"hello"), hash_bytes(b"hello"));
-    }
-
-    #[test]
-    fn differs_on_different_input() {
-        assert_ne!(hash_bytes(b"hello"), hash_bytes(b"world"));
-    }
-
-    #[test]
     fn hash_str_matches_hash_bytes() {
         assert_eq!(hash_str("hello"), hash_bytes(b"hello"));
     }

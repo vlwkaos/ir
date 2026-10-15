@@ -61,8 +61,7 @@ pub fn embed(
             let embeddings = embedder.embed_doc_batch(&inputs)?;
 
             // Write atomically: a crash mid-insert would leave no partial state.
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let write = || -> Result<()> {
+            db::write_txn(conn, || {
                 if opts.force {
                     // Collect seqs before deleting content_vectors (sqlite-vec can't LIKE on PK).
                     let seqs: Vec<i64> = {
@@ -95,14 +94,7 @@ pub fn embed(
                     )?;
                 }
                 Ok(())
-            };
-            match write() {
-                Ok(()) => conn.execute_batch("COMMIT")?,
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(e);
-                }
-            }
+            })?;
 
             total_chunks += chunks.len();
             total_docs += 1;

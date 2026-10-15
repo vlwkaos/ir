@@ -1,7 +1,8 @@
 # ir
 
 [![crates.io](https://img.shields.io/crates/v/ir-search.svg)](https://crates.io/crates/ir-search)
-[![CI](https://github.com/vlwkaos/ir/actions/workflows/ci.yml/badge.svg)](https://github.com/vlwkaos/ir/actions/workflows/ci.yml)
+[![CI - check](https://github.com/vlwkaos/ir/actions/workflows/ci.yml/badge.svg)](https://github.com/vlwkaos/ir/actions/workflows/ci.yml)
+[![CI - evaluation](https://github.com/vlwkaos/ir/actions/workflows/ci-evaluation.yml/badge.svg)](https://github.com/vlwkaos/ir/actions/workflows/ci-evaluation.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [ENG](README.md) | [한국어](README.ko.md) | [中文](README.zh.md)
@@ -138,6 +139,18 @@ ir embed [notes] [--force]   # 벡터 복구 / 재임베딩
 
 인덱싱은 증분·내용 주소 방식(SHA-256)이다. 변경된 파일만 재처리하고, 동일 콘텐츠는 중복 제거하며, 삭제된 파일은 제거하고, 이동/복원된 콘텐츠는 재추론 없이 캐시된 벡터를 재사용한다.
 
+`ir update`는 컬렉션 경로, 스캔된 파일 수, 아직 벡터가 없는 문서 수를 함께 출력한다.
+
+```
+updating 'notes' (/Users/me/notes)…
+  321 scanned: 1 added, 0 updated, 0 deactivated
+  1 pending embedding (run `ir embed` or `ir sync`)
+```
+
+`0 scanned`는 경로나 glob에 맞는 파일이 없다는 뜻이다. `ir update --force`는 텍스트 인덱스를 다시 만들면서 컬렉션에 저장된 벡터를 지우므로, `ir embed`나 `ir sync`를 실행하기 전까지 모든 문서가 임베딩 대기 상태가 된다.
+
+컬렉션의 전처리기를 시작할 수 없거나 실행 중에 멈추면, `ir update`는 경고를 출력하고 원문 텍스트로 인덱싱한다. 따라서 모든 파일이 계속 검색된다. 전처리기가 다시 동작하면 다음 `ir update`가 그 파일들을 다시 인덱싱한다. 여러 `ir` 프로세스(CLI 실행, MCP 서버)가 같은 컬렉션을 동시에 업데이트해도 된다. `ir sync`와 `ir embed`는 다른 프로세스가 같은 컬렉션을 임베딩하는 동안 기다린다.
+
 **검색:**
 
 ```bash
@@ -167,6 +180,8 @@ ir daemon start|stop|status   # 첫 검색 시 자동 시작
 ```
 
 웜 쿼리는 Unix 소켓 왕복 ~30ms. 콜드 스타트에서는 모델이 백그라운드에서 로드되는 동안 첫 쿼리가 BM25 결과를 즉시 반환할 수 있다.
+
+`ir`을 업그레이드하면, 다음 검색이 이전 바이너리로 시작된 데몬을 자동으로 교체한다. 그 쿼리는 콜드 스타트와 같은 방식으로 응답한다. Homebrew와 `cargo install`은 `ir`이 실행 중이어도 업그레이드한다. 바이너리를 직접 복사한다면 덮어쓰지 말고 파일을 교체한다(`mv` 또는 `install`). Linux는 실행 중인 프로그램에 쓰기를 거부한다("Text file busy"). `--mode bm25` 검색은 데몬을 시작하거나 호출하지 않는다. 데몬이 120초 안에 응답하지 않으면 검색은 기다리기를 멈추고 이미 가진 결과를 반환한다.
 
 </details>
 
@@ -203,6 +218,10 @@ ir preprocessor bind ko wiki  # 컬렉션에 연결하고 재인덱싱
 ```
 
 도구: `search` (`mode`, `limit`, `min_score`, `collections`, `filter` 지원), `get`, `multi_get`, `status`, `update`.
+
+`update`는 텍스트 전용이다. BM25 인덱스만 갱신하고 임베딩은 계산하지 않는다. 결과에는 컬렉션마다 `path`, `scanned`, `added`, `updated`, `deactivated`, `pending_embeddings`, `notes`가 들어 있다. 대기 중인 문서를 임베딩하려면 터미널에서 `ir embed`나 `ir sync`를 실행한다. `force: true`는 그때까지 컬렉션의 기존 벡터를 지운다.
+
+`update` 결과의 `notes`와 `search` 결과 뒤에 붙는 두 번째 `notes:` 블록에는 `ir`가 터미널에 출력하는 경고가 담긴다. 예를 들어 시작하지 못한 전처리기, 인덱싱되지 않은 컬렉션, 모델 로딩 중이라 BM25 결과만 반환한 경우다. 알릴 내용이 없으면 비어 있거나 생략된다.
 
 원격/멀티 클라이언트용 HTTP 모드:
 

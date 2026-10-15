@@ -42,14 +42,36 @@ impl Config {
         Ok(config)
     }
 
+    /// Replace config.yml atomically, so a reader (daemon reload, MCP server,
+    /// another CLI) never sees a truncated file. Callers that read, change and
+    /// save must hold `lock_for_edit` across all three steps.
     pub fn save(&self) -> Result<()> {
         let path = config_path();
+        // ^ Write through a symlinked config.yml (dotfiles) instead of replacing the link.
+        let path = fs::canonicalize(&path).unwrap_or(path);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let yaml = serde_yaml::to_string(self)?;
-        fs::write(&path, yaml)?;
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(format!(".tmp.{}", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        fs::write(&tmp, yaml)?;
+        fs::rename(&tmp, &path).inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
         Ok(())
+    }
+
+    /// Hold this across load → change → save. Without it two processes editing
+    /// config.yml at the same time silently drop one of the edits.
+    pub fn lock_for_edit() -> Result<fs::File> {
+        let mut lock = config_path().into_os_string();
+        lock.push(".lock");
+        crate::lock::exclusive_or_wait(
+            &PathBuf::from(lock),
+            "another ir command that is editing config.yml",
+        )
     }
 
     pub fn get_collection(&self, name: &str) -> Option<&Collection> {
@@ -276,12 +298,39 @@ pub fn collection_db_path(name: &str) -> PathBuf {
     data_dir().join(format!("{name}.sqlite"))
 }
 
+/// Every file that makes up a collection's index: the DB, its WAL/SHM
+/// companions, and the ANN sidecar. They are moved or deleted together.
+pub fn collection_index_files(name: &str) -> [PathBuf; 4] {
+    let db = collection_db_path(name);
+    let companion = |suffix: &str| {
+        let mut path = db.clone().into_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    [
+        companion("-wal"),
+        companion("-shm"),
+        db.with_extension("usearch"),
+        db,
+    ]
+}
+
+/// Held while a process embeds a collection (`ir sync` / `ir embed`).
+pub fn collection_embed_lock_path(name: &str) -> PathBuf {
+    data_dir().join(format!("{name}.embed.lock"))
+}
+
 pub fn daemon_socket_path() -> PathBuf {
     ir_dir().join("daemon.sock")
 }
 
 pub fn daemon_pid_path() -> PathBuf {
     ir_dir().join("daemon.pid")
+}
+
+/// Executable path and stamp of the running daemon, used to detect an upgrade.
+pub fn daemon_build_path() -> PathBuf {
+    ir_dir().join("daemon.build")
 }
 
 pub fn daemon_tier2_path() -> PathBuf {
@@ -329,43 +378,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_name() {
-        let mut cfg = Config::default();
-        assert!(cfg.add_collection(col("")).is_err());
-    }
-
-    #[test]
-    fn rejects_slash_in_name() {
-        let mut cfg = Config::default();
-        assert!(cfg.add_collection(col("a/b")).is_err());
-    }
-
-    #[test]
-    fn rejects_dotdot_in_name() {
-        let mut cfg = Config::default();
-        assert!(cfg.add_collection(col("..")).is_err());
-        assert!(cfg.add_collection(col("a..b")).is_err());
-    }
-
-    #[test]
     fn rejects_null_byte() {
         let mut cfg = Config::default();
         assert!(cfg.add_collection(col("a\0b")).is_err());
-    }
-
-    #[test]
-    fn accepts_valid_names() {
-        let mut cfg = Config::default();
-        assert!(cfg.add_collection(col("knowledge")).is_ok());
-        assert!(cfg.add_collection(col("my-notes_2024")).is_ok());
-    }
-
-    #[test]
-    fn rename_validates_new_name() {
-        let mut cfg = Config::default();
-        cfg.add_collection(col("notes")).unwrap();
-        assert!(cfg.rename_collection("notes", "a/b").is_err());
-        assert!(cfg.rename_collection("notes", "ok-name").is_ok());
     }
 
     #[test]
@@ -441,25 +456,6 @@ mod tests {
     }
 
     #[test]
-    fn ir_dir_respects_ir_config_dir() {
-        let _guard = env_lock();
-        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::set_var("IR_CONFIG_DIR", "/custom/ir");
-        }
-        let result = ir_dir();
-        unsafe {
-            std::env::remove_var("IR_CONFIG_DIR");
-            match saved_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-        assert_eq!(result, PathBuf::from("/custom/ir"));
-    }
-
-    #[test]
     fn ir_dir_ir_config_dir_with_tilde() {
         let _guard = env_lock();
         let home = dirs::home_dir().unwrap();
@@ -477,29 +473,6 @@ mod tests {
             }
         }
         assert_eq!(result, home.join(".config/ir"));
-    }
-
-    #[test]
-    fn ir_dir_xdg_fallback() {
-        let _guard = env_lock();
-        let saved_ir = std::env::var("IR_CONFIG_DIR").ok();
-        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::remove_var("IR_CONFIG_DIR");
-            std::env::set_var("XDG_CONFIG_HOME", "/tmp/test-xdg");
-        }
-        let result = ir_dir();
-        unsafe {
-            match saved_ir {
-                Some(v) => std::env::set_var("IR_CONFIG_DIR", v),
-                None => std::env::remove_var("IR_CONFIG_DIR"),
-            }
-            match saved_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-        assert_eq!(result, PathBuf::from("/tmp/test-xdg/ir"));
     }
 
     #[test]

@@ -24,6 +24,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
     tokenize='porter unicode61'
 );
 
+-- Content whose search text is raw because the preprocessor failed while it
+-- was indexed. The next update stores those documents again.
+CREATE TABLE IF NOT EXISTS fts_raw (
+    hash TEXT PRIMARY KEY
+);
+
 -- Vector embeddings (sqlite-vec)
 CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec USING vec0(
     hash_seq TEXT PRIMARY KEY,

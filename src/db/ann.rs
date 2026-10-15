@@ -9,7 +9,8 @@
 //   dimension change, or any removed vector, triggers a from-scratch rebuild.
 // - `search()` runs at query time: returns None (→ caller falls back to exact
 //   brute-force) when the flag is off, the sidecar is absent, or the index is
-//   stale (count mismatch with vectors_vec). Approximation never silently
+//   stale (count mismatch with vectors_vec, or `invalidate()` after vectors were
+//   dropped). Approximation never silently
 //   covers less than the full vector set.
 //
 // Distance semantics match sqlite-vec: cosine distance = 1 − cosine similarity.
@@ -87,6 +88,19 @@ fn vectors_count(conn: &Connection) -> Result<i64> {
 
 fn ann_err(e: impl std::fmt::Display) -> Error {
     Error::Other(format!("usearch: {e}"))
+}
+
+/// Mark the sidecar as not matching vectors_vec. Call wherever stored vectors
+/// are dropped.
+/// ^ `search` trusts the sidecar when its size equals the vector count. Vectors
+///   dropped and embedded again (a forced update, a new model) reach the same
+///   count while the sidecar still holds the old ones.
+pub fn invalidate(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DELETE FROM ann_keys;
+         DELETE FROM meta WHERE key = 'ann_count';",
+    )?;
+    Ok(())
 }
 
 /// Sync the sidecar with vectors_vec. Called after embedding when enabled.

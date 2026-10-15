@@ -9,8 +9,10 @@ pub mod graph;
 pub mod schema;
 pub mod vectors;
 
+use crate::config::{Config, collection_db_path};
 use crate::error::Result;
 use crate::preprocess::PreprocessChain;
+use crate::types::Collection;
 use rusqlite::ffi::{sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
 use rusqlite::{Connection, OpenFlags};
 use std::cell::RefCell;
@@ -59,6 +61,32 @@ pub struct CollectionDb {
 }
 
 impl CollectionDb {
+    /// Index-writing handle for a configured collection: creates the DB and
+    /// schema on first use and carries the collection's config.
+    pub fn open_for_index(config: &Config, collection: &Collection) -> Result<Self> {
+        let commands = collection_preprocessors(config, collection);
+        let mut db = Self::open(
+            &collection.name,
+            &collection_db_path(&collection.name),
+            !commands.is_empty(),
+        )?;
+        db.preprocessor_commands = commands;
+        db.routing = collection.routing.clone();
+        db.retrieval = collection.retrieval.clone();
+        Ok(db)
+    }
+
+    /// Search handle for a configured collection. Fails when it was never indexed.
+    pub fn open_for_search(config: &Config, collection: &Collection) -> Result<Self> {
+        Self::open_rw(
+            &collection.name,
+            &collection_db_path(&collection.name),
+            collection_preprocessors(config, collection),
+            collection.routing.clone(),
+            collection.retrieval.clone(),
+        )
+    }
+
     /// Open (or create) a collection DB at the given path with read-write access.
     /// `has_preprocessor` controls whether FTS triggers are installed in the schema.
     pub fn open(name: impl Into<String>, db_path: &Path, has_preprocessor: bool) -> Result<Self> {
@@ -126,6 +154,14 @@ impl CollectionDb {
             .unwrap_or(0)
     }
 
+    /// Why `preprocess_query` could not start this collection's preprocessor,
+    /// so queries were matched as raw text. None when it runs or none is bound.
+    pub fn query_preprocessor_error(&self) -> Option<String> {
+        let chain_ref = self.preprocess_chain.borrow();
+        let chain = chain_ref.as_ref().filter(|chain| !chain.is_active())?;
+        Some(chain.spawn_error().unwrap_or("unknown error").to_string())
+    }
+
     /// Preprocess a query using the collection's configured preprocessor chain.
     /// Lazily spawns the chain on first call and reuses it for subsequent calls.
     /// Falls back to the raw query on spawn failure or I/O error.
@@ -137,10 +173,6 @@ impl CollectionDb {
         let chain =
             chain_ref.get_or_insert_with(|| PreprocessChain::spawn(&self.preprocessor_commands));
         if !chain.is_active() {
-            eprintln!(
-                "warning: preprocessor ({}) failed to start; using raw query",
-                self.preprocessor_commands.join(", ")
-            );
             return query.to_string();
         }
         chain
@@ -218,27 +250,25 @@ pub fn get_rerank_scores(conn: &Connection, keys: &[String]) -> HashMap<String, 
 }
 
 /// Batch-insert reranker scores into llm_cache.
+/// ^ The cache is an optimisation and this runs inside a search. When another
+///   process holds the write lock the scores are dropped at once; waiting for
+///   the lock would stall the search for the whole busy timeout.
 pub fn put_rerank_scores(conn: &Connection, entries: &[(String, f64)]) {
     if entries.is_empty() {
         return;
     }
     let now = chrono::Utc::now().to_rfc3339();
-    let tx = match conn.unchecked_transaction() {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-    {
-        let mut stmt = match tx.prepare(
+    let _ = conn.busy_timeout(std::time::Duration::ZERO);
+    let _ = write_txn(conn, || {
+        let mut stmt = conn.prepare(
             "INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?1, ?2, ?3)",
-        ) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
+        )?;
         for (hash, score) in entries {
-            let _ = stmt.execute(rusqlite::params![hash, score.to_string(), now]);
+            stmt.execute(rusqlite::params![hash, score.to_string(), now])?;
         }
-    }
-    let _ = tx.commit();
+        Ok(())
+    });
+    let _ = conn.busy_timeout(BUSY_TIMEOUT);
 }
 
 // ── vector dimension helpers ──────────────────────────────────────────────────
@@ -274,6 +304,7 @@ pub fn ensure_vector_dimension(conn: &Connection, dim: usize) -> Result<()> {
                 "DROP TABLE IF EXISTS vectors_vec;
                  DELETE FROM content_vectors;",
             )?;
+            ann::invalidate(conn)?;
         }
         None => {
             conn.execute_batch("DROP TABLE IF EXISTS vectors_vec;")?;
@@ -288,11 +319,47 @@ pub fn ensure_vector_dimension(conn: &Connection, dim: usize) -> Result<()> {
     Ok(())
 }
 
+fn collection_preprocessors(config: &Config, collection: &Collection) -> Vec<String> {
+    config.resolve_preprocessor_commands(collection.preprocessor.as_deref().unwrap_or(&[]))
+}
+
+/// Run `f` inside one IMMEDIATE transaction: the write lock is taken up front,
+/// so what `f` reads cannot change before it writes. Rolls back on error.
+pub fn write_txn<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match f() {
+        Ok(value) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(value)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn configure(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    // ^ Switching a new DB to WAL takes an exclusive lock, and SQLite does not
+    //   call the busy handler for it. Retry, or openers that create the same
+    //   collection at the same moment fail with "database is locked".
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode = WAL;") {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => break result?,
+        }
+    }
     conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA busy_timeout = 5000;
-         PRAGMA synchronous  = NORMAL;
+        "PRAGMA synchronous  = NORMAL;
          PRAGMA cache_size   = -64000;
          PRAGMA foreign_keys = ON;",
     )?;
