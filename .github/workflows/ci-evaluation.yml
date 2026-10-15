@@ -81,7 +81,9 @@ jobs:
           target/release/ir preprocessor install zh
 
       - name: Model and network tests
-        run: cargo test ${{ matrix.features }} --lib --bins --test e2e_ops -- --ignored
+        # ^ llm::combined needs the opt-in Qwen3.5 GGUF in ~/local-models,
+        #   which ir never downloads; it is not part of the default pipeline.
+        run: cargo test ${{ matrix.features }} --lib --bins --test e2e_ops -- --ignored --skip llm::combined
 
       - name: Daemon scenarios
         # ^ One at a time: each starts its own daemon, and one compares timings.
