@@ -253,7 +253,7 @@ fn read_term(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
 
 /// Normalize FTS5 BM25 score to [0, 1].
 /// FTS5 returns negative values (more negative = better match).
-fn normalize(raw: f64) -> f64 {
+pub(crate) fn normalize(raw: f64) -> f64 {
     let pos = -raw; // make positive
     pos / (1.0 + pos)
 }
@@ -331,6 +331,8 @@ fn collect_search_rows(
             doc_id,
             content: None,
             chunk_seq: None,
+            evidence: None,
+            kind: None,
         });
     }
     Ok(results)

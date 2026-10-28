@@ -288,6 +288,35 @@ ir --config-path ./variant.yml search "query" -c notes
 
 优先级：`--config-path` > `IR_CONFIG_FILE` > `<config-dir>/config.yml`。
 
+**代码域（辅助证据）** — 在集合文档旁同时索引源代码文件。代码文件不会作为搜索结果返回；其符号和文档注释会提升或补充提到这些符号的文档：
+
+```bash
+ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs' --code-glob 'src/**/*.py'
+ir update notes
+ir search "drop outdated values after a migration" --json   # 找到提到对应函数的文档
+```
+
+```yaml
+collections:
+  - name: notes
+    path: ~/project
+    auxiliary:
+      code:
+        globs: ["src/**/*.rs", "src/**/*.py"]
+        excludes: ["src/generated/**"]   # 可选
+```
+
+- 支持：`.rs`、`.py`、`.js`/`.jsx`/`.mjs`/`.cjs`、`.ts`/`.tsx`、`.go`（tree-sitter）。函数、方法、类型、trait/interface、常量和模块连同文档注释一起索引；不索引函数体。
+- 文档写出符号名即建立链接：`snake_case`、`camelCase` 和两段以上的 `PascalCase` 在任何位置都算，其他名称仅在反引号内算。写出文件路径（`src/db/schema.rs` 或唯一后缀如 `db/schema.rs`）则链接到该文件。
+- 有辅助证据的结果在 `--json` 输出中带 `evidence` 字段，例如 `["code:src/cache.rs:invalidate_entry"]`。未配置代码域时，结果和输出不变。
+- 从集合中删除 `auxiliary:` 后，下一次 `ir update` 会删除其代码索引。
+- 对文档从未提到的代码，可以显式链接：
+  - 文档 frontmatter：`code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]`（文件路径或唯一后缀、`path:symbol` 或符号名）；
+  - 代码注释：`// knowledge: design/ledger.md` 或 `// [[Ledger design]]`（文档路径或标题），作用于整个文件。
+- `ir update` 会对每个指向不存在目标的显式链接发出警告（例如重命名之后），便于修复过期链接。
+- 代码匹配至少覆盖查询一半的词时才作为证据。
+- `ir search --include-code`（MCP：`include_code: true`）还会在**所有文档之后**返回匹配的符号和文件本身，带 `"kind": "code"`、源文件 `path`、`code:<path>:<line>` 形式的 `doc_id`，snippet 为签名和文档注释。默认关闭，代码仍是辅助信息。过滤器（`-f`）只作用于文档。
+
 ## 许可证
 
 [MIT](LICENSE)

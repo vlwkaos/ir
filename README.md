@@ -295,6 +295,35 @@ ir --config-path ./variant.yml search "query" -c notes
 
 Precedence: `--config-path` > `IR_CONFIG_FILE` > `<config-dir>/config.yml`.
 
+**Code domain (supporting evidence)** — index source files beside a collection's documents. Code files are never search results. Their symbols and doc comments raise, or add, the documents that mention them:
+
+```bash
+ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs' --code-glob 'src/**/*.py'
+ir update notes
+ir search "drop outdated values after a migration" --json   # finds docs that name the matching function
+```
+
+```yaml
+collections:
+  - name: notes
+    path: ~/project
+    auxiliary:
+      code:
+        globs: ["src/**/*.rs", "src/**/*.py"]
+        excludes: ["src/generated/**"]   # optional
+```
+
+- Supported: `.rs`, `.py`, `.js`/`.jsx`/`.mjs`/`.cjs`, `.ts`/`.tsx`, `.go` (tree-sitter). Functions, methods, types, traits/interfaces, constants and modules are indexed with their doc comments; function bodies are not.
+- A document links to a symbol when it names it: `snake_case`, `camelCase` or two-hump `PascalCase` anywhere, or any name inside backticks. It links to a file when it names its path (`src/db/schema.rs` or a unique suffix such as `db/schema.rs`).
+- A supported result has an `evidence` field in `--json` output, e.g. `["code:src/cache.rs:invalidate_entry"]`. Without a code domain, results and output are unchanged.
+- Removing `auxiliary:` from a collection drops its code index on the next `ir update`.
+- Explicit links, for code a document never names:
+  - in the document's frontmatter: `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` (a file path or unique suffix, `path:symbol`, or a symbol name);
+  - in a code comment: `// knowledge: design/ledger.md` or `// [[Ledger design]]` (document path or title). It covers the whole file.
+- `ir update` warns about each explicit link that matches nothing, for example after a rename, so stale links can be fixed.
+- A code match counts only when it covers at least half of the query's words.
+- `ir search --include-code` (MCP: `include_code: true`) also returns the matching symbols and files themselves, **after** all documents, with `"kind": "code"`, `path` = source file, `doc_id` = `code:<path>:<line>`, and the signature and doc comment as the snippet. Off by default: code stays auxiliary. Filters (`-f`) apply to documents only.
+
 ## License
 
 [MIT](LICENSE)

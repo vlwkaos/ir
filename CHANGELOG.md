@@ -1,3 +1,15 @@
+## [Unreleased]
+
+### Added
+
+- **Code domain: source code as supporting evidence for documents.** `ir collection add --code-glob 'src/**/*.rs'` (or `auxiliary.code.globs` in `config.yml`) indexes Rust, Python, JavaScript, TypeScript and Go files with tree-sitter: functions, methods, types, traits/interfaces, constants and modules, with their doc comments. Code files never appear as results. A query that matches a symbol raises, or adds, the documents that name it (or the file's path), and those results list the symbol in a new `evidence` field of `--json` output. Collections without a code domain return the same results as before.
+- **Explicit code links.** A document's frontmatter `code:` field (file path, `path:symbol` or symbol name) and a code comment `knowledge: <document path>` or `[[Title]]` link code that the text never names. `ir update` prints a warning for each explicit link that matches nothing, so stale links show up after a rename or deletion. A code match supports a document only when it covers at least half of the query's words.
+- **`ir search --include-code`** (MCP search field `include_code`) returns matching code symbols and files after all documents, marked `"kind": "code"`. Off by default.
+
+### Changed
+
+- **`ir --help` is a complete quick guide for people and agents.** It now includes a quick start and tips on picking a mode, filters and reading results. `search`, `get`/`multi-get`, `collection add` and `sync`/`update`/`embed` show runnable examples, and every command summary says what it does and when to use it.
+
 ## [0.18.2] - 2026-10-15
 
 ### Fixed

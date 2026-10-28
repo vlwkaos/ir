@@ -85,7 +85,59 @@ CREATE TABLE IF NOT EXISTS ann_keys (
     hash_seq TEXT NOT NULL UNIQUE
 );
 
+-- Auxiliary domains (config `auxiliary:`): artifacts extracted from non-document
+-- files that support primary documents and are never results themselves.
+-- Empty unless a domain is configured; search reads meta 'aux_artifacts' first.
+-- One row per extracted source file; `extractor` versions the extraction rules.
+CREATE TABLE IF NOT EXISTS artifact_sources (
+    domain    TEXT NOT NULL,
+    path      TEXT NOT NULL,
+    hash      TEXT NOT NULL,
+    extractor TEXT NOT NULL,
+    PRIMARY KEY (domain, path)
+);
+
+-- kind: file | function | method | type | trait | constant | module ...
+CREATE TABLE IF NOT EXISTS artifacts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain     TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line   INTEGER NOT NULL,
+    text       TEXT NOT NULL
+);
+
+-- rowid = artifacts.id. Managed by the index pipeline (no triggers).
+CREATE VIRTUAL TABLE IF NOT EXISTS artifact_fts USING fts5(
+    name, body,
+    tokenize='porter unicode61'
+);
+
+-- Documents an artifact's source names in its comments (`knowledge: <path>`,
+-- `[[Title]]`), resolved to `anchored` edges when links are rebuilt.
+CREATE TABLE IF NOT EXISTS artifact_anchors (
+    artifact_id INTEGER NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+    target      TEXT NOT NULL,
+    PRIMARY KEY (artifact_id, target)
+);
+
+-- Typed artifact → document links. relation: mentions_symbol | mentions_path
+-- (found in the document text), declared (document frontmatter `code:`),
+-- anchored (code comment naming the document).
+-- weight in (0, 1]: lower for identifiers that many documents mention.
+CREATE TABLE IF NOT EXISTS artifact_edges (
+    artifact_id INTEGER NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    relation    TEXT NOT NULL,
+    weight      REAL NOT NULL,
+    PRIMARY KEY (artifact_id, document_id, relation)
+);
+
 -- Indexes
+CREATE INDEX IF NOT EXISTS idx_artifacts_source ON artifacts (domain, path);
+CREATE INDEX IF NOT EXISTS idx_artifact_edges_document ON artifact_edges (document_id);
 CREATE INDEX IF NOT EXISTS idx_documents_hash   ON documents (hash);
 CREATE INDEX IF NOT EXISTS idx_documents_active ON documents (active);
 CREATE INDEX IF NOT EXISTS idx_content_vectors_hash ON content_vectors (hash);

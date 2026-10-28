@@ -747,6 +747,8 @@ mod tests {
             doc_id: "#abc".into(),
             content: None,
             chunk_seq: Some(seq),
+            evidence: None,
+            kind: None,
         }
     }
 
@@ -761,6 +763,8 @@ mod tests {
             doc_id: "#abc".into(),
             content: None,
             chunk_seq: None,
+            evidence: None,
+            kind: None,
         }
     }
 
@@ -828,6 +832,7 @@ mod tests {
             preprocessor: None,
             routing: None,
             retrieval: None,
+            auxiliary: None,
         }
     }
 

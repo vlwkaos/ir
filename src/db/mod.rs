@@ -58,6 +58,8 @@ pub struct CollectionDb {
     conn: Connection,
     /// Lazily spawned preprocessor chain, reused across BM25 calls within one search request.
     preprocess_chain: RefCell<Option<PreprocessChain>>,
+    /// Whether the DB holds auxiliary artifacts; read once per handle.
+    has_artifacts: std::cell::OnceCell<bool>,
 }
 
 impl CollectionDb {
@@ -113,6 +115,7 @@ impl CollectionDb {
             retrieval: None,
             conn,
             preprocess_chain: RefCell::new(None),
+            has_artifacts: std::cell::OnceCell::new(),
         })
     }
 
@@ -139,11 +142,20 @@ impl CollectionDb {
             retrieval,
             conn,
             preprocess_chain: RefCell::new(None),
+            has_artifacts: std::cell::OnceCell::new(),
         })
     }
 
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// True when auxiliary artifacts are stored (see `auxiliary`). One meta
+    /// read per handle; collections without auxiliary domains do no other work.
+    pub fn has_artifacts(&self) -> bool {
+        *self
+            .has_artifacts
+            .get_or_init(|| crate::auxiliary::has_artifacts(&self.conn))
     }
 
     pub fn active_doc_count(&self) -> usize {

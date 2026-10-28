@@ -1,4 +1,5 @@
 // Library crate root — re-exports internal modules for use by src/bin/* targets.
+pub mod auxiliary;
 pub mod config;
 pub mod db;
 pub mod error;

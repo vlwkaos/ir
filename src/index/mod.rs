@@ -73,14 +73,7 @@ fn plan(
     has_preprocessor: bool,
     hash_only: &HashMap<String, String>,
 ) -> Result<Plan> {
-    let stored_has_preprocessor = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'has_preprocessor'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .is_ok_and(|v| v == "1");
-    let preprocessor_changed = stored_has_preprocessor != has_preprocessor;
+    let preprocessor_changed = preprocessor_changed(conn, has_preprocessor);
     let force = opts.force || preprocessor_changed;
     // Force mode presents an empty stored state.
     let stored = if force {
@@ -93,6 +86,18 @@ fn plan(
         preprocessor_changed,
         diff: diff::compute(hash_only, &stored),
     })
+}
+
+/// The stored index was built with the other preprocessor setting.
+fn preprocessor_changed(conn: &rusqlite::Connection, has_preprocessor: bool) -> bool {
+    let stored = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'has_preprocessor'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .is_ok_and(|v| v == "1");
+    stored != has_preprocessor
 }
 
 /// Preprocessed search text per content hash, for collections with a preprocessor.
@@ -233,138 +238,151 @@ pub fn update(
         fts_bodies.prepare(&draft, &scanned, &pb)?;
     }
 
+    // 2b. Extract auxiliary-domain sources (code), also without a lock.
+    // ^ A preprocessor change re-indexes everything, artifact text included.
+    let aux_force = opts.force || preprocessor_changed(conn, has_preprocessor);
+    let aux = crate::auxiliary::prepare(conn, collection, &pp_commands, aux_force)?;
+
     // 3–6. Diff against the stored state and apply it under one write lock, so a
     // crash leaves the DB consistent.
     // ^ The stored state is read again inside the transaction, and that diff is
     //   the one applied. Applied from a read taken before it, two updates running
     //   at once both act on the same snapshot and the second fails on a duplicate
     //   path.
-    let ((n_add, n_update, n_deactivate), n_raw, rebuilt) = db::write_txn(conn, || {
-        let Plan {
-            force,
-            preprocessor_changed,
-            diff: d,
-        } = plan(conn, opts, has_preprocessor, &hash_only)?;
-        // ^ Reported only when something existed to rebuild: a new collection
-        //   with a preprocessor also takes this path on its first update.
-        let rebuilt = !opts.force
-            && preprocessor_changed
-            && conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM documents WHERE active = 1)",
-                [],
-                |row| row.get::<_, bool>(0),
-            )?;
-        // Only documents another update changed since step 2 are left to do.
-        fts_bodies.prepare(&d, &scanned, &pb)?;
+    let ((n_add, n_update, n_deactivate), n_raw, rebuilt, stale_links) =
+        db::write_txn(conn, || {
+            let Plan {
+                force,
+                preprocessor_changed,
+                diff: d,
+            } = plan(conn, opts, has_preprocessor, &hash_only)?;
+            // ^ Reported only when something existed to rebuild: a new collection
+            //   with a preprocessor also takes this path on its first update.
+            let rebuilt = !opts.force
+                && preprocessor_changed
+                && conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM documents WHERE active = 1)",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )?;
+            // Only documents another update changed since step 2 are left to do.
+            fts_bodies.prepare(&d, &scanned, &pb)?;
 
-        let counts = (d.to_add.len(), d.to_update.len(), d.to_deactivate.len());
-        let (n_add, n_update, n_deactivate) = counts;
-        pb.set_position(0);
-        pb.set_length((n_add + n_update + n_deactivate) as u64);
-        pb.set_message("applying");
+            let counts = (d.to_add.len(), d.to_update.len(), d.to_deactivate.len());
+            let (n_add, n_update, n_deactivate) = counts;
+            pb.set_position(0);
+            pb.set_length((n_add + n_update + n_deactivate) as u64);
+            pb.set_message("applying");
 
-        if force {
-            conn.execute_batch(
-                "DELETE FROM documents_fts;
+            if force {
+                conn.execute_batch(
+                    "DELETE FROM documents_fts;
                  DELETE FROM documents;
                  DELETE FROM content;
                  DELETE FROM content_vectors;
                  DELETE FROM vectors_vec;
                  DELETE FROM llm_cache;
                  DELETE FROM fts_raw;",
-            )?;
-            db::ann::invalidate(conn)?;
-        } else {
-            // ^ v0.15 and older retained tombstones. Purging them before inserts
-            // makes a path that disappeared and returned self-healing.
-            if has_preprocessor {
-                conn.execute(
-                    "DELETE FROM documents_fts
-                     WHERE rowid IN (SELECT id FROM documents WHERE active = 0)",
-                    [],
                 )?;
+                db::ann::invalidate(conn)?;
+            } else {
+                // ^ v0.15 and older retained tombstones. Purging them before inserts
+                // makes a path that disappeared and returned self-healing.
+                if has_preprocessor {
+                    conn.execute(
+                        "DELETE FROM documents_fts
+                     WHERE rowid IN (SELECT id FROM documents WHERE active = 0)",
+                        [],
+                    )?;
+                }
+                conn.execute("DELETE FROM documents WHERE active = 0", [])?;
             }
-            conn.execute("DELETE FROM documents WHERE active = 0", [])?;
-        }
 
-        // 4. Delete removed files. Content and vectors remain hash-addressed caches.
-        for rel_path in &d.to_deactivate {
-            // ! Triggers disabled — must manually remove from FTS.
-            delete_document(conn, rel_path, has_preprocessor)?;
-            pb.inc(1);
-            pb.set_message(format!("remove {rel_path}"));
-        }
-
-        // 5. Add new files
-        for rel_path in &d.to_add {
-            let (hash, content, file_mtime, file_birthtime) = scan_entry(&scanned, rel_path)?;
-            store_document(
-                conn,
-                rel_path,
-                hash,
-                &decode(content),
-                file_birthtime,
-                file_mtime,
-                has_preprocessor.then_some(&fts_bodies.by_hash),
-            )?;
-            pb.inc(1);
-            pb.set_message(format!("add {rel_path}"));
-        }
-
-        // 6. Update changed files
-        for rel_path in &d.to_update {
-            let (hash, content, file_mtime, _file_birthtime) = scan_entry(&scanned, rel_path)?;
-            let created_at: String = conn
-                .query_row(
-                    "SELECT created_at FROM documents WHERE path = ?1",
-                    [rel_path],
-                    |row| row.get(0),
-                )
-                .unwrap_or_else(|_| file_mtime.clone());
-
-            // ! Triggers disabled — must manually remove from FTS before delete.
-            // ^ ON DELETE CASCADE removes document_metadata rows for this document
-            delete_document(conn, rel_path, has_preprocessor)?;
-            store_document(
-                conn,
-                rel_path,
-                hash,
-                &decode(content),
-                &created_at,
-                file_mtime,
-                has_preprocessor.then_some(&fts_bodies.by_hash),
-            )?;
-            pb.inc(1);
-            pb.set_message(format!("update {rel_path}"));
-        }
-
-        // ^ Counted here, not from `raw`: step 2 may have prepared documents
-        //   that another update stored first.
-        let mut n_raw = 0;
-        if has_preprocessor {
-            for rel_path in d.to_add.iter().chain(&d.to_update) {
-                let hash = &scan_entry(&scanned, rel_path)?.0;
-                let sql = if fts_bodies.raw.contains(hash) {
-                    n_raw += 1;
-                    "INSERT OR IGNORE INTO fts_raw (hash) VALUES (?1)"
-                } else {
-                    "DELETE FROM fts_raw WHERE hash = ?1"
-                };
-                conn.execute(sql, [hash])?;
+            // 4. Delete removed files. Content and vectors remain hash-addressed caches.
+            for rel_path in &d.to_deactivate {
+                // ! Triggers disabled — must manually remove from FTS.
+                delete_document(conn, rel_path, has_preprocessor)?;
+                pb.inc(1);
+                pb.set_message(format!("remove {rel_path}"));
             }
-        }
 
-        // Record the preprocessing state only after the matching FTS content is ready.
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('has_preprocessor', ?1)",
-            [if has_preprocessor { "1" } else { "0" }],
-        )?;
+            // 5. Add new files
+            for rel_path in &d.to_add {
+                let (hash, content, file_mtime, file_birthtime) = scan_entry(&scanned, rel_path)?;
+                store_document(
+                    conn,
+                    rel_path,
+                    hash,
+                    &decode(content),
+                    file_birthtime,
+                    file_mtime,
+                    has_preprocessor.then_some(&fts_bodies.by_hash),
+                )?;
+                pb.inc(1);
+                pb.set_message(format!("add {rel_path}"));
+            }
 
-        Ok((counts, n_raw, rebuilt))
-    })?;
+            // 6. Update changed files
+            for rel_path in &d.to_update {
+                let (hash, content, file_mtime, _file_birthtime) = scan_entry(&scanned, rel_path)?;
+                let created_at: String = conn
+                    .query_row(
+                        "SELECT created_at FROM documents WHERE path = ?1",
+                        [rel_path],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or_else(|_| file_mtime.clone());
+
+                // ! Triggers disabled — must manually remove from FTS before delete.
+                // ^ ON DELETE CASCADE removes document_metadata rows for this document
+                delete_document(conn, rel_path, has_preprocessor)?;
+                store_document(
+                    conn,
+                    rel_path,
+                    hash,
+                    &decode(content),
+                    &created_at,
+                    file_mtime,
+                    has_preprocessor.then_some(&fts_bodies.by_hash),
+                )?;
+                pb.inc(1);
+                pb.set_message(format!("update {rel_path}"));
+            }
+
+            // ^ Counted here, not from `raw`: step 2 may have prepared documents
+            //   that another update stored first.
+            let mut n_raw = 0;
+            if has_preprocessor {
+                for rel_path in d.to_add.iter().chain(&d.to_update) {
+                    let hash = &scan_entry(&scanned, rel_path)?.0;
+                    let sql = if fts_bodies.raw.contains(hash) {
+                        n_raw += 1;
+                        "INSERT OR IGNORE INTO fts_raw (hash) VALUES (?1)"
+                    } else {
+                        "DELETE FROM fts_raw WHERE hash = ?1"
+                    };
+                    conn.execute(sql, [hash])?;
+                }
+            }
+
+            // 7. Auxiliary artifacts and their document links, in the same transaction.
+            // ^ Document ids change on every store, so links are rebuilt whenever
+            //   documents changed.
+            let documents_changed = force || n_add + n_update + n_deactivate > 0;
+            let stale_links = crate::auxiliary::apply(conn, &aux, documents_changed)?;
+
+            // Record the preprocessing state only after the matching FTS content is ready.
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('has_preprocessor', ?1)",
+                [if has_preprocessor { "1" } else { "0" }],
+            )?;
+
+            Ok((counts, n_raw, rebuilt, stale_links))
+        })?;
 
     pb.finish_with_message("done");
-    let mut notes = Vec::new();
+    let mut notes = aux.notes;
+    notes.extend(stale_links);
     if rebuilt {
         notes.push(format!(
             "the preprocessor setting changed ({}), so the collection was re-indexed \
@@ -521,6 +539,7 @@ mod tests {
                 preprocessor: None,
                 routing: None,
                 retrieval: None,
+                auxiliary: None,
             };
             Self {
                 _temp: temp,

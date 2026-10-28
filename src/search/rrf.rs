@@ -68,6 +68,8 @@ mod tests {
             doc_id: "#abc".into(),
             content: None,
             chunk_seq: None,
+            evidence: None,
+            kind: None,
         }
     }
 

@@ -1,3 +1,4 @@
+mod auxiliary;
 mod cli;
 mod config;
 mod daemon;
@@ -82,6 +83,7 @@ fn run() -> Result<()> {
             verbose,
             quiet,
             filter,
+            include_code,
         } => handle_search(
             query.join(" "),
             mode,
@@ -106,6 +108,7 @@ fn run() -> Result<()> {
                 types::Verbosity::Normal
             },
             filter,
+            include_code,
         ),
         Command::Get {
             target,
@@ -239,6 +242,7 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
             exclude,
             description,
             preprocessor,
+            code_glob,
         } => {
             // Validate aliases before mutating config.
             for alias in &preprocessor {
@@ -262,6 +266,12 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
                 },
                 routing: None,
                 retrieval: None,
+                auxiliary: (!code_glob.is_empty()).then(|| types::AuxiliaryConfig {
+                    code: Some(types::CodeDomainConfig {
+                        globs: code_glob,
+                        excludes: vec![],
+                    }),
+                }),
             })?;
             config.save()?;
             println!("added collection '{name}'");
@@ -417,6 +427,37 @@ fn index_collections<'a>(
             .ok_or_else(|| error::Error::CollectionNotFound(name.to_string())),
         None => Ok(config.collections.iter().collect()),
     }
+}
+
+/// Append up to `limit` auxiliary code artifacts matching `query` after the
+/// document results (`--include-code`, MCP `include_code`). Code never
+/// displaces a document; collections without a code domain add nothing.
+/// Document filters (`-f`) do not apply to code.
+/// knowledge: bigpicture/Multiscript and Auxiliary Retrieval Roadmap.md (Branch 2)
+pub(crate) fn append_code_results(
+    query: &str,
+    collection_filter: &[String],
+    limit: usize,
+    results: &mut Vec<types::SearchResult>,
+) -> Result<()> {
+    let config = Config::load()?;
+    let mut code = Vec::new();
+    for name in resolve_collections(&config, collection_filter)? {
+        let Some(c) = config.get_collection(&name) else {
+            continue;
+        };
+        if c.auxiliary.as_ref().and_then(|a| a.code.as_ref()).is_none()
+            || !collection_db_path(&name).exists()
+        {
+            continue;
+        }
+        let db = db::CollectionDb::open_for_search(&config, c)?;
+        code.extend(auxiliary::code_results(&db, query, limit)?);
+    }
+    types::SearchResult::sort_desc(&mut code);
+    code.truncate(limit);
+    results.extend(code);
+    Ok(())
 }
 
 /// Search core: runs the tier-0/1/2 pipeline and returns ranked results.
@@ -706,6 +747,7 @@ fn handle_search(
     files: bool,
     verbosity: types::Verbosity,
     filter_strs: Vec<String>,
+    include_code: bool,
 ) -> Result<()> {
     let filter = types::Filter::parse(&filter_strs).map_err(error::Error::Other)?;
 
@@ -743,6 +785,9 @@ fn handle_search(
     } else if chunk {
         get::populate_chunk_content(&mut results)?;
     }
+    if include_code {
+        append_code_results(&query, &collection_filter, limit, &mut results)?;
+    }
 
     output::print_results(&results, fmt);
     Ok(())
@@ -765,6 +810,8 @@ fn to_search_results(daemon_results: Vec<daemon::DaemonResult>) -> Vec<types::Se
             doc_id: r.doc_id,
             content: None,
             chunk_seq: r.chunk_seq,
+            evidence: r.evidence,
+            kind: None,
         })
         .collect()
 }

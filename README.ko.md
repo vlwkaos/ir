@@ -317,6 +317,35 @@ ir --config-path ./variant.yml search "query" -c notes
 
 우선순위: `--config-path` > `IR_CONFIG_FILE` > `<config-dir>/config.yml`.
 
+**코드 도메인 (보조 근거)** — 컬렉션 문서 옆의 소스 파일을 함께 색인합니다. 코드 파일은 검색 결과로 나오지 않습니다. 대신 심볼과 doc comment가 그 심볼을 언급한 문서의 순위를 올리거나 결과에 추가합니다.
+
+```bash
+ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs' --code-glob 'src/**/*.py'
+ir update notes
+ir search "drop outdated values after a migration" --json   # 해당 함수를 언급한 문서를 찾습니다
+```
+
+```yaml
+collections:
+  - name: notes
+    path: ~/project
+    auxiliary:
+      code:
+        globs: ["src/**/*.rs", "src/**/*.py"]
+        excludes: ["src/generated/**"]   # 선택
+```
+
+- 지원 형식: `.rs`, `.py`, `.js`/`.jsx`/`.mjs`/`.cjs`, `.ts`/`.tsx`, `.go` (tree-sitter). 함수, 메서드, 타입, trait/interface, 상수, 모듈을 doc comment와 함께 색인합니다. 함수 본문은 색인하지 않습니다.
+- 문서가 심볼 이름을 쓰면 연결됩니다. `snake_case`, `camelCase`, 두 단어 이상의 `PascalCase`는 어디서든, 다른 이름은 백틱 안에서만 연결됩니다. 파일 경로(`src/db/schema.rs` 또는 `db/schema.rs`처럼 유일한 접미사)를 쓰면 파일과 연결됩니다.
+- 보조 근거가 있는 결과는 `--json` 출력에 `evidence` 필드가 붙습니다(예: `["code:src/cache.rs:invalidate_entry"]`). 코드 도메인이 없으면 결과와 출력은 이전과 같습니다.
+- 컬렉션에서 `auxiliary:`를 지우면 다음 `ir update`에서 코드 색인이 삭제됩니다.
+- 문서가 이름을 쓰지 않는 코드는 명시적 링크로 연결합니다.
+  - 문서 frontmatter: `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` (파일 경로나 유일한 접미사, `path:symbol`, 심볼 이름)
+  - 코드 주석: `// knowledge: design/ledger.md` 또는 `// [[Ledger design]]` (문서 경로나 제목). 파일 전체에 적용됩니다.
+- `ir update`는 아무것도 가리키지 않는 명시적 링크마다 경고합니다(예: 이름 변경 후). 낡은 링크를 바로 고칠 수 있습니다.
+- 코드 일치는 쿼리 단어의 절반 이상을 포함할 때만 근거로 씁니다.
+- `ir search --include-code`(MCP: `include_code: true`)는 일치한 심볼과 파일 자체도 **모든 문서 뒤에** 반환합니다. 결과에는 `"kind": "code"`, 소스 파일 `path`, `code:<path>:<line>` 형식의 `doc_id`가 붙고, snippet은 시그니처와 doc comment입니다. 기본값은 꺼짐입니다. 코드는 보조 정보로 남습니다. 필터(`-f`)는 문서에만 적용됩니다.
+
 ## 라이선스
 
 [MIT](LICENSE)

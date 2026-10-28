@@ -142,6 +142,8 @@ pub fn search(
                     doc_id: format!("#{}", &hash[..6.min(hash.len())]),
                     content: None,
                     chunk_seq: Some(*seq),
+                    evidence: None,
+                    kind: None,
                 });
             }
         }

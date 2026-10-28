@@ -587,7 +587,7 @@ fn bm25_across(dbs: &[CollectionDb], query: &str, limit: usize) -> Result<Vec<Se
                 limit,
                 title_weight: None,
             };
-            fts::search(db.conn(), &q)
+            crate::auxiliary::bm25_with_support(db, &q)
         })
         .collect::<Result<Vec<Vec<_>>>>()
         .map(|vv| vv.into_iter().flatten().collect())
@@ -850,6 +850,8 @@ mod tests {
             doc_id: "#h".into(),
             content: None,
             chunk_seq: None,
+            evidence: None,
+            kind: None,
         };
 
         // Below floor → not strong
@@ -954,6 +956,8 @@ mod tests {
             doc_id: "#h".into(),
             content: None,
             chunk_seq: None,
+            evidence: None,
+            kind: None,
         };
 
         let r = vec![make(0.70), make(0.60)];
@@ -990,6 +994,8 @@ mod tests {
             doc_id: "#h".into(),
             content: None,
             chunk_seq: None,
+            evidence: None,
+            kind: None,
         };
 
         // Below floor → not strong
@@ -1044,6 +1050,7 @@ mod tests {
                 bm25_strong_gap: None,
             }),
             retrieval: None,
+            auxiliary: None,
         };
         let a = make("a");
         let b = make("b");
@@ -1070,6 +1077,7 @@ mod tests {
                 bm25_strong_gap: None,
             }),
             retrieval: None,
+            auxiliary: None,
         };
         let b = Collection {
             name: "b".into(),
@@ -1080,6 +1088,7 @@ mod tests {
             preprocessor: None,
             routing: None,
             retrieval: None,
+            auxiliary: None,
         };
         let cols = vec![&a, &b];
         assert_eq!(
@@ -1104,6 +1113,8 @@ mod tests {
             doc_id: "#h".into(),
             content: None,
             chunk_seq: None,
+            evidence: None,
+            kind: None,
         };
         let results = vec![make(0.9), make(0.5), make(0.3)];
         let filtered = apply_min_score(results, Some(0.6), 10);

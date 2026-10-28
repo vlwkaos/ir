@@ -32,7 +32,7 @@ pub fn bm25(dbs: &[CollectionDb], req: &SearchRequest) -> Result<Vec<SearchResul
                 limit: req.limit * 2, // over-fetch to allow for merging
                 title_weight: None,
             };
-            fts::search(db.conn(), &q)
+            crate::auxiliary::bm25_with_support(db, &q)
         })
         .collect::<crate::error::Result<Vec<_>>>()?;
 
@@ -83,6 +83,8 @@ mod tests {
             doc_id: "#h".into(),
             content: None,
             chunk_seq: None,
+            evidence: None,
+            kind: None,
         }
     }
 

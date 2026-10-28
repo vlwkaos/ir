@@ -58,6 +58,9 @@ struct SearchInput {
     /// Ops: =, !=, >, >=, <, <=, ~ (contains), !~ (not-contains).
     /// Example: [{"field":"modified_at","op":">=","value":"2024-01-01"},{"field":"meta.tags","op":"=","value":"rust"}]
     filter: Option<Vec<FilterClauseInput>>,
+    /// Also return matching code symbols and files from collections with a code
+    /// domain, after the documents (kind "code"). Filters apply to documents only.
+    include_code: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -151,6 +154,8 @@ impl IrMcpServer {
         Set full=true to include full document text inline. \
         Set include_chunk=true to include the best-matching chunk text inline (vector results only). \
         Use get or multi_get to retrieve full document text by path. \
+        Set include_code=true to also get matching code symbols (kind \"code\", after the documents) \
+        from collections with a code domain; read those files directly. \
         Use filter to narrow results by metadata: fields path, modified_at, created_at, meta.<name>; \
         ops =, !=, >, >=, <, <=, ~ (contains), !~ (not-contains); multiple clauses are ANDed. \
         When the answer was degraded (e.g. BM25 only while models load, a collection not indexed, \
@@ -166,6 +171,7 @@ impl IrMcpServer {
             full,
             include_chunk,
             filter,
+            include_code,
         } = params.0;
         let mode = mode.unwrap_or_else(|| "hybrid".to_string());
         let limit = limit.unwrap_or(10);
@@ -199,6 +205,9 @@ impl IrMcpServer {
                 crate::fill_content(&mut results)?;
             } else if include_chunk {
                 crate::get::populate_chunk_content(&mut results)?;
+            }
+            if include_code.unwrap_or(false) {
+                crate::append_code_results(&query, &collections, limit, &mut results)?;
             }
             Ok((results, notes))
         })

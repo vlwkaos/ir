@@ -19,20 +19,25 @@ pub struct ScannedFile {
 }
 
 pub fn scan(collection: &Collection) -> Result<Vec<ScannedFile>> {
-    let root = &collection.path;
-    let globs: Vec<&str> = if collection.globs.is_empty() {
-        vec!["**/*.md"]
+    let default = ["**/*.md".to_string()];
+    let globs: &[String] = if collection.globs.is_empty() {
+        &default
     } else {
-        collection.globs.iter().map(|s| s.as_str()).collect()
+        &collection.globs
     };
+    scan_globs(&collection.path, globs, &collection.excludes)
+}
 
+/// Files under `root` matching any of `globs` and none of `excludes`.
+/// Respects .gitignore. Also used for auxiliary-domain sources.
+pub fn scan_globs(root: &str, globs: &[String], excludes: &[String]) -> Result<Vec<ScannedFile>> {
     let mut override_builder = ignore::overrides::OverrideBuilder::new(root);
-    for glob in &globs {
+    for glob in globs {
         override_builder
             .add(glob)
             .map_err(|e| crate::error::Error::Other(e.to_string()))?;
     }
-    for exclude in &collection.excludes {
+    for exclude in excludes {
         // Prefix with ! to negate
         override_builder
             .add(&format!("!{exclude}"))

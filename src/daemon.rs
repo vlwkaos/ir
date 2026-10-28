@@ -86,6 +86,8 @@ pub struct DaemonResult {
     pub doc_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_seq: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Vec<String>>,
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -876,6 +878,7 @@ fn handle_request(
                 hash: r.hash,
                 doc_id: r.doc_id,
                 chunk_seq: r.chunk_seq,
+                evidence: r.evidence,
             })
             .collect(),
         log,

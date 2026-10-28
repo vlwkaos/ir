@@ -62,6 +62,26 @@ pub struct Collection {
     /// Applies only when all searched collections agree; `config > env > default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<RetrievalConfig>,
+    /// Optional auxiliary domains indexed beside the primary documents. They
+    /// support document ranking and never appear as results themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary: Option<AuxiliaryConfig>,
+}
+
+/// Auxiliary domains of one collection (config.yml `auxiliary:`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AuxiliaryConfig {
+    /// Source code: symbols and doc comments extracted with tree-sitter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeDomainConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CodeDomainConfig {
+    /// Code files to extract, relative to the collection path (e.g. `src/**/*.rs`).
+    pub globs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excludes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +98,14 @@ pub struct SearchResult {
     /// Best-matching chunk index within the document (set by vector search; None for BM25-only results).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_seq: Option<usize>,
+    /// Auxiliary artifacts that raised or added this document
+    /// (e.g. `code:src/db/schema.rs:init`). None without auxiliary domains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Vec<String>>,
+    /// `"code"` for an auxiliary code artifact returned by `--include-code`
+    /// (always after the documents); None for documents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 impl SearchResult {

@@ -294,6 +294,8 @@ fn expand_with_activation(
                     doc_id: format!("#{}", &hash[..6.min(hash.len())]),
                     content: None,
                     chunk_seq: None,
+                    evidence: None,
+                    kind: None,
                 });
             }
         }

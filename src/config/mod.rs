@@ -374,6 +374,7 @@ mod tests {
             preprocessor: None,
             routing: None,
             retrieval: None,
+            auxiliary: None,
         }
     }
 

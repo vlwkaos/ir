@@ -42,6 +42,13 @@ axum = { version = "0.8.8", default-features = false, features = ["http1", "toki
 tower-http = { version = "0.6.8", features = ["cors"] }
 schemars = "1.2.1"
 usearch = "=2.26.0"  # exact-pin: vendored C++ engine compiled via cxx; avoid unaudited 2.x drift
+# Code-domain symbol extraction (auxiliary domains). Exact pins: each grammar compiles vendored C via cc.
+tree-sitter = { version = "=0.25.10", default-features = false, features = ["std"] }
+tree-sitter-rust = "=0.24.0"
+tree-sitter-python = "=0.25.0"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-go = "=0.25.0"
 
 [dev-dependencies]
 tempfile = "3"
