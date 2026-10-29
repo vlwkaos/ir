@@ -10,6 +10,13 @@
 
 - **`ir --help` is a complete quick guide for people and agents.** It now includes a quick start and tips on picking a mode, filters and reading results. `search`, `get`/`multi-get`, `collection add` and `sync`/`update`/`embed` show runnable examples, and every command summary says what it does and when to use it.
 
+### Security
+
+- Updated TLS dependencies used for model downloads: `rustls` 0.23.46,
+  `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.10 (RUSTSEC-2026-0285,
+  -0346, -0348, -0349, -0381, -0382). Updated `crossbeam-epoch` to 0.9.20
+  (RUSTSEC-2026-0204).
+
 ## [0.18.2] - 2026-10-15
 
 ### Fixed
