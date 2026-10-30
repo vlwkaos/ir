@@ -257,6 +257,7 @@ collections:
 - 문서가 심볼 이름을 쓰면 연결됩니다. `snake_case`, `camelCase`, 두 단어 이상의 `PascalCase`는 어디서든, 다른 이름은 백틱 안에서만 연결됩니다. 파일 경로(`src/db/schema.rs` 또는 `db/schema.rs`처럼 유일한 접미사)를 쓰면 파일과 연결됩니다.
 - 보조 근거가 있는 결과는 `--json` 출력에 `evidence` 필드가 붙습니다(예: `["code:src/cache.rs:invalidate_entry"]`). 코드 도메인이 없으면 결과와 출력은 이전과 같습니다.
 - 컬렉션에서 `auxiliary:`를 지우면 다음 `ir update`에서 코드 색인이 삭제됩니다.
+- `ir status`, MCP `status`, MCP 연결 안내문은 코드가 있는 컬렉션에만 `code: N symbols`를 표시합니다. 소스 파일이 있는 폴더를 `--code-glob` 없이 `ir collection add`로 추가하면, 추가할 설정을 담은 안내를 한 번 출력합니다.
 - 문서가 이름을 쓰지 않는 코드는 명시적 링크로 연결합니다.
   - 문서 frontmatter: `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` (파일 경로나 유일한 접미사, `path:symbol`, 심볼 이름)
   - 코드 주석: `// knowledge: design/ledger.md` 또는 `// [[Ledger design]]` (문서 경로나 제목). 파일 전체에 적용됩니다.

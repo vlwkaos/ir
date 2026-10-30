@@ -608,3 +608,80 @@ fn include_code_returns_code_after_documents_only_on_request() {
         "{mcp_results}"
     );
 }
+
+/// Agents learn about the code domain only where it applies: `ir collection
+/// add` hints once when a folder holds source files and no code domain was
+/// asked for; `ir status`, MCP `status` and the MCP connect instructions name
+/// the code only for collections that have it, so setups without code spend
+/// no extra output on it.
+#[test]
+fn code_domain_is_announced_only_where_it_applies() {
+    let env = Env::new("aux-announce");
+
+    let repo = env.path("repo");
+    write(
+        &repo,
+        "docs/cache.md",
+        "# Cache\n\nNotes about the cache.\n",
+    );
+    write(
+        &repo,
+        "src/cache.rs",
+        "/// Evict stale entries.\npub fn evict_stale() {}\n",
+    );
+    let plain = env.path("plain");
+    write(&plain, "a.md", "# Plain\n\nOnly notes here.\n");
+
+    let hint_for = |name: &str, dir: &std::path::Path, extra: &[&str]| {
+        let mut args = vec!["collection", "add", name, dir.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        let (ok, _, stderr) = env.run(&args);
+        assert!(ok, "collection add failed: {stderr}");
+        // ^ the hint spans two lines: "note: …" then the config snippet
+        stderr.starts_with("note:") && stderr.contains("**/*.rs")
+    };
+    let hinted_repo = hint_for("repo", &repo, &[]);
+    let hinted_plain = hint_for("plain", &plain, &[]);
+    let hinted_with_code = hint_for(
+        "code",
+        &repo,
+        &["--glob", "docs/**/*.md", "--code-glob", "src/**/*.rs"],
+    );
+    env.ok(&["update"]);
+
+    let status = env.ok(&["status"]);
+    let status_line = |name: &str| {
+        status
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{name} ")))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let mut server = support::Mcp::start(&env);
+    let mcp_status = server.tool("status", serde_json::json!({})).unwrap();
+    let code_symbols = |name: &str| {
+        mcp_status["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .map(|c| c.get("code_symbols").cloned())
+    };
+
+    assert_eq!(
+        (
+            hinted_repo,
+            hinted_plain,
+            hinted_with_code,
+            status_line("code").contains("code: "),
+            status_line("plain").contains("code: "),
+            code_symbols("code").flatten().is_some(),
+            code_symbols("plain"),
+            server.instructions.contains("include_code"),
+        ),
+        (true, false, false, true, false, true, Some(None), true),
+        "status:\n{status}\nmcp status: {mcp_status}\ninstructions: {}",
+        server.instructions
+    );
+}

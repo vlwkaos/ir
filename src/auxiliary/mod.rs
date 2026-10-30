@@ -587,14 +587,20 @@ fn path_suffixes(path: &str) -> Vec<String> {
 
 /// True when the collection DB holds artifacts.
 pub fn has_artifacts(conn: &Connection) -> bool {
+    artifact_count(conn) > 0
+}
+
+/// Number of stored auxiliary artifacts (code symbols and files); 0 without
+/// an auxiliary domain.
+pub fn artifact_count(conn: &Connection) -> usize {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", [META_COUNT], |r| {
         r.get::<_, String>(0)
     })
     .optional()
     .ok()
     .flatten()
-    .and_then(|v| v.parse::<i64>().ok())
-    .is_some_and(|n| n > 0)
+    .and_then(|v| v.parse::<usize>().ok())
+    .unwrap_or(0)
 }
 
 /// BM25 over one collection, then auxiliary support. Same as `fts::search`

@@ -23,6 +23,8 @@ For agents:
   - Narrow with -c <collection>, -n <count>, -f \"meta.tags=rust\", -f \"modified_at>=2026-01-01\".
   - Read with `ir get` (--section, --offset, --max-chars) or `ir multi-get`, not by opening files.
   - `ir status` lists collections and their index state; `ir mcp` serves the same tools over MCP.
+  - Collections with code (status shows `code: N symbols`): --include-code also lists
+    matching functions and types after the documents.
 
 Run `ir <command> --help` for options and examples.";
 

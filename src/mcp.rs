@@ -105,6 +105,9 @@ struct CollectionStatus {
     indexed: bool,
     size_mb: f64,
     doc_count: Option<usize>,
+    /// Indexed code symbols and files; absent without a code domain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code_symbols: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -362,26 +365,44 @@ fn build_instructions() -> String {
         .map(|c| {
             let db_path = collection_db_path(&c.name);
             let suffix = if db_path.exists() {
-                count_docs(&db_path)
+                let docs = count_docs(&db_path)
                     .map(|n| format!(", {n} docs"))
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                // ^ only collections with a code domain mention it: no tokens otherwise
+                let code = count_code_symbols(&db_path)
+                    .map(|n| format!(", code: {n} symbols"))
+                    .unwrap_or_default();
+                format!("{docs}{code}")
             } else {
                 " (not indexed)".to_string()
             };
             format!("{} ({}{})", c.name, c.path, suffix)
         })
         .collect();
+    let code_hint = if cols.iter().any(|c| c.contains(", code: ")) {
+        " For collections with code, `search` with include_code=true also lists matching \
+        functions and types after the documents."
+    } else {
+        ""
+    };
 
     format!(
         "ir local search engine. Collections: {}. \
         Use `search` for hybrid BM25+vector retrieval, `get` or `multi_get` to retrieve \
         full document text by path, `status` for index health, \
-        `update` to re-index text after file changes (no embeddings).",
+        `update` to re-index text after file changes (no embeddings).{code_hint}",
         cols.join("; ")
     )
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Code symbols and files indexed for the collection; `None` when it has none.
+fn count_code_symbols(db_path: &std::path::Path) -> Option<usize> {
+    db::ensure_sqlite_vec();
+    let conn = open_readonly(db_path).ok()?;
+    Some(crate::auxiliary::artifact_count(&conn)).filter(|&n| n > 0)
+}
 
 fn count_docs(db_path: &std::path::Path) -> Option<usize> {
     db::ensure_sqlite_vec();
@@ -403,12 +424,18 @@ fn build_status() -> IrResult<StatusOutput> {
         let indexed = size_bytes.is_some();
         let size_mb = size_bytes.unwrap_or(0) as f64 / 1_048_576.0;
         let doc_count = if indexed { count_docs(&db_path) } else { None };
+        let code_symbols = if indexed {
+            count_code_symbols(&db_path)
+        } else {
+            None
+        };
         collections.push(CollectionStatus {
             name: col.name.clone(),
             path: col.path.clone(),
             indexed,
             size_mb,
             doc_count,
+            code_symbols,
         });
     }
     Ok(StatusOutput {

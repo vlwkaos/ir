@@ -253,6 +253,7 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
                 }
             }
             let store_path = config::portable_path(&path)?;
+            let code_glob_empty = code_glob.is_empty();
             config.add_collection(Collection {
                 name: name.clone(),
                 path: store_path,
@@ -266,7 +267,7 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
                 },
                 routing: None,
                 retrieval: None,
-                auxiliary: (!code_glob.is_empty()).then(|| types::AuxiliaryConfig {
+                auxiliary: (!code_glob_empty).then(|| types::AuxiliaryConfig {
                     code: Some(types::CodeDomainConfig {
                         globs: code_glob,
                         excludes: vec![],
@@ -275,6 +276,11 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
             })?;
             config.save()?;
             println!("added collection '{name}'");
+            if code_glob_empty
+                && let Some(hint) = code_domain_hint(&config::expand_path(&path), &name)
+            {
+                eprintln!("{hint}");
+            }
         }
         CollectionCmd::Rm { name, purge } => {
             config.remove_collection(&name)?;
@@ -362,6 +368,31 @@ fn handle_collection(cmd: CollectionCmd) -> Result<()> {
     Ok(())
 }
 
+/// One-time hint after `ir collection add` without `--code-glob`: the folder
+/// holds source files the code domain could link to the notes. Bounded walk
+/// (gitignore-aware); `None` when no supported source files are found.
+fn code_domain_hint(root: &std::path::Path, name: &str) -> Option<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // ^ honor ignore files inside the folder (target/, node_modules/), not above it
+    let walk = ignore::WalkBuilder::new(root)
+        .parents(false)
+        .max_depth(Some(6))
+        .build();
+    for entry in walk.flatten().take(5000) {
+        let path = entry.path().to_string_lossy();
+        if auxiliary::code::Lang::from_path(&path).is_some()
+            && let Some((_, ext)) = path.rsplit_once('.')
+        {
+            *counts.entry(ext.to_ascii_lowercase()).or_default() += 1;
+        }
+    }
+    let (ext, n) = counts.into_iter().max_by_key(|(_, n)| *n)?;
+    Some(format!(
+        "note: {n} .{ext} files here. To link code to these notes, add to '{name}' in config.yml:\n  \
+         auxiliary: {{ code: {{ globs: [\"**/*.{ext}\"] }} }}   then run `ir sync {name}`"
+    ))
+}
+
 fn handle_status() -> Result<()> {
     let config = Config::load()?;
     println!("collections: {}", config.collections.len());
@@ -375,7 +406,17 @@ fn handle_status() -> Result<()> {
         } else {
             String::new()
         };
-        println!("  {:<20} {:<12} {}  {}", col.name, status, col.path, size);
+        let code = db_exists
+            .then(|| get::open_readonly(&db_path).ok())
+            .flatten()
+            .map(|conn| auxiliary::artifact_count(&conn))
+            .filter(|&n| n > 0)
+            .map(|n| format!("  code: {n} symbols"))
+            .unwrap_or_default();
+        println!(
+            "  {:<20} {:<12} {}  {}{code}",
+            col.name, status, col.path, size
+        );
     }
     Ok(())
 }

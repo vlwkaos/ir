@@ -234,6 +234,7 @@ collections:
 - A document links to a symbol when it names it: `snake_case`, `camelCase` or two-hump `PascalCase` anywhere, or any name inside backticks. It links to a file when it names its path (`src/db/schema.rs` or a unique suffix such as `db/schema.rs`).
 - A supported result has an `evidence` field in `--json` output, e.g. `["code:src/cache.rs:invalidate_entry"]`. Without a code domain, results and output are unchanged.
 - Removing `auxiliary:` from a collection drops its code index on the next `ir update`.
+- `ir status`, MCP `status` and the MCP connect instructions show `code: N symbols` only for collections with code. `ir collection add` on a folder with source files and no `--code-glob` prints a one-time hint with the config to add.
 - Explicit links, for code a document never names:
   - in the document's frontmatter: `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` (a file path or unique suffix, `path:symbol`, or a symbol name);
   - in a code comment: `// knowledge: design/ledger.md` or `// [[Ledger design]]` (document path or title). It covers the whole file.

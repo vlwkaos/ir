@@ -228,6 +228,7 @@ collections:
 - 文档写出符号名即建立链接：`snake_case`、`camelCase` 和两段以上的 `PascalCase` 在任何位置都算，其他名称仅在反引号内算。写出文件路径（`src/db/schema.rs` 或唯一后缀如 `db/schema.rs`）则链接到该文件。
 - 有辅助证据的结果在 `--json` 输出中带 `evidence` 字段，例如 `["code:src/cache.rs:invalidate_entry"]`。未配置代码域时，结果和输出不变。
 - 从集合中删除 `auxiliary:` 后，下一次 `ir update` 会删除其代码索引。
+- `ir status`、MCP `status` 和 MCP 连接说明只对含代码的集合显示 `code: N symbols`。对含源文件的文件夹执行 `ir collection add` 且未指定 `--code-glob` 时，会打印一次提示，给出需要添加的配置。
 - 对文档从未提到的代码，可以显式链接：
   - 文档 frontmatter：`code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]`（文件路径或唯一后缀、`path:symbol` 或符号名）；
   - 代码注释：`// knowledge: design/ledger.md` 或 `// [[Ledger design]]`（文档路径或标题），作用于整个文件。

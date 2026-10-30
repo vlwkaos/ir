@@ -279,6 +279,9 @@ pub struct Mcp {
     // Replies read while waiting for a different id (overlapping requests).
     early: std::collections::HashMap<u64, Value>,
     next_id: u64,
+    /// The server's `instructions` from its `initialize` reply: what a client
+    /// shows the model when it connects.
+    pub instructions: String,
 }
 
 const MCP_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -314,8 +317,9 @@ impl Mcp {
             responses,
             early: Default::default(),
             next_id: 1,
+            instructions: String::new(),
         };
-        server.request(
+        let init = server.request(
             "initialize",
             json!({
                 "protocolVersion": "2025-03-26",
@@ -323,6 +327,10 @@ impl Mcp {
                 "clientInfo": { "name": "ir-e2e", "version": "0" },
             }),
         );
+        server.instructions = init["instructions"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         server.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
         server
     }
