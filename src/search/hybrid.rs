@@ -20,7 +20,7 @@ use crate::llm::{
 use crate::search::rrf::{self, RankedList};
 use crate::types::SearchResult;
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 fn env_override_f64(name: &str) -> Option<f64> {
@@ -446,10 +446,22 @@ fn score_fusion_two_list(
             }
         }
     }
-    let bm25_list = bm25_across(dbs, req.query, fetch_n)?;
-    let t0 = Instant::now();
-    let emb = embedder.embed_query(req.query)?;
-    log.timing("embed", t0.elapsed());
+    // ^ BM25 (with its preprocessor subprocesses) and the query embedding are
+    //   independent: run them in parallel; kNN needs the embedding.
+    let (bm25_list, embedded) = std::thread::scope(|scope| {
+        let embedding = scope.spawn(|| {
+            let t0 = Instant::now();
+            embedder.embed_query(req.query).map(|e| (e, t0.elapsed()))
+        });
+        let t0 = Instant::now();
+        let bm25 = bm25_across(dbs, req.query, fetch_n).map(|b| (b, t0.elapsed()));
+        (bm25, embedding.join())
+    });
+    let (bm25_list, bm25_time) = bm25_list?;
+    let (emb, embed_time) = embedded
+        .map_err(|_| crate::error::Error::Other("query embedding thread panicked".into()))??;
+    log.timing("bm25", bm25_time);
+    log.timing("embed", embed_time);
     let t0 = Instant::now();
     let vec_list = vec_across(dbs, &emb, fetch_n, use_ann)?;
     log.timing("knn", t0.elapsed());
@@ -470,11 +482,29 @@ fn score_fusion_two_list(
     }
 
     let t0 = Instant::now();
+    let plan = fusion_plan(dbs, req.query, &bm25_list, &vec_list);
+    if log.verbose {
+        log.log.push(format!("[fusion] {plan:?}"));
+    }
+    let query_units = coverage_units(req.query);
     let alpha = SCORE_FUSION_VEC_ALPHA;
     let mut merged: Vec<SearchResult> = scores
         .into_values()
         .map(|(bm25_score, vec_score, mut result)| {
-            result.score = alpha * vec_score + (1.0 - alpha) * bm25_score;
+            result.score = match plan {
+                // ^ BM25 counts only for passages that hold every query word
+                FusionPlan::Keyword => {
+                    let covers = bm25_score > 0.0 && passage_covers(dbs, &result, &query_units);
+                    vec_score
+                        + if covers {
+                            COVER_BM25_WEIGHT * bm25_score
+                        } else {
+                            0.0
+                        }
+                }
+                FusionPlan::CrossScript => vec_score,
+                FusionPlan::Weighted => alpha * vec_score + (1.0 - alpha) * bm25_score,
+            };
             result
         })
         .collect();
@@ -483,6 +513,146 @@ fn score_fusion_two_list(
     merged.truncate(fetch_n); // keep over-fetched count; tier-1 filter will reduce further
     log.timing("fusion", t0.elapsed());
     Ok(merged)
+}
+
+/// How tier-1 fusion weighs BM25 for one query.
+/// knowledge: domain/Multilingual and Mixed-Script Retrieval Contract.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FusionPlan {
+    /// A BM25 top-3 passage holds every query unit: vector score, plus
+    /// `COVER_BM25_WEIGHT`·BM25 only for passages that hold every unit.
+    Keyword,
+    /// A top vector hit is written in a script the query does not use, so
+    /// BM25 can only favour same-script near misses: vector score only.
+    CrossScript,
+    /// `SCORE_FUSION_VEC_ALPHA`·vector + the rest·BM25.
+    Weighted,
+}
+
+fn fusion_plan(
+    dbs: &[CollectionDb],
+    query: &str,
+    bm25_list: &[SearchResult],
+    vec_list: &[SearchResult],
+) -> FusionPlan {
+    if bm25_covers_query(dbs, query, bm25_list) {
+        FusionPlan::Keyword
+    } else if is_cross_script(dbs, query, vec_list) {
+        FusionPlan::CrossScript
+    } else {
+        FusionPlan::Weighted
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Script {
+    Latin,
+    Hangul,
+    Han,
+    Kana,
+}
+
+fn script_of(c: char) -> Option<Script> {
+    match c as u32 {
+        0x41..=0x5A | 0x61..=0x7A => Some(Script::Latin),
+        0xAC00..=0xD7A3 | 0x1100..=0x11FF | 0x3130..=0x318F => Some(Script::Hangul),
+        0x3040..=0x30FF => Some(Script::Kana),
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => Some(Script::Han),
+        _ => None,
+    }
+}
+
+/// Scripts making up at least `min_share` of the letters in `text`.
+fn dominant_scripts(text: &str, min_share: f64) -> HashSet<Script> {
+    let mut counts: HashMap<Script, usize> = HashMap::new();
+    for s in text.chars().filter_map(script_of) {
+        *counts.entry(s).or_default() += 1;
+    }
+    let total: usize = counts.values().sum();
+    counts
+        .into_iter()
+        .filter(|&(_, n)| total > 0 && n as f64 / total as f64 >= min_share)
+        .map(|(s, _)| s)
+        .collect()
+}
+
+/// Query units for the keyword check: lowercase Latin words and digit runs,
+/// and CJK runs as character bigrams (a single character stays whole).
+fn coverage_units(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut latin = String::new();
+    let mut cjk: Vec<char> = Vec::new();
+    let flush_cjk = |cjk: &mut Vec<char>, out: &mut HashSet<String>| {
+        if cjk.len() == 1 {
+            out.insert(cjk[0].to_string());
+        }
+        for w in cjk.windows(2) {
+            out.insert(w.iter().collect());
+        }
+        cjk.clear();
+    };
+    for c in text.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            flush_cjk(&mut cjk, &mut out);
+            latin.push(c);
+            continue;
+        }
+        if !latin.is_empty() {
+            out.insert(std::mem::take(&mut latin));
+        }
+        if matches!(
+            script_of(c),
+            Some(Script::Hangul | Script::Han | Script::Kana)
+        ) {
+            cjk.push(c);
+        } else {
+            flush_cjk(&mut cjk, &mut out);
+        }
+    }
+    if !latin.is_empty() {
+        out.insert(latin);
+    }
+    flush_cjk(&mut cjk, &mut out);
+    out
+}
+
+const COVER_BM25_WEIGHT: f64 = 0.2;
+
+/// True when the passage (title and text) holds every unit in `units`.
+fn passage_covers(dbs: &[CollectionDb], r: &SearchResult, units: &HashSet<String>) -> bool {
+    let text = fetch_doc_text(dbs, &r.hash, &r.collection).unwrap_or_default();
+    units.is_subset(&coverage_units(&format!("{} {text}", r.title)))
+}
+
+/// True when one of the 3 best BM25 hits holds every query unit.
+fn bm25_covers_query(dbs: &[CollectionDb], query: &str, bm25_list: &[SearchResult]) -> bool {
+    const TOP: usize = 3;
+    let units = coverage_units(query);
+    if units.is_empty() {
+        return false;
+    }
+    let mut best: Vec<&SearchResult> = bm25_list.iter().collect();
+    best.sort_by(|a, b| b.score.total_cmp(&a.score));
+    best.into_iter()
+        .take(TOP)
+        .any(|r| passage_covers(dbs, r, &units))
+}
+
+/// True when one of the top vector hits shares no dominant script with the query.
+fn is_cross_script(dbs: &[CollectionDb], query: &str, vec_list: &[SearchResult]) -> bool {
+    const TOP: usize = 10;
+    const SHARE: f64 = 0.2;
+    let query_scripts: HashSet<Script> = query.chars().filter_map(script_of).collect();
+    if query_scripts.is_empty() {
+        return false;
+    }
+    vec_list.iter().take(TOP).any(|r| {
+        let Some(text) = fetch_doc_text(dbs, &r.hash, &r.collection) else {
+            return false;
+        };
+        let doc_scripts = dominant_scripts(&text, SHARE);
+        !doc_scripts.is_empty() && doc_scripts.is_disjoint(&query_scripts)
+    })
 }
 
 /// Multi-subquery RRF fusion.
