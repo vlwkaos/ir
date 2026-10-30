@@ -392,3 +392,145 @@ fn search_gives_up_on_a_daemon_that_never_answers() {
         "waited {waited:?}; stderr: {stderr}"
     );
 }
+
+/// A hybrid search once the daemon serves tier 1 (its verbose log names the
+/// fusion plan); earlier searches return BM25 while the models load.
+/// Returns the result paths and the pipeline log.
+fn hybrid_search(env: &Env, collection: &str, query: &str) -> (Vec<String>, String) {
+    let mut found = (Vec::new(), String::new());
+    let mut last = String::new();
+    let served = eventually(DAEMON_START, || {
+        let (ok, stdout, stderr) = env.run(&["search", "--json", "-v", "-c", collection, query]);
+        if !ok || !stderr.contains("[fusion]") {
+            last = format!("ok={ok}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+            return false;
+        }
+        found = (
+            support::result_paths(&serde_json::from_str(&stdout).unwrap()),
+            stderr,
+        );
+        true
+    });
+    assert!(
+        served,
+        "hybrid search never reached tier 1; last attempt:\n{last}"
+    );
+    found
+}
+
+/// Hybrid fusion picks a weighting per query from the BM25 and vector hits:
+/// a question in another script than its answer ranks by meaning, a query that
+/// one note covers word for word keeps the keyword boost, and a same-script
+/// question over same-script notes keeps the weighted mix. The ranking gain itself is measured on the
+/// MIRACL benchmark; this scenario checks the choice through the real daemon.
+/// knowledge: domain/Multilingual and Mixed-Script Retrieval Contract.md
+#[test]
+#[ignore = "embeds and searches with the real models"]
+fn hybrid_fusion_chooses_the_weighting_per_query() {
+    let env = Env::with_real_models("e2e-xlang");
+    let notes = env.add_collection("notes", &[]);
+    write(
+        &notes,
+        "retention.md",
+        "# 서버 로그 보관 정책\n\n서버 로그는 30일 동안 보관한 뒤 자동으로 삭제합니다.\n",
+    );
+    write(
+        &notes,
+        "artifacts.md",
+        "# Build artifacts\n\nHow long are build artifacts kept before they are deleted? Build artifacts are kept for 7 days.\n",
+    );
+    write(
+        &notes,
+        "rockets.md",
+        "# Launch\n\nThe rocket engine fires and the launch vehicle climbs to orbit.\n",
+    );
+    // ^ same-script plan needs top vector hits in the query's script only
+    let korean = env.add_collection("ko", &[]);
+    write(
+        &korean,
+        "retention.md",
+        "# 서버 로그 보관 정책\n\n서버 로그는 30일 동안 보관한 뒤 자동으로 삭제합니다.\n",
+    );
+    write(
+        &korean,
+        "deploy.md",
+        "# 배포 절차\n\n배포 전에 변경 내역을 검토하고 롤백 계획을 세웁니다.\n",
+    );
+    env.ok(&["sync"]);
+    let plan = |log: &str| {
+        log.lines()
+            .find_map(|l| l.strip_prefix("[fusion] "))
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let (cross, cross_log) = hybrid_search(
+        &env,
+        "notes",
+        "how long are server logs kept before they are deleted",
+    );
+    let (_, keyword_log) = hybrid_search(&env, "notes", "rocket engine launch vehicle");
+    let (_, same_log) = hybrid_search(&env, "ko", "서버 로그 보관 기간");
+
+    assert_eq!(
+        (
+            plan(&cross_log),
+            cross.first().map(String::as_str),
+            plan(&keyword_log),
+            plan(&same_log),
+        ),
+        (
+            "CrossScript".to_string(),
+            Some("retention.md"),
+            "Keyword".to_string(),
+            "Weighted".to_string(),
+        ),
+        "cross:\n{cross_log}\nkeyword:\n{keyword_log}\nsame script:\n{same_log}"
+    );
+}
+
+/// The code domain changes which documents BM25 returns. Hybrid search must
+/// still rank the note that a matching function links to first, for a query
+/// that names only the function's behaviour.
+#[test]
+#[ignore = "embeds and searches with the real models"]
+fn code_supported_note_ranks_first_in_hybrid_search() {
+    let env = Env::with_real_models("e2e-codehyb");
+    let notes = env.add_collection(
+        "notes",
+        &["--glob", "docs/**/*.md", "--code-glob", "src/**/*.rs"],
+    );
+    write(
+        &notes,
+        "src/cache.rs",
+        "/// Drop cached entries whose schema version is older than the current one.\npub fn evict_stale_schema_entries() {}\n",
+    );
+    write(
+        &notes,
+        "docs/cache.md",
+        "# Cache design\n\nAfter a migration we call `evict_stale_schema_entries` on startup.\n",
+    );
+    write(
+        &notes,
+        "docs/release.md",
+        "# Release checklist\n\nTag the release, update the changelog and publish the binaries.\n",
+    );
+    write(
+        &notes,
+        "docs/rockets.md",
+        "# Launch\n\nThe rocket engine fires and the launch vehicle climbs to orbit.\n",
+    );
+    env.ok(&["sync", "notes"]);
+
+    let (paths, log) = hybrid_search(
+        &env,
+        "notes",
+        "drop cached entries with an old schema version",
+    );
+
+    assert_eq!(
+        paths.first().map(String::as_str),
+        Some("docs/cache.md"),
+        "results: {paths:?}\nlog:\n{log}"
+    );
+}

@@ -1206,6 +1206,8 @@ mod tests {
 
     #[test]
     fn collection_routing_override_applies_when_all_collections_agree() {
+        // ^ another test sets the strong-signal override env vars
+        let _env = env_lock();
         let make = |name: &str| Collection {
             name: name.into(),
             path: "/tmp".into(),
@@ -1233,6 +1235,8 @@ mod tests {
 
     #[test]
     fn collection_routing_override_falls_back_on_conflict() {
+        // ^ another test sets the strong-signal override env vars
+        let _env = env_lock();
         let a = Collection {
             name: "a".into(),
             path: "/tmp".into(),
