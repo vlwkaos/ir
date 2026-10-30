@@ -482,11 +482,11 @@ fn score_fusion_two_list(
     }
 
     let t0 = Instant::now();
-    let plan = fusion_plan(dbs, req.query, &bm25_list, &vec_list);
+    let query_units = coverage_units(req.query);
+    let plan = fusion_plan(dbs, req.query, &query_units, &bm25_list, &vec_list);
     if log.verbose {
         log.log.push(format!("[fusion] {plan:?}"));
     }
-    let query_units = coverage_units(req.query);
     let alpha = SCORE_FUSION_VEC_ALPHA;
     let mut merged: Vec<SearchResult> = scores
         .into_values()
@@ -532,10 +532,11 @@ enum FusionPlan {
 fn fusion_plan(
     dbs: &[CollectionDb],
     query: &str,
+    query_units: &HashSet<String>,
     bm25_list: &[SearchResult],
     vec_list: &[SearchResult],
 ) -> FusionPlan {
-    if bm25_covers_query(dbs, query, bm25_list) {
+    if bm25_covers_query(dbs, query_units, bm25_list) {
         FusionPlan::Keyword
     } else if is_cross_script(dbs, query, vec_list) {
         FusionPlan::CrossScript
@@ -625,9 +626,12 @@ fn passage_covers(dbs: &[CollectionDb], r: &SearchResult, units: &HashSet<String
 }
 
 /// True when one of the 3 best BM25 hits holds every query unit.
-fn bm25_covers_query(dbs: &[CollectionDb], query: &str, bm25_list: &[SearchResult]) -> bool {
+fn bm25_covers_query(
+    dbs: &[CollectionDb],
+    units: &HashSet<String>,
+    bm25_list: &[SearchResult],
+) -> bool {
     const TOP: usize = 3;
-    let units = coverage_units(query);
     if units.is_empty() {
         return false;
     }
@@ -635,7 +639,7 @@ fn bm25_covers_query(dbs: &[CollectionDb], query: &str, bm25_list: &[SearchResul
     best.sort_by(|a, b| b.score.total_cmp(&a.score));
     best.into_iter()
         .take(TOP)
-        .any(|r| passage_covers(dbs, r, &units))
+        .any(|r| passage_covers(dbs, r, units))
 }
 
 /// True when one of the top vector hits shares no dominant script with the query.

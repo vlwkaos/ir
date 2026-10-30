@@ -7,7 +7,7 @@
 
 [ENG](README.md) | [한국어](README.ko.md) | [中文](README.zh.md)
 
-마크다운 지식베이스를 위한 로컬 시맨틱 검색. BM25 + 벡터 + LLM 재순위화를 전부 로컬 머신에서 수행 — 컬렉션당 SQLite 파일 하나, 퍼시스턴트 데몬이 모델을 메모리에 상주시키고, 모든 LLM 출력은 캐시된다.
+여러 언어가 섞인 마크다운 지식베이스를 위한 로컬 검색. BM25 + 벡터 + LLM 재순위화를 전부 로컬 머신에서 수행 — 컬렉션당 SQLite 파일 하나, 퍼시스턴트 데몬이 모델을 메모리에 상주시키고, 모든 LLM 출력은 캐시된다. 선택적으로 노트 옆의 소스 코드를 보조 근거로 색인한다.
 
 ```bash
 brew install vlwkaos/tap/ir          # macOS
@@ -26,17 +26,34 @@ BM25 검색은 모델 없이 동작한다. 벡터/하이브리드 검색은 첫 
 
 3개 티어. 각 티어는 **이전 티어가 확실하지 않을 때만** 실행되므로, 대부분의 쿼리는 티어 0 또는 1에서 반환되고 LLM을 건드리지 않는다. 하나의 웜 데몬이 모든 모델을 메모리에 유지하고, 모든 LLM 출력은 SQLite에 캐시된다.
 
-<p align="center">
-  <img src="research/ir-pipeline.png" alt="ir 0.18 3-티어 검색 파이프라인: 티어 0 BM25 + doc-graph 확장, 티어 1 HNSW ANN + 하이브리드 융합, 티어 2 재순위기 (윈도우 100 + keep-window); 강신호 단축으로 조기 반환; LLM 확장기는 기본 비활성화되어 호출 에이전트에 위임." width="620">
-</p>
+```
+query
+  │
+  ▼  TIER 0 · no model · instant
+  BM25 (+ doc-graph neighbours, + documents that matching code links to)
+  clear keyword winner? ─── yes ──► results
+  │
+  ▼  TIER 1 · embedding model · ~50 ms
+  BM25  ∥  embed query ─► vector kNN (HNSW)          run in parallel
+  fuse, choosing per query:
+    a top BM25 passage holds every query word ─► vector + BM25 boost for exact matches
+    answers are in another script than the query ─► vector only (cross-language)
+    otherwise ─► 0.8 · vector + 0.2 · BM25
+  confident? ─── yes ──► results
+  │
+  ▼  TIER 2 · reranker 0.6B · ~2–5 s
+  rerank the top 100 ─► results
+```
 
-전처리기는 한국어·일본어·중국어 검색의 성패를 가르는 단계다: 색인 텍스트와 쿼리를 동일하게 형태소 단위로 토큰화하며, 없으면 CJK BM25 점수가 0에 가깝다.
+쿼리마다 융합 방식을 고르므로 키워드 조회는 정확하게 유지되고, 질문은 다른 언어로 쓰인 답도 찾는다. 영어 질문이 한국어 노트와 일치하고, 그 반대도 마찬가지다.
 
-**콜드 vs 웜** (M4 Max): 첫 쿼리는 데몬이 모델을 로드하는 ~3.0초, 이후 모든 쿼리는 ~30ms 왕복 — 콜드 스타트 중에도 BM25는 즉시 응답한다. **0.18**부터 HNSW ANN, 티어-0 그래프 확장, 넓은 재순위 윈도우가 기본 활성화되고, LLM 쿼리 확장기는 호출 에이전트로 위임된다 — 모두 [고급 설정](#고급-설정)에서 컬렉션별로 조정할 수 있다.
+전처리기는 한국어·일본어·중국어 BM25 검색의 성패를 가르는 단계다: 색인 텍스트와 쿼리를 동일하게 형태소 단위로 토큰화하며, 없으면 CJK BM25 점수가 0에 가깝다.
 
-## 측정된 품질 (0.18 기본값, nDCG@10)
+**콜드 vs 웜** (M4 Max): 첫 쿼리는 데몬이 모델을 로드하는 ~3.0초, 이후 모든 쿼리는 ~30ms 왕복 — 콜드 스타트 중에도 BM25는 즉시 응답한다. 파이프라인 설정은 [고급 설정](#고급-설정)에서 컬렉션별로 조정할 수 있다.
 
-각 단계는 하나의 완전한 에스컬레이션 단계 — **쿼리가 그 단계에서 멈췄을 때**의 점수다. `BM25`와 `Vector`는 단일 신호 기준선이고, `Hybrid`는 둘을 융합하며(`0.80·vec + 0.20·bm25`, 티어 1), `+ Rerank`는 window-100 풀에 0.6B 재순위기를 더한다(티어 2). LLM 확장기는 **기본 비활성화**.
+## 측정된 품질 (nDCG@10)
+
+각 열은 **쿼리가 그 단계에서 멈췄을 때**의 점수다. `BM25`와 `Vector`는 단일 신호 기준선이고, `Hybrid`는 티어 1이며, `+ Rerank`는 상위 100개에 0.6B 재순위기를 더한다(티어 2). LLM 확장기는 **기본 비활성화**.
 
 | 코퍼스 | BM25 | Vector | Hybrid | + Rerank |
 |---|---|---|---|---|
@@ -44,16 +61,18 @@ BM25 검색은 모델 없이 동작한다. 벡터/하이브리드 검색은 첫 
 | FiQA (en, 57.6k 문서, 648 쿼리) | 0.24 | 0.40 | 0.40 | **0.44** |
 | MIRACL-ko 50k (ko, 213 쿼리) | 0.73 | — | 0.92 | **0.96** |
 | Allganize RAG-eval-KO (ko, 1.4k 페이지, 298 쿼리) | 0.70 | — | 0.69 | 0.72 |
-| **중앙값 지연시간** (웜, M-시리즈) | ~1 ms | ~50 ms | ~50–280 ms | ~2 s |
+| 한/일/중/영 혼합, 교차 언어 질문 (19k 패시지, 200 쿼리) | ≈ 0 | 0.78 | **0.78** | **0.80** |
+| **중앙값 지연시간** (웜, M-시리즈) | ~1 ms | ~50 ms | ~50–280 ms | ~2–5 s |
 
-`BM25`는 원시 FTS5이며, 0.18 기본 티어-0은 **doc-graph 확장**도 실행한다 — 희소 코퍼스(NFCorpus, `0.31 → 0.33`)에서 ≈ +0.02 nDCG@10, 밀집 코퍼스(FiQA)에서는 ~중립. FiQA는 BM25가 약해 `Vector ≈ Hybrid`이고, 재순위기가 실질 향상을 만든다(`0.40 → 0.44`). 한국어는 `ko` 전처리기가 전제다 (없으면 한국어 BM25 ≈ 0). 한국어 `Vector`는 여기서 재측정하지 않음(—).
+교차 언어 질문은 한국어·일본어·중국어 패시지에 대한 영어 질문과 영어 패시지에 대한 한국어 질문을 한 코퍼스(MIRACL)에 섞은 것이다. 이전의 고정 `0.8 · vector + 0.2 · BM25` 융합은 여기서 **0.21**(재순위기 포함 0.71)이었다. BM25가 같은 언어의 근접 오답을 정답 위로 끌어올렸기 때문이다. 위의 단일 언어 결과는 쿼리별 융합으로 바뀌지 않았다(±0.003 이내). 티어 0은 **doc-graph 확장**도 실행하며, 희소 코퍼스(NFCorpus)에서 ≈ +0.02, 밀집 코퍼스(FiQA)에서는 ~중립이다. 한국어 BM25는 `ko` 전처리기가 필요하다 (없으면 ≈ 0). 한국어 `Vector`는 여기서 재측정하지 않았다(—). 방법과 데이터: [research/adr-0002-per-query-fusion.md](research/adr-0002-per-query-fusion.md).
 
 ## 버전 한눈에 보기
 
 - **≤ 0.15** — 코어 파이프라인, 데몬, MCP, CJK 전처리기.
-- **0.16** — `ir sync` (인덱스 + 임베딩 단일 명령), 자가 복구 증분 업데이트: 삭제된 파일은 완전히 제거되고, 이동/복원된 콘텐츠는 캐시된 벡터를 재사용.
-- **0.17** — graph-expanded retrieval 연구 인프라와 선택적 HNSW ANN 인덱스, 대폭 빨라진 벤치마크 툴체인. **전부 기본 비활성화이며 검색 동작을 전혀 바꾸지 않는다** — opt-in 실험이지 내장 기능이 아니다. 컬렉션 DB에는 첫 쓰기 시 빈 테이블 2개가 추가되며, 0.16과 양방향으로 완전 호환.
-- **0.18** — 위 연구 경로들이 **기본** 파이프라인이 된다: 벡터 검색용 HNSW ANN, 티어-0 그래프 확장, keep-window를 갖춘 넓은 재순위 윈도우, 그리고 기본에서 제거된 LLM 쿼리 확장기(확장은 호출 에이전트로 이관). 모든 항목은 `retrieval:` 설정 블록을 통해 컬렉션별로 조정할 수 있다 ([고급 설정](#고급-설정)). 마이그레이션은 매끄럽다 — 기존 컬렉션은 다음 `ir sync`에서 ANN 인덱스와 doc graph를 빌드하고 그 전까지는 정확 검색으로 폴백한다; 스키마 변경 없음. 근거와 측정 결과: [research/adr-0001-default-retrieval-pipeline.md](research/adr-0001-default-retrieval-pipeline.md). *(O(N·log N) graph-from-ANN 빌드는 0.18.x 후속 작업이며, 0.18.0은 기존 정확 패스로 그래프를 빌드한다.)*
+- **0.16** — `ir sync` (인덱스 + 임베딩 단일 명령); 삭제된 파일은 제거되고 이동된 콘텐츠는 캐시된 벡터를 재사용.
+- **0.17** — opt-in 연구 경로: 문서 그래프와 HNSW ANN 인덱스.
+- **0.18** — 그 경로들이 기본값이 된다 (HNSW ANN, 티어-0 그래프 확장, 재순위 윈도우 100); LLM 쿼리 확장기는 호출 에이전트로 이관. [ADR-0001](research/adr-0001-default-retrieval-pipeline.md).
+- **다음** — 여러 언어가 섞인 컬렉션을 위한 쿼리별 하이브리드 융합, 병렬 티어 1, 코드 도메인, 다시 쓴 `--help`. [ADR-0002](research/adr-0002-per-query-fusion.md). 기존 컬렉션은 재색인 없이 그대로 동작한다.
 
 ## 문서
 
@@ -161,7 +180,10 @@ ir search "에러 처리" -c notes --min-score 0.4
 
 ir search "소유권" --json | --md | --files | --full | --chunk | --quiet
 ir search "설계" -f "modified_at>=2026-01-01" -f "meta.tags=rust"
+ir search "token refresh" --include-code         # 코드 심볼도 문서 뒤에 함께 반환
 ```
+
+쿼리와 문서의 언어가 달라도 된다. 영어 질문이 `hybrid`와 `vector` 모드에서 한국어 노트를 찾는다. `bm25`는 단어만 일치시킨다.
 
 필터 절(`-f`, 반복 가능, AND 결합): 필드 `path`, `modified_at`, `created_at`, `meta.<name>`; 연산자 `=` `!=` `>` `>=` `<` `<=` `~` `!~`. 날짜는 UTC RFC3339로 정규화된다. 배열 프론트매터 필드는 **어느 한** 요소라도 조건을 만족하면 일치로 처리된다 (`!=` 포함).
 
@@ -211,13 +233,47 @@ ir preprocessor bind ko wiki  # 컬렉션에 연결하고 재인덱싱
 </details>
 
 <details>
+<summary><strong>코드 도메인 — 소스 코드를 보조 근거로</strong></summary>
+
+컬렉션 문서 옆의 소스 파일을 함께 색인합니다. 코드 파일은 검색 결과로 나오지 않습니다. 대신 심볼과 doc comment가 그 심볼을 언급한 문서의 순위를 올리거나 결과에 추가합니다.
+
+```bash
+ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs' --code-glob 'src/**/*.py'
+ir update notes
+ir search "drop outdated values after a migration" --json   # 해당 함수를 언급한 문서를 찾습니다
+```
+
+```yaml
+collections:
+  - name: notes
+    path: ~/project
+    auxiliary:
+      code:
+        globs: ["src/**/*.rs", "src/**/*.py"]
+        excludes: ["src/generated/**"]   # 선택
+```
+
+- 지원 형식: `.rs`, `.py`, `.js`/`.jsx`/`.mjs`/`.cjs`, `.ts`/`.tsx`, `.go` (tree-sitter). 함수, 메서드, 타입, trait/interface, 상수, 모듈을 doc comment와 함께 색인합니다. 함수 본문은 색인하지 않습니다.
+- 문서가 심볼 이름을 쓰면 연결됩니다. `snake_case`, `camelCase`, 두 단어 이상의 `PascalCase`는 어디서든, 다른 이름은 백틱 안에서만 연결됩니다. 파일 경로(`src/db/schema.rs` 또는 `db/schema.rs`처럼 유일한 접미사)를 쓰면 파일과 연결됩니다.
+- 보조 근거가 있는 결과는 `--json` 출력에 `evidence` 필드가 붙습니다(예: `["code:src/cache.rs:invalidate_entry"]`). 코드 도메인이 없으면 결과와 출력은 이전과 같습니다.
+- 컬렉션에서 `auxiliary:`를 지우면 다음 `ir update`에서 코드 색인이 삭제됩니다.
+- 문서가 이름을 쓰지 않는 코드는 명시적 링크로 연결합니다.
+  - 문서 frontmatter: `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` (파일 경로나 유일한 접미사, `path:symbol`, 심볼 이름)
+  - 코드 주석: `// knowledge: design/ledger.md` 또는 `// [[Ledger design]]` (문서 경로나 제목). 파일 전체에 적용됩니다.
+- `ir update`는 아무것도 가리키지 않는 명시적 링크마다 경고합니다(예: 이름 변경 후). 낡은 링크를 바로 고칠 수 있습니다.
+- 코드 일치는 쿼리 단어의 절반 이상을 포함할 때만 근거로 씁니다.
+- `ir search --include-code`(MCP: `include_code: true`)는 일치한 심볼과 파일 자체도 **모든 문서 뒤에** 반환합니다. 결과에는 `"kind": "code"`, 소스 파일 `path`, `code:<path>:<line>` 형식의 `doc_id`가 붙고, snippet은 시그니처와 doc comment입니다. 기본값은 꺼짐입니다. 코드는 보조 정보로 남습니다. 필터(`-f`)는 문서에만 적용됩니다.
+
+</details>
+
+<details>
 <summary><strong>MCP 서버 — Claude Desktop / Claude Code</strong></summary>
 
 ```json
 { "mcpServers": { "ir": { "command": "ir", "args": ["mcp"] } } }
 ```
 
-도구: `search` (`mode`, `limit`, `min_score`, `collections`, `filter` 지원), `get`, `multi_get`, `status`, `update`.
+도구: `search` (`mode`, `limit`, `min_score`, `collections`, `filter`, `include_code` 지원), `get`, `multi_get`, `status`, `update`.
 
 `update`는 텍스트 전용이다. BM25 인덱스만 갱신하고 임베딩은 계산하지 않는다. 결과에는 컬렉션마다 `path`, `scanned`, `added`, `updated`, `deactivated`, `pending_embeddings`, `notes`가 들어 있다. 대기 중인 문서를 임베딩하려면 터미널에서 `ir embed`나 `ir sync`를 실행한다. `force: true`는 그때까지 컬렉션의 기존 벡터를 지운다.
 
@@ -246,7 +302,7 @@ bash scripts/preship.sh              # 픽스처 기반 안정성 / 속도 / 품
 
 실행은 재개 가능하고 (쿼리별 진행 상태가 크래시를 견딤) macOS에서는 메모리 감시기가 보호한다. 과거 BEIR 결과 (이전 파이프라인 설정): ArguAna에서 재순위화가 순수 벡터 대비 최대 +14.5% nDCG@10; 영어 코퍼스에서 융합 단독은 순수 벡터보다 유의미하게 낫지 않았다 — tier-2의 가치는 재순위기에 있다.
 
-v0.17은 이 코퍼스들에서 탐구한 **기본 비활성화** 실험 연구 인프라를 포함한다: 재순위기 후보 풀을 넓히는 문서 유사도 그래프 (희소 결과 코퍼스에서 유의미), 그리고 근사 kNN용 선택적 HNSW 인덱스 (usearch) — 검증(MIRACL-ko 50k)에서 정확 검색과 top-10 일치율 99.2%, nDCG@10은 정확 검색과 동일. 기본 동작은 전혀 바뀌지 않는다; 세부 사항과 측정 결과는 `CHANGELOG.md` 참고.
+HNSW 인덱스(usearch)는 정확 검색과 top-10 일치율 99.2%, 동일한 nDCG@10을 보였다(MIRACL-ko 50k). 혼합 언어 세트는 MIRACL로 만들었다. 방법, 데이터, 스크립트는 [ADR-0002](research/adr-0002-per-query-fusion.md)에 있다.
 
 </details>
 
@@ -273,20 +329,20 @@ cargo test                   # 모델 불필요
 cargo test -- --ignored      # 모델 의존 테스트
 ```
 
-컬렉션별 스키마: `content` (해시 → 텍스트), `documents`, `documents_fts` (FTS5), `vectors_vec` (sqlite-vec, 코사인), `content_vectors` (청크 메타데이터), `llm_cache` (재순위 점수), `document_metadata` (프론트매터), `meta`, `doc_graph`, `ann_keys`. 전역 `expander_cache.sqlite`는 확장 출력을 캐시한다. 스테이지드 비동기 데몬 설계는 [research/pipeline.md](research/pipeline.md) 참고.
+컬렉션별 스키마: `content` (해시 → 텍스트), `documents`, `documents_fts` (FTS5), `vectors_vec` (sqlite-vec, 코사인), `content_vectors` (청크 메타데이터), `llm_cache` (재순위 점수), `document_metadata` (프론트매터), `meta`, `doc_graph`, `ann_keys`, 그리고 코드 도메인의 `artifact_sources`, `artifacts`, `artifact_fts`, `artifact_anchors`, `artifact_edges` (코드 도메인이 없으면 비어 있음). 전역 `expander_cache.sqlite`는 확장 출력을 캐시한다. 스테이지드 비동기 데몬 설계는 [research/pipeline.md](research/pipeline.md) 참고.
 
 </details>
 
 ## 고급 설정
 
-검색 파이프라인 동작은 `config.yml`의 `retrieval:` 블록에서 컬렉션별로(그리고 전역으로) 설정한다. 모든 필드는 선택 사항이며 — 생략하면 0.18 기본값이 적용된다. 해석 우선순위는 **`config > env > default`**: 여기에 설정한 값이 최종 권한을 가지며, 떠도는 환경변수에 조용히 덮어써지지 않는다.
+검색 파이프라인 동작은 `config.yml`의 `retrieval:` 블록에서 컬렉션별로(그리고 전역으로) 설정한다. 모든 필드는 선택 사항이며 — 생략하면 기본값이 적용된다. 해석 우선순위는 **`config > env > default`**: 여기에 설정한 값이 최종 권한을 가지며, 떠도는 환경변수에 조용히 덮어써지지 않는다.
 
 ```yaml
 # ~/.config/ir/config.yml
 
 # 전역 (데몬): 인프로세스 LLM 쿼리 확장기 로드 여부
 retrieval:
-  expander: false            # 0.18 기본값 — 확장은 호출 에이전트의 몫
+  expander: false            # 기본값 — 확장은 호출 에이전트의 몫
 
 collections:
   - name: notes
@@ -299,7 +355,7 @@ collections:
       rerank_keep_window: true
 ```
 
-| 키 | 범위 | 0.18 기본값 | 의미 |
+| 키 | 범위 | 기본값 | 의미 |
 |---|---|---|---|
 | `ann` | 컬렉션 | `true` | 벡터 검색용 HNSW ANN 인덱스; 없거나 오래되면 정확 브루트포스로 폴백. |
 | `t0_graph_expand` | 컬렉션 | `true` | BM25 시드가 `doc_graph` 이웃을 티어-0 후보 목록으로 끌어온다. |
@@ -307,7 +363,7 @@ collections:
 | `rerank_keep_window` | 컬렉션 | `true` | 판정된 문서를 미판정 꼬리보다 위에 유지. |
 | `expander` | 전역 | `false` | 인프로세스 LLM 쿼리 확장기 로드; 아니면 확장은 호출자에게 위임. |
 
-함께 검색되는 컬렉션들은 컬렉션별 값이 **일치**해야 적용된다; 충돌하면 기본값으로 폴백한다 (`routing:`과 동일한 규칙). `ir sync` / `ir embed`는 해당 노브가 켜져 있을 때 ANN 인덱스와 doc graph를 빌드한다 (빈 컬렉션은 건너뜀). 컬렉션을 0.18 이전 검색 동작으로 되돌리려면 `ann: false`, `t0_graph_expand: false`, `rerank_window: 20`, `rerank_keep_window: false`, 그리고 전역 `expander: true`로 설정한다.
+함께 검색되는 컬렉션들은 컬렉션별 값이 **일치**해야 적용된다; 충돌하면 기본값으로 폴백한다 (`routing:`과 동일한 규칙). `ir sync` / `ir embed`는 해당 노브가 켜져 있을 때 ANN 인덱스와 doc graph를 빌드한다 (빈 컬렉션은 건너뜀). 컬렉션을 0.18 이전 파이프라인으로 되돌리려면 `ann: false`, `t0_graph_expand: false`, `rerank_window: 20`, `rerank_keep_window: false`, 그리고 전역 `expander: true`로 설정한다.
 
 **대체 설정 파일** — 데이터 디렉터리를 옮기지 않고(컬렉션과 캐시는 그대로) 다른 `config.yml`을 `ir`에 지정하여, 하나의 임베딩된 코퍼스 위에서 여러 파이프라인 설정을 비교할 수 있다:
 
@@ -316,35 +372,6 @@ ir --config-path ./variant.yml search "query" -c notes
 ```
 
 우선순위: `--config-path` > `IR_CONFIG_FILE` > `<config-dir>/config.yml`.
-
-**코드 도메인 (보조 근거)** — 컬렉션 문서 옆의 소스 파일을 함께 색인합니다. 코드 파일은 검색 결과로 나오지 않습니다. 대신 심볼과 doc comment가 그 심볼을 언급한 문서의 순위를 올리거나 결과에 추가합니다.
-
-```bash
-ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs' --code-glob 'src/**/*.py'
-ir update notes
-ir search "drop outdated values after a migration" --json   # 해당 함수를 언급한 문서를 찾습니다
-```
-
-```yaml
-collections:
-  - name: notes
-    path: ~/project
-    auxiliary:
-      code:
-        globs: ["src/**/*.rs", "src/**/*.py"]
-        excludes: ["src/generated/**"]   # 선택
-```
-
-- 지원 형식: `.rs`, `.py`, `.js`/`.jsx`/`.mjs`/`.cjs`, `.ts`/`.tsx`, `.go` (tree-sitter). 함수, 메서드, 타입, trait/interface, 상수, 모듈을 doc comment와 함께 색인합니다. 함수 본문은 색인하지 않습니다.
-- 문서가 심볼 이름을 쓰면 연결됩니다. `snake_case`, `camelCase`, 두 단어 이상의 `PascalCase`는 어디서든, 다른 이름은 백틱 안에서만 연결됩니다. 파일 경로(`src/db/schema.rs` 또는 `db/schema.rs`처럼 유일한 접미사)를 쓰면 파일과 연결됩니다.
-- 보조 근거가 있는 결과는 `--json` 출력에 `evidence` 필드가 붙습니다(예: `["code:src/cache.rs:invalidate_entry"]`). 코드 도메인이 없으면 결과와 출력은 이전과 같습니다.
-- 컬렉션에서 `auxiliary:`를 지우면 다음 `ir update`에서 코드 색인이 삭제됩니다.
-- 문서가 이름을 쓰지 않는 코드는 명시적 링크로 연결합니다.
-  - 문서 frontmatter: `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` (파일 경로나 유일한 접미사, `path:symbol`, 심볼 이름)
-  - 코드 주석: `// knowledge: design/ledger.md` 또는 `// [[Ledger design]]` (문서 경로나 제목). 파일 전체에 적용됩니다.
-- `ir update`는 아무것도 가리키지 않는 명시적 링크마다 경고합니다(예: 이름 변경 후). 낡은 링크를 바로 고칠 수 있습니다.
-- 코드 일치는 쿼리 단어의 절반 이상을 포함할 때만 근거로 씁니다.
-- `ir search --include-code`(MCP: `include_code: true`)는 일치한 심볼과 파일 자체도 **모든 문서 뒤에** 반환합니다. 결과에는 `"kind": "code"`, 소스 파일 `path`, `code:<path>:<line>` 형식의 `doc_id`가 붙고, snippet은 시그니처와 doc comment입니다. 기본값은 꺼짐입니다. 코드는 보조 정보로 남습니다. 필터(`-f`)는 문서에만 적용됩니다.
 
 ## 라이선스
 

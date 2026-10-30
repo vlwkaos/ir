@@ -7,7 +7,7 @@
 
 [ENG](README.md) | [한국어](README.ko.md) | [中文](README.zh.md)
 
-面向 Markdown 知识库的本地语义检索。BM25 + 向量 + LLM 重排序，全部在本机运行——每个集合一个 SQLite 文件，持久化守护进程保持模型热加载，所有 LLM 输出均被缓存。
+面向多语言混合 Markdown 知识库的本地检索。BM25 + 向量 + LLM 重排序，全部在本机运行——每个集合一个 SQLite 文件，持久化守护进程保持模型热加载，所有 LLM 输出均被缓存。还可以选择在笔记旁索引源代码，作为辅助证据。
 
 ```bash
 brew install vlwkaos/tap/ir          # macOS
@@ -24,19 +24,36 @@ BM25 检索无需任何模型。向量/混合检索在首次使用时自动从 H
 
 ## 检索流程 — 只为困难查询付出代价
 
-三层。每层**仅在上一层信心不足时**才运行，因此绝大多数查询在第 0 或第 1 层就返回，不触及 LLM。单个热守护进程将所有模型常驻内存，所有 LLM 输出都缓存在 SQLite 中。
+三层。每层**仅在上一层信心不足时**才运行，因此大多数查询在第 0 或第 1 层就返回，不触及 LLM。单个热守护进程将所有模型常驻内存，所有 LLM 输出都缓存在 SQLite 中。
 
-<p align="center">
-  <img src="research/ir-pipeline.png" alt="ir 0.18 三层检索管线：第 0 层 BM25 + doc-graph 扩展，第 1 层 HNSW ANN + 混合融合，第 2 层重排序器（窗口 100 + keep-window）；强信号捷径提前返回；LLM 扩展器默认关闭并委托给调用方。" width="620">
-</p>
+```
+query
+  │
+  ▼  TIER 0 · no model · instant
+  BM25 (+ doc-graph neighbours, + documents that matching code links to)
+  clear keyword winner? ─── yes ──► results
+  │
+  ▼  TIER 1 · embedding model · ~50 ms
+  BM25  ∥  embed query ─► vector kNN (HNSW)          run in parallel
+  fuse, choosing per query:
+    a top BM25 passage holds every query word ─► vector + BM25 boost for exact matches
+    answers are in another script than the query ─► vector only (cross-language)
+    otherwise ─► 0.8 · vector + 0.2 · BM25
+  confident? ─── yes ──► results
+  │
+  ▼  TIER 2 · reranker 0.6B · ~2–5 s
+  rerank the top 100 ─► results
+```
 
-预处理器是中日韩检索成败的关键：它对索引文本和查询做相同的形态素切分，没有它 CJK BM25 分数接近零。
+按查询选择融合方式，既让关键词查找保持精确，也让问题能找到用另一种语言写成的答案：英文问题可以匹配韩文笔记，反过来也一样。
 
-**冷启动 vs 热启动**（M4 Max）：首次查询约 3.0 秒（守护进程加载模型），之后每次查询约 30ms 往返——即使在冷启动期间 BM25 也即时响应。自 **0.18** 起，HNSW ANN、第 0 层图扩展和更宽的重排序窗口均默认开启，而 LLM 查询扩展器则委托给调用方 agent——所有这些均可在[高级配置](#高级配置)中按集合调整。
+预处理器是中日韩 BM25 检索成败的关键：它对索引文本和查询做相同的形态素切分，没有它 CJK BM25 分数接近零。
 
-## 实测质量（0.18 默认值，nDCG@10）
+**冷启动 vs 热启动**（M4 Max）：首次查询约 3.0 秒（守护进程加载模型），之后每次查询约 30ms 往返——即使在冷启动期间 BM25 也即时响应。检索管线的各项设置可在[高级配置](#高级配置)中按集合调整。
 
-每一阶段都是一次完整的升级步骤——即**查询在该阶段停止时**的得分。`BM25` 和 `Vector` 是单信号基线；`Hybrid` 将二者融合（`0.80·vec + 0.20·bm25`，第 1 层）；`+ Rerank` 在 window-100 候选池上加入 0.6B 重排序器（第 2 层）。LLM 扩展器**默认关闭**。
+## 实测质量（nDCG@10）
+
+每一列是**查询在该阶段停止时**的得分。`BM25` 和 `Vector` 是单信号基线；`Hybrid` 是第 1 层；`+ Rerank` 在前 100 个候选上加入 0.6B 重排序器（第 2 层）。LLM 扩展器**默认关闭**。
 
 | 语料库 | BM25 | Vector | Hybrid | + Rerank |
 |---|---|---|---|---|
@@ -44,16 +61,18 @@ BM25 检索无需任何模型。向量/混合检索在首次使用时自动从 H
 | FiQA（英文，57.6k 文档，648 查询） | 0.24 | 0.40 | 0.40 | **0.44** |
 | MIRACL-ko 50k（韩文，213 查询） | 0.73 | — | 0.92 | **0.96** |
 | Allganize RAG-eval-KO（韩文，1.4k 页，298 查询） | 0.70 | — | 0.69 | 0.72 |
-| **中位延迟**（热启动，M 系列） | ~1 ms | ~50 ms | ~50–280 ms | ~2 s |
+| 中日韩英混合，跨语言问题（19k 段落，200 查询） | ≈ 0 | 0.78 | **0.78** | **0.80** |
+| **中位延迟**（热启动，M 系列） | ~1 ms | ~50 ms | ~50–280 ms | ~2–5 s |
 
-`BM25` 为原始 FTS5；0.18 默认的第 0 层还会运行 **doc-graph 扩展**，在稀疏语料（NFCorpus，`0.31 → 0.33`）上带来 ≈ +0.02 nDCG@10，在稠密语料（FiQA）上则~中性。FiQA 上 BM25 较弱，故 `Vector ≈ Hybrid`；随后由重排序器带来实质提升（`0.40 → 0.44`）。韩文需要 `ko` 预处理器（否则韩文 BM25 ≈ 0）。韩文 `Vector` 未在此重新测量（—）。
+跨语言问题是指：用英文提问韩文、日文或中文段落，以及用韩文提问英文段落，混合在同一个语料库（MIRACL）中。此前固定的 `0.8 · vector + 0.2 · BM25` 融合在这里只有 **0.21**（加重排序器为 0.71）：BM25 把同语言的近似错误结果抬到了正确答案之上。上面的单语言结果不受按查询融合影响（变化在 ±0.003 以内）。第 0 层还会运行 **doc-graph 扩展**，在稀疏语料（NFCorpus）上带来 ≈ +0.02，在稠密语料（FiQA）上则~中性。韩文 BM25 需要 `ko` 预处理器（否则 ≈ 0）；韩文 `Vector` 未在此重新测量（—）。方法与数据见 [research/adr-0002-per-query-fusion.md](research/adr-0002-per-query-fusion.md)。
 
 ## 版本速览
 
 - **≤ 0.15** — 核心管线、守护进程、MCP、CJK 预处理器。
-- **0.16** — `ir sync`（索引 + 嵌入一条命令搞定），自愈式增量更新：已删除文件被彻底移除，移动/恢复的内容复用缓存向量。
-- **0.17** — 面向图扩展检索的研究基础设施和可选的 HNSW ANN 索引，以及快得多的基准测试工具链。**全部默认禁用，不改变任何检索行为**——这些是可选实验，不是内置特性。集合数据库在首次写入时新增两个空表；数据库与 0.16 双向完全兼容。
-- **0.18** — 上述研究路径成为**默认**流程：向量检索用 HNSW ANN、第 0 层图扩展、更宽的重排序窗口（含 keep-window），并从默认流程中移除 LLM 查询扩展器（扩展交给调用方 agent）。一切均可通过 `retrieval:` 配置块按集合调整（[高级配置](#高级配置)）。迁移无缝——现有集合在下次 `ir sync` 时构建其 ANN 索引和 doc graph，在此之前回退到精确检索；无 schema 变更。理由与实测结果见 [research/adr-0001-default-retrieval-pipeline.md](research/adr-0001-default-retrieval-pipeline.md)。*（O(N·log N) 的由 ANN 派生 doc graph 的构建是 0.18.x 的后续工作；0.18.0 通过现有的精确遍历构建该图。）*
+- **0.16** — `ir sync`（一条命令完成索引 + 嵌入）；已删除的文件会被移除，被移动的内容复用缓存的向量。
+- **0.17** — 可选的研究路径：文档图和 HNSW ANN 索引。
+- **0.18** — 这些路径成为默认（HNSW ANN、第 0 层图扩展、重排序窗口 100）；LLM 查询扩展器交给调用方 agent。[ADR-0001](research/adr-0001-default-retrieval-pipeline.md)。
+- **下一版** — 面向多语言集合的按查询混合融合、并行的第 1 层、代码域、重写的 `--help`。[ADR-0002](research/adr-0002-per-query-fusion.md)。现有集合无需重新索引即可继续使用。
 
 ## 文档
 
@@ -132,7 +151,10 @@ ir search "error handling" -c notes --min-score 0.4
 
 ir search "ownership" --json | --md | --files | --full | --chunk | --quiet
 ir search "design" -f "modified_at>=2026-01-01" -f "meta.tags=rust"
+ir search "token refresh" --include-code         # 同时返回代码符号，排在文档之后
 ```
+
+查询和文档可以使用不同的语言：英文问题在 `hybrid` 和 `vector` 模式下可以找到韩文笔记。`bm25` 只匹配词。
 
 过滤条件（`-f`，可重复，AND 连接）：字段 `path`、`modified_at`、`created_at`、`meta.<name>`；运算符 `=` `!=` `>` `>=` `<` `<=` `~` `!~`。日期规范化为 UTC RFC3339。多值前言字段只要**任意**一个元素满足条件即匹配（包括 `!=`）。
 
@@ -182,13 +204,47 @@ ir preprocessor bind ko wiki  # 绑定到集合并重新索引
 </details>
 
 <details>
+<summary><strong>代码域 — 以源代码作为辅助证据</strong></summary>
+
+在集合文档旁同时索引源代码文件。代码文件不会作为搜索结果返回；其符号和文档注释会提升或补充提到这些符号的文档：
+
+```bash
+ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs' --code-glob 'src/**/*.py'
+ir update notes
+ir search "drop outdated values after a migration" --json   # 找到提到对应函数的文档
+```
+
+```yaml
+collections:
+  - name: notes
+    path: ~/project
+    auxiliary:
+      code:
+        globs: ["src/**/*.rs", "src/**/*.py"]
+        excludes: ["src/generated/**"]   # 可选
+```
+
+- 支持：`.rs`、`.py`、`.js`/`.jsx`/`.mjs`/`.cjs`、`.ts`/`.tsx`、`.go`（tree-sitter）。函数、方法、类型、trait/interface、常量和模块连同文档注释一起索引；不索引函数体。
+- 文档写出符号名即建立链接：`snake_case`、`camelCase` 和两段以上的 `PascalCase` 在任何位置都算，其他名称仅在反引号内算。写出文件路径（`src/db/schema.rs` 或唯一后缀如 `db/schema.rs`）则链接到该文件。
+- 有辅助证据的结果在 `--json` 输出中带 `evidence` 字段，例如 `["code:src/cache.rs:invalidate_entry"]`。未配置代码域时，结果和输出不变。
+- 从集合中删除 `auxiliary:` 后，下一次 `ir update` 会删除其代码索引。
+- 对文档从未提到的代码，可以显式链接：
+  - 文档 frontmatter：`code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]`（文件路径或唯一后缀、`path:symbol` 或符号名）；
+  - 代码注释：`// knowledge: design/ledger.md` 或 `// [[Ledger design]]`（文档路径或标题），作用于整个文件。
+- `ir update` 会对每个指向不存在目标的显式链接发出警告（例如重命名之后），便于修复过期链接。
+- 代码匹配至少覆盖查询一半的词时才作为证据。
+- `ir search --include-code`（MCP：`include_code: true`）还会在**所有文档之后**返回匹配的符号和文件本身，带 `"kind": "code"`、源文件 `path`、`code:<path>:<line>` 形式的 `doc_id`，snippet 为签名和文档注释。默认关闭，代码仍是辅助信息。过滤器（`-f`）只作用于文档。
+
+</details>
+
+<details>
 <summary><strong>MCP 服务器 — Claude Desktop / Claude Code</strong></summary>
 
 ```json
 { "mcpServers": { "ir": { "command": "ir", "args": ["mcp"] } } }
 ```
 
-工具：`search`（支持 `mode`、`limit`、`min_score`、`collections`、`filter`）、`get`、`multi_get`、`status`、`update`。
+工具：`search`（支持 `mode`、`limit`、`min_score`、`collections`、`filter`、`include_code`）、`get`、`multi_get`、`status`、`update`。
 
 `update` 仅处理文本：它只刷新 BM25 索引，不计算嵌入。每个结果包含 `path`、`scanned`、`added`、`updated`、`deactivated`、`pending_embeddings` 和 `notes`。要嵌入待处理的文档，请在终端运行 `ir embed` 或 `ir sync`。`force: true` 会删除该集合现有的向量，直到运行上述命令为止。
 
@@ -217,7 +273,7 @@ bash scripts/preship.sh              # 基于 fixture 的稳定性 / 速度 / �
 
 运行可断点续跑（逐查询进度可在崩溃后恢复），并在 macOS 上由内存看门狗保护。历史 BEIR 结果（旧版管线配置）：重排序在 ArguAna 上相对纯向量最高提升 +14.5% nDCG@10；在英文语料上仅靠融合并不显著优于纯向量——tier-2 的价值来自重排序器。
 
-v0.17 附带在这些语料上探索的实验性、**默认关闭**的研究基础设施：一个文档相似度图，用于扩大重排序器的候选池（在稀疏结果语料上效果显著）；以及一个可选的 HNSW 索引（usearch）用于近似 kNN，验证（MIRACL-ko 50k）中与精确检索的 top-10 一致率为 99.2%，nDCG@10 与精确检索相同。它们不改变任何默认行为；详情与实测结果见 `CHANGELOG.md`。
+HNSW 索引（usearch）与精确检索的 top-10 一致率为 99.2%，nDCG@10 相同（MIRACL-ko 50k）。混合语言数据集由 MIRACL 构建；方法、数据和脚本见 [ADR-0002](research/adr-0002-per-query-fusion.md)。
 
 </details>
 
@@ -244,20 +300,20 @@ cargo test                   # 无需模型
 cargo test -- --ignored      # 依赖模型的测试
 ```
 
-集合级 schema：`content`（哈希 → 文本）、`documents`、`documents_fts`（FTS5）、`vectors_vec`（sqlite-vec，余弦）、`content_vectors`（分块元数据）、`llm_cache`（重排序分数）、`document_metadata`（前言）、`meta`、`doc_graph`、`ann_keys`。全局 `expander_cache.sqlite` 缓存扩展输出。分阶段异步守护进程设计见 [research/pipeline.md](research/pipeline.md)。
+集合级 schema：`content`（哈希 → 文本）、`documents`、`documents_fts`（FTS5）、`vectors_vec`（sqlite-vec，余弦）、`content_vectors`（分块元数据）、`llm_cache`（重排序分数）、`document_metadata`（前言）、`meta`、`doc_graph`、`ann_keys`，以及代码域的 `artifact_sources`、`artifacts`、`artifact_fts`、`artifact_anchors`、`artifact_edges`（没有代码域时为空）。全局 `expander_cache.sqlite` 缓存扩展输出。分阶段异步守护进程设计见 [research/pipeline.md](research/pipeline.md)。
 
 </details>
 
 ## 高级配置
 
-检索管线的行为可在 `config.yml` 中按集合（以及全局）通过 `retrieval:` 块配置。每个字段都是可选的——省略即采用 0.18 默认值。解析优先级为 **`config > env > default`**：此处设置的值具有权威性，不会被某个游离的环境变量悄然覆盖。
+检索管线的行为可在 `config.yml` 中按集合（以及全局）通过 `retrieval:` 块配置。每个字段都是可选的——省略即采用默认值。解析优先级为 **`config > env > default`**：此处设置的值具有权威性，不会被某个游离的环境变量悄然覆盖。
 
 ```yaml
 # ~/.config/ir/config.yml
 
 # 全局（守护进程）：是否加载进程内的 LLM 查询扩展器
 retrieval:
-  expander: false            # 0.18 默认——扩展是调用方 agent 的职责
+  expander: false            # 默认——扩展是调用方 agent 的职责
 
 collections:
   - name: notes
@@ -270,7 +326,7 @@ collections:
       rerank_keep_window: true
 ```
 
-| 键 | 作用域 | 0.18 默认 | 含义 |
+| 键 | 作用域 | 默认 | 含义 |
 |---|---|---|---|
 | `ann` | 集合 | `true` | 向量检索的 HNSW ANN 索引；缺失或过期时回退到精确的暴力检索。 |
 | `t0_graph_expand` | 集合 | `true` | BM25 种子将 `doc_graph` 邻居拉入第 0 层候选列表。 |
@@ -278,7 +334,7 @@ collections:
 | `rerank_keep_window` | 集合 | `true` | 让已评判文档排在未评判尾部之上。 |
 | `expander` | 全局 | `false` | 加载进程内的 LLM 查询扩展器；否则扩展委托给调用方。 |
 
-一起检索的集合必须在某个集合级值上**一致**，该值才会生效；冲突时回退到默认值（与 `routing:` 规则相同）。当相应开关开启时，`ir sync` / `ir embed` 会构建 ANN 索引和 doc graph（空集合会跳过）。要将某集合恢复到 0.18 之前的检索方式，设置 `ann: false`、`t0_graph_expand: false`、`rerank_window: 20`、`rerank_keep_window: false`，并将全局 `expander: true`。
+一起检索的集合必须在某个集合级值上**一致**，该值才会生效；冲突时回退到默认值（与 `routing:` 规则相同）。当相应开关开启时，`ir sync` / `ir embed` 会构建 ANN 索引和 doc graph（空集合会跳过）。要将某集合恢复到 0.18 之前的管线，设置 `ann: false`、`t0_graph_expand: false`、`rerank_window: 20`、`rerank_keep_window: false`，并将全局 `expander: true`。
 
 **备用配置文件** — 在不移动数据目录（集合和缓存保持原位）的情况下，让 `ir` 指向另一个 `config.yml`，以便在同一份已嵌入的语料上比较不同的管线配置：
 
@@ -287,35 +343,6 @@ ir --config-path ./variant.yml search "query" -c notes
 ```
 
 优先级：`--config-path` > `IR_CONFIG_FILE` > `<config-dir>/config.yml`。
-
-**代码域（辅助证据）** — 在集合文档旁同时索引源代码文件。代码文件不会作为搜索结果返回；其符号和文档注释会提升或补充提到这些符号的文档：
-
-```bash
-ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs' --code-glob 'src/**/*.py'
-ir update notes
-ir search "drop outdated values after a migration" --json   # 找到提到对应函数的文档
-```
-
-```yaml
-collections:
-  - name: notes
-    path: ~/project
-    auxiliary:
-      code:
-        globs: ["src/**/*.rs", "src/**/*.py"]
-        excludes: ["src/generated/**"]   # 可选
-```
-
-- 支持：`.rs`、`.py`、`.js`/`.jsx`/`.mjs`/`.cjs`、`.ts`/`.tsx`、`.go`（tree-sitter）。函数、方法、类型、trait/interface、常量和模块连同文档注释一起索引；不索引函数体。
-- 文档写出符号名即建立链接：`snake_case`、`camelCase` 和两段以上的 `PascalCase` 在任何位置都算，其他名称仅在反引号内算。写出文件路径（`src/db/schema.rs` 或唯一后缀如 `db/schema.rs`）则链接到该文件。
-- 有辅助证据的结果在 `--json` 输出中带 `evidence` 字段，例如 `["code:src/cache.rs:invalidate_entry"]`。未配置代码域时，结果和输出不变。
-- 从集合中删除 `auxiliary:` 后，下一次 `ir update` 会删除其代码索引。
-- 对文档从未提到的代码，可以显式链接：
-  - 文档 frontmatter：`code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]`（文件路径或唯一后缀、`path:symbol` 或符号名）；
-  - 代码注释：`// knowledge: design/ledger.md` 或 `// [[Ledger design]]`（文档路径或标题），作用于整个文件。
-- `ir update` 会对每个指向不存在目标的显式链接发出警告（例如重命名之后），便于修复过期链接。
-- 代码匹配至少覆盖查询一半的词时才作为证据。
-- `ir search --include-code`（MCP：`include_code: true`）还会在**所有文档之后**返回匹配的符号和文件本身，带 `"kind": "code"`、源文件 `path`、`code:<path>:<line>` 形式的 `doc_id`，snippet 为签名和文档注释。默认关闭，代码仍是辅助信息。过滤器（`-f`）只作用于文档。
 
 ## 许可证
 

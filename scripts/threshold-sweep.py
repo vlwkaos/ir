@@ -115,7 +115,8 @@ VEC_ALPHA = 0.80
 def offline_fused_ndcg(ranked_bm25: list, ranked_vector: list,
                         relevant: dict | None, k: int = 10) -> float:
     """Compute nDCG@k from offline score-fusion of BM25 and vector ranked lists.
-    Mirrors score_fusion_two_list in hybrid.rs: score = 0.80*vec + 0.20*bm25.
+    Mirrors the Weighted plan of score_fusion_two_list in hybrid.rs: score = 0.80*vec + 0.20*bm25.
+    The Keyword and CrossScript plans (ADR-0002) are not simulated here.
     Uses rank-based score proxy since we don't have raw scores in ranked lists.
     """
     if relevant is None:
