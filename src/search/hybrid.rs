@@ -1,11 +1,12 @@
 // Hybrid search pipeline:
-//   1. BM25 + vector + score fusion (~20ms) — always runs, cheap
+//   1. BM25 ∥ query embedding → vector kNN → per-query score fusion (~50ms)
 //   2. is_strong_signal(fused) → return fused (skip LLM enhancement)
 //   3a. With query expander: expand → RRF with fused as base ranked list
 //   3b. Without expander: fused results pass directly to reranking
-//   4. LLM reranking (top 20) → final score = fused×0.4 + rerank×0.6
+//   4. LLM reranking (rerank window, default 100) → final score = fused×0.4 + rerank×0.6
 //
-// Score-fusion α=0.80 (mid-range of 0.70–0.95 plateau) selected on BEIR/NFCorpus.
+// Fusion picks a FusionPlan per query (keyword / cross-script / weighted, ADR-0002);
+// the weighted plan uses α=0.80 (mid-range of the 0.70–0.95 plateau on BEIR/NFCorpus).
 // Strong-signal: top*gap >= STRONG_SIGNAL_PRODUCT && top >= STRONG_SIGNAL_FLOOR.
 // See src/bin/eval.rs for the evaluation harness.
 
@@ -83,7 +84,7 @@ pub struct HybridSearch {
     pub expander_cache: Option<ExpanderCache>,
 }
 
-/// Weight for vector in score-fusion: 0.80·vec + 0.20·bm25.
+/// Weight for vector in the `Weighted` fusion plan: 0.80·vec + 0.20·bm25.
 /// Tuned on BEIR/NFCorpus via grid search (α=0.70–0.95 plateau at nDCG@10≈0.393);
 /// 0.80 is the robust mid-range choice. See eval --mode all for reproduction.
 const SCORE_FUSION_VEC_ALPHA: f64 = 0.80;
