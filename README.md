@@ -7,7 +7,7 @@
 
 [ENG](README.md) | [한국어](README.ko.md) | [中文](README.zh.md)
 
-Local semantic search for markdown knowledge bases. BM25 + vector + LLM reranking, entirely on your machine — one SQLite file per collection, models kept warm by a persistent daemon, all LLM outputs cached.
+Local search for markdown knowledge bases, in any mix of languages. BM25 + vector + LLM reranking, entirely on your machine — one SQLite file per collection, models kept warm by a persistent daemon, all LLM outputs cached. Optionally indexes source code beside the notes as supporting evidence.
 
 ```bash
 brew install vlwkaos/tap/ir          # macOS
@@ -24,26 +24,42 @@ BM25 search works with no models at all. Vector/hybrid search downloads models a
 
 ## How it searches — you only pay for what's hard
 
-Three tiers. Each fires **only if the previous one wasn't confident**, so the vast
-majority of queries return from tier 0 or 1 and never touch an LLM. One warm daemon
-holds every model in memory; every LLM output is cached in SQLite.
+Three tiers. Each runs **only if the previous one wasn't confident**, so most queries
+return from tier 0 or 1 and never touch an LLM. One warm daemon holds every model in
+memory; every LLM output is cached in SQLite.
 
-<p align="center">
-  <img src="research/ir-pipeline.png" alt="ir 0.18 three-tier retrieval pipeline: Tier 0 BM25 + doc-graph expansion, Tier 1 HNSW ANN + hybrid fusion, Tier 2 reranker (window 100 + keep-window); strong-signal shortcuts return early; the LLM expander is off by default and delegated to the caller." width="620">
-</p>
+```
+query
+  │
+  ▼  TIER 0 · no model · instant
+  BM25 (+ doc-graph neighbours, + documents that matching code links to)
+  clear keyword winner? ─── yes ──► results
+  │
+  ▼  TIER 1 · embedding model · ~50 ms
+  BM25  ∥  embed query ─► vector kNN (HNSW)          run in parallel
+  fuse, choosing per query:
+    a top BM25 passage holds every query word ─► vector + BM25 boost for exact matches
+    answers are in another script than the query ─► vector only (cross-language)
+    otherwise ─► 0.8 · vector + 0.2 · BM25
+  confident? ─── yes ──► results
+  │
+  ▼  TIER 2 · reranker 0.6B · ~2–5 s
+  rerank the top 100 ─► results
+```
 
-The preprocessor is the make-or-break stage for Korean/Japanese/Chinese: it morphologically
+The per-query choice keeps keyword lookups exact while a question finds its answer
+in another language: an English question matches a Korean note, and the other way round.
+
+The preprocessor is the make-or-break stage for Korean/Japanese/Chinese BM25: it
 tokenizes both the indexed text and the query, and without it CJK BM25 scores near zero.
 
 **Cold vs warm** (M4 Max): first query ~3.0 s while the daemon loads; every query after,
-~30 ms round-trip — and BM25 stays instant even during cold start. As of **0.18**, HNSW
-ANN, tier-0 graph expansion, and a wide reranker window are on by default, and the LLM
-query-expander is delegated to the calling agent — all tunable per collection under
-[Advanced Configuration](#advanced-configuration).
+~30 ms round-trip, and BM25 stays instant even during a cold start. Pipeline knobs are
+tunable per collection under [Advanced Configuration](#advanced-configuration).
 
-## Measured quality (0.18 defaults, nDCG@10)
+## Measured quality (nDCG@10)
 
-Each stage is a full escalation step — the score **if the query stops there**. `BM25` and `Vector` are the single-signal baselines; `Hybrid` fuses them (`0.80·vec + 0.20·bm25`, tier 1); `+ Rerank` adds the 0.6B reranker over a window-100 pool (tier 2). The LLM expander is **off by default**.
+Each column is the score **if the query stops at that stage**. `BM25` and `Vector` are the single-signal baselines; `Hybrid` is tier 1; `+ Rerank` adds the 0.6B reranker over the top 100 (tier 2). The LLM expander is **off by default**.
 
 | Corpus | BM25 | Vector | Hybrid | + Rerank |
 |---|---|---|---|---|
@@ -51,16 +67,18 @@ Each stage is a full escalation step — the score **if the query stops there**.
 | FiQA (en, 57.6k docs, 648 q) | 0.24 | 0.40 | 0.40 | **0.44** |
 | MIRACL-ko 50k (ko, 213 q) | 0.73 | — | 0.92 | **0.96** |
 | Allganize RAG-eval-KO (ko, 1.4k pages, 298 q) | 0.70 | — | 0.69 | 0.72 |
-| **median latency** (warm, M-series) | ~1 ms | ~50 ms | ~50–280 ms | ~2 s |
+| Mixed ko/ja/zh/en, cross-language questions (19k passages, 200 q) | ≈ 0 | 0.78 | **0.78** | **0.80** |
+| **median latency** (warm, M-series) | ~1 ms | ~50 ms | ~50–280 ms | ~2–5 s |
 
-`BM25` is raw FTS5; the 0.18 default tier-0 also runs **doc-graph expansion**, which adds ≈ +0.02 nDCG@10 on sparse corpora (NFCorpus, `0.31 → 0.33`) and is ~neutral on dense ones (FiQA). On FiQA, BM25 is weak, so `Vector ≈ Hybrid`; the reranker then adds the real lift (`0.40 → 0.44`). Korean needs the `ko` preprocessor (without it Korean BM25 ≈ 0); Korean `Vector` isn't re-measured here (—).
+Cross-language questions are English questions about Korean, Japanese or Chinese passages and Korean questions about English ones, mixed in one corpus (MIRACL). The earlier fixed `0.8 · vector + 0.2 · BM25` fusion scored **0.21** there (0.71 with the reranker): BM25 lifted same-language near misses above the right answer. Single-language results above are unchanged by the per-query fusion (within ±0.003). Tier 0 also runs **doc-graph expansion**, which adds ≈ +0.02 on sparse corpora (NFCorpus) and is ~neutral on dense ones (FiQA). Korean BM25 needs the `ko` preprocessor (without it ≈ 0); Korean `Vector` isn't re-measured here (—). Method and data: [research/adr-0002-per-query-fusion.md](research/adr-0002-per-query-fusion.md).
 
 ## Versions at a glance
 
 - **≤ 0.15** — core pipeline, daemon, MCP, CJK preprocessors.
-- **0.16** — `ir sync` (one command for index + embed), self-healing incremental updates: deleted files are hard-removed and moved/restored content reuses cached vectors.
-- **0.17** — research infrastructure for graph-expanded retrieval and an optional HNSW ANN index, plus a much faster benchmark toolchain. **All of it is disabled by default and changes nothing about search behavior** — these are opt-in experiments, not baked-in features. Collection DBs gain two empty tables on first write; databases remain fully compatible in both directions with 0.16.
-- **0.18** — the research paths above become the **default** pipeline: HNSW ANN for vector search, tier-0 graph expansion, a wide reranker window with keep-window, and the LLM query-expander dropped from the default (expansion moves to the calling agent). Everything is tunable per collection via the `retrieval:` config block ([Advanced Configuration](#advanced-configuration)). Migration is seamless — existing collections build their ANN index and doc graph on the next `ir sync` and fall back to exact search until then; no schema change. Rationale and measured results: [research/adr-0001-default-retrieval-pipeline.md](research/adr-0001-default-retrieval-pipeline.md). *(The O(N·log N) graph-from-ANN build is a 0.18.x follow-up; 0.18.0 builds the graph via the existing exact pass.)*
+- **0.16** — `ir sync` (index + embed in one command); deleted files are removed and moved content reuses cached vectors.
+- **0.17** — opt-in research paths: document graph and HNSW ANN index.
+- **0.18** — those paths become the default (HNSW ANN, tier-0 graph expansion, reranker window 100); the LLM query expander moves to the calling agent. [ADR-0001](research/adr-0001-default-retrieval-pipeline.md).
+- **Next** — per-query hybrid fusion for collections in several languages, parallel tier 1, code domain, rewritten `--help`. [ADR-0002](research/adr-0002-per-query-fusion.md). Existing collections keep working with no re-index.
 
 ## Documentation
 
@@ -139,7 +157,10 @@ ir search "error handling" -c notes --min-score 0.4
 
 ir search "ownership" --json | --md | --files | --full | --chunk | --quiet
 ir search "design" -f "modified_at>=2026-01-01" -f "meta.tags=rust"
+ir search "token refresh" --include-code         # also code symbols, after the documents
 ```
+
+Queries and documents may be in different languages: an English question finds a Korean note in `hybrid` and `vector` mode. `bm25` matches words only.
 
 Filter clauses (`-f`, repeatable, ANDed): fields `path`, `modified_at`, `created_at`, `meta.<name>`; ops `=` `!=` `>` `>=` `<` `<=` `~` `!~`. Dates normalize to UTC RFC3339. Multi-valued frontmatter fields match if **any** element satisfies the clause (including `!=`).
 
@@ -189,13 +210,47 @@ Any executable can be a preprocessor: UTF-8 lines on stdin → 0-or-1 tokenized 
 </details>
 
 <details>
+<summary><strong>Code domain — source code as supporting evidence</strong></summary>
+
+Index source files beside a collection's documents. Code files are never search results. Their symbols and doc comments raise, or add, the documents that mention them:
+
+```bash
+ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs' --code-glob 'src/**/*.py'
+ir update notes
+ir search "drop outdated values after a migration" --json   # finds docs that name the matching function
+```
+
+```yaml
+collections:
+  - name: notes
+    path: ~/project
+    auxiliary:
+      code:
+        globs: ["src/**/*.rs", "src/**/*.py"]
+        excludes: ["src/generated/**"]   # optional
+```
+
+- Supported: `.rs`, `.py`, `.js`/`.jsx`/`.mjs`/`.cjs`, `.ts`/`.tsx`, `.go` (tree-sitter). Functions, methods, types, traits/interfaces, constants and modules are indexed with their doc comments; function bodies are not.
+- A document links to a symbol when it names it: `snake_case`, `camelCase` or two-hump `PascalCase` anywhere, or any name inside backticks. It links to a file when it names its path (`src/db/schema.rs` or a unique suffix such as `db/schema.rs`).
+- A supported result has an `evidence` field in `--json` output, e.g. `["code:src/cache.rs:invalidate_entry"]`. Without a code domain, results and output are unchanged.
+- Removing `auxiliary:` from a collection drops its code index on the next `ir update`.
+- Explicit links, for code a document never names:
+  - in the document's frontmatter: `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` (a file path or unique suffix, `path:symbol`, or a symbol name);
+  - in a code comment: `// knowledge: design/ledger.md` or `// [[Ledger design]]` (document path or title). It covers the whole file.
+- `ir update` warns about each explicit link that matches nothing, for example after a rename, so stale links can be fixed.
+- A code match counts only when it covers at least half of the query's words.
+- `ir search --include-code` (MCP: `include_code: true`) also returns the matching symbols and files themselves, **after** all documents, with `"kind": "code"`, `path` = source file, `doc_id` = `code:<path>:<line>`, and the signature and doc comment as the snippet. Off by default: code stays auxiliary. Filters (`-f`) apply to documents only.
+
+</details>
+
+<details>
 <summary><strong>MCP server — Claude Desktop / Claude Code</strong></summary>
 
 ```json
 { "mcpServers": { "ir": { "command": "ir", "args": ["mcp"] } } }
 ```
 
-Tools: `search` (with `mode`, `limit`, `min_score`, `collections`, `filter`), `get`, `multi_get`, `status`, `update`.
+Tools: `search` (with `mode`, `limit`, `min_score`, `collections`, `filter`, `include_code`), `get`, `multi_get`, `status`, `update`.
 
 `update` is text-only: it refreshes the BM25 index and never computes embeddings. Each result reports `path`, `scanned`, `added`, `updated`, `deactivated`, `pending_embeddings`, and `notes`. Run `ir embed` or `ir sync` in a terminal to embed pending documents. `force: true` drops the collection's existing vectors until then.
 
@@ -224,7 +279,7 @@ bash scripts/preship.sh              # stability / speed / quality gate on fixtu
 
 Runs are resumable (per-query progress survives crashes) and guarded by a memory watchdog on macOS. Historical BEIR results (older pipeline config): reranking added up to +14.5% nDCG@10 over pure vector on ArguAna; fusion alone was not significantly better than pure vector on English corpora — the reranker is where tier-2 value lives.
 
-v0.17 ships experimental, **off-by-default** research infrastructure explored on these corpora: a document-similarity graph used to widen the reranker's candidate pool (significant on sparse-result corpora), and an optional HNSW index (usearch) for approximate kNN that reached 99.2% top-10 overlap with exact search at nDCG@10 identical to exact (MIRACL-ko 50k validation). These change no default behavior; see `CHANGELOG.md` for details and measured results.
+The HNSW index (usearch) reached 99.2% top-10 overlap with exact search at identical nDCG@10 (MIRACL-ko 50k). The mixed-language set is built from MIRACL; method, data and scripts are described in [ADR-0002](research/adr-0002-per-query-fusion.md).
 
 </details>
 
@@ -251,20 +306,20 @@ cargo test                   # no models required
 cargo test -- --ignored      # model-dependent tests
 ```
 
-Per-collection schema: `content` (hash → text), `documents`, `documents_fts` (FTS5), `vectors_vec` (sqlite-vec, cosine), `content_vectors` (chunk metadata), `llm_cache` (reranker scores), `document_metadata` (frontmatter), `meta`, `doc_graph`, `ann_keys`. Global `expander_cache.sqlite` caches expansion outputs. See [research/pipeline.md](research/pipeline.md) for the staged-async daemon design.
+Per-collection schema: `content` (hash → text), `documents`, `documents_fts` (FTS5), `vectors_vec` (sqlite-vec, cosine), `content_vectors` (chunk metadata), `llm_cache` (reranker scores), `document_metadata` (frontmatter), `meta`, `doc_graph`, `ann_keys`, and the code domain's `artifact_sources`, `artifacts`, `artifact_fts`, `artifact_anchors`, `artifact_edges` (empty without one). Global `expander_cache.sqlite` caches expansion outputs. See [research/pipeline.md](research/pipeline.md) for the staged-async daemon design.
 
 </details>
 
 ## Advanced Configuration
 
-Search-pipeline behavior is configured per collection (and globally) in `config.yml` under a `retrieval:` block. Every field is optional — omit it to take the 0.18 default. Resolution precedence is **`config > env > default`**: a value set here is authoritative and won't be silently overridden by a stray environment variable.
+Search-pipeline behavior is configured per collection (and globally) in `config.yml` under a `retrieval:` block. Every field is optional — omit it to take the default. Resolution precedence is **`config > env > default`**: a value set here is authoritative and won't be silently overridden by a stray environment variable.
 
 ```yaml
 # ~/.config/ir/config.yml
 
 # global (daemon): whether to load the in-process LLM query expander
 retrieval:
-  expander: false            # 0.18 default — expansion is the calling agent's job
+  expander: false            # default — expansion is the calling agent's job
 
 collections:
   - name: notes
@@ -277,7 +332,7 @@ collections:
       rerank_keep_window: true
 ```
 
-| Key | Scope | 0.18 default | Meaning |
+| Key | Scope | Default | Meaning |
 |---|---|---|---|
 | `ann` | collection | `true` | HNSW ANN index for vector search; exact brute-force fallback when absent or stale. |
 | `t0_graph_expand` | collection | `true` | BM25 seeds pull `doc_graph` neighbours into the tier-0 candidate list. |
@@ -285,7 +340,7 @@ collections:
 | `rerank_keep_window` | collection | `true` | Keep judged docs above the un-judged tail. |
 | `expander` | global | `false` | Load the in-process LLM query expander; otherwise expansion is delegated to the caller. |
 
-Collections searched together must **agree** on a per-collection value for it to apply; a conflict falls back to the default (same rule as `routing:`). `ir sync` / `ir embed` builds the ANN index and doc graph when the corresponding knob is on (skipped for empty collections). To restore pre-0.18 retrieval for a collection, set `ann: false`, `t0_graph_expand: false`, `rerank_window: 20`, `rerank_keep_window: false`, and global `expander: true`.
+Collections searched together must **agree** on a per-collection value for it to apply; a conflict falls back to the default (same rule as `routing:`). `ir sync` / `ir embed` builds the ANN index and doc graph when the corresponding knob is on (skipped for empty collections). To restore the pre-0.18 pipeline for a collection, set `ann: false`, `t0_graph_expand: false`, `rerank_window: 20`, `rerank_keep_window: false`, and global `expander: true`.
 
 **Alternate config file** — point `ir` at a different `config.yml` without moving the data dir (collections and caches stay put), so you can compare pipeline configurations over one embedded corpus:
 
@@ -294,35 +349,6 @@ ir --config-path ./variant.yml search "query" -c notes
 ```
 
 Precedence: `--config-path` > `IR_CONFIG_FILE` > `<config-dir>/config.yml`.
-
-**Code domain (supporting evidence)** — index source files beside a collection's documents. Code files are never search results. Their symbols and doc comments raise, or add, the documents that mention them:
-
-```bash
-ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs' --code-glob 'src/**/*.py'
-ir update notes
-ir search "drop outdated values after a migration" --json   # finds docs that name the matching function
-```
-
-```yaml
-collections:
-  - name: notes
-    path: ~/project
-    auxiliary:
-      code:
-        globs: ["src/**/*.rs", "src/**/*.py"]
-        excludes: ["src/generated/**"]   # optional
-```
-
-- Supported: `.rs`, `.py`, `.js`/`.jsx`/`.mjs`/`.cjs`, `.ts`/`.tsx`, `.go` (tree-sitter). Functions, methods, types, traits/interfaces, constants and modules are indexed with their doc comments; function bodies are not.
-- A document links to a symbol when it names it: `snake_case`, `camelCase` or two-hump `PascalCase` anywhere, or any name inside backticks. It links to a file when it names its path (`src/db/schema.rs` or a unique suffix such as `db/schema.rs`).
-- A supported result has an `evidence` field in `--json` output, e.g. `["code:src/cache.rs:invalidate_entry"]`. Without a code domain, results and output are unchanged.
-- Removing `auxiliary:` from a collection drops its code index on the next `ir update`.
-- Explicit links, for code a document never names:
-  - in the document's frontmatter: `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` (a file path or unique suffix, `path:symbol`, or a symbol name);
-  - in a code comment: `// knowledge: design/ledger.md` or `// [[Ledger design]]` (document path or title). It covers the whole file.
-- `ir update` warns about each explicit link that matches nothing, for example after a rename, so stale links can be fixed.
-- A code match counts only when it covers at least half of the query's words.
-- `ir search --include-code` (MCP: `include_code: true`) also returns the matching symbols and files themselves, **after** all documents, with `"kind": "code"`, `path` = source file, `doc_id` = `code:<path>:<line>`, and the signature and doc comment as the snippet. Off by default: code stays auxiliary. Filters (`-f`) apply to documents only.
 
 ## License
 

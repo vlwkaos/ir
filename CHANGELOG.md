@@ -8,6 +8,8 @@
 
 ### Changed
 
+- **Hybrid search finds answers written in another language.** Tier-1 fusion now picks a weighting per query instead of always using `0.8 · vector + 0.2 · BM25`: when one of the top BM25 passages contains every query word, only those exact matches get the BM25 boost; when the best vector hits are in another script than the query (an English question about Korean notes), results rank by meaning alone; otherwise the previous mix applies. On a mixed Korean, Japanese, Chinese and English MIRACL set, cross-language questions rose from 0.21 to 0.78 nDCG@10 (0.71 to 0.80 with the reranker). Single-language results on MIRACL-ko, NFCorpus and FiQA are unchanged within 0.003. No re-index needed. See `research/adr-0002-per-query-fusion.md`.
+- **Faster tier-1 search.** Keyword search and the query embedding run in parallel; median hybrid time fell from about 67 ms to 50 ms in our runs.
 - **`ir --help` is a complete quick guide for people and agents.** It now includes a quick start and tips on picking a mode, filters and reading results. `search`, `get`/`multi-get`, `collection add` and `sync`/`update`/`embed` show runnable examples, and every command summary says what it does and when to use it.
 
 ### Security

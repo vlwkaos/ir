@@ -20,7 +20,7 @@ flowchart TD
 
     subgraph S1["TIER 1 — embedder · ~50–280ms"]
         direction TB
-        T1["Vector kNN · HNSW ANN<br/>exact fallback · NEW in 0.18"] --> FUSE["Hybrid fusion<br/>0.80·vec + 0.20·bm25"]
+        T1["Vector kNN · HNSW ANN<br/>exact fallback · NEW in 0.18"] --> FUSE["Per-query hybrid fusion<br/>keyword · cross-script · 0.80·vec + 0.20·bm25<br/>(ADR-0002)"]
     end
 
     subgraph S2["TIER 2 — reranker 0.6B · ~2s"]
@@ -71,7 +71,7 @@ ir search "query"
   └──────────┬──────────────────┘
            │
 ┌──────────┴──────────┐
-│  Hybrid Score-Fusion │  0.80·vec + 0.20·bm25  →  fused
+│  Hybrid Score-Fusion │  per query (ADR-0002): keyword / cross-script / 0.80·vec + 0.20·bm25  →  fused
 └──────────┬──────────┘
            │
      strong enough?  ──yes──────────────────────────────► return

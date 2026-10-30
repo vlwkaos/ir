@@ -18,7 +18,8 @@ Quick start:
 For agents:
   - Add --json: results carry path, title, score, snippet, doc_id.
   - --mode bm25 for exact words and identifiers (instant, no models);
-    hybrid (default) for questions; vector when query and documents differ in language.
+    hybrid (default) for everything else, including questions in another language
+    than the documents.
   - Narrow with -c <collection>, -n <count>, -f \"meta.tags=rust\", -f \"modified_at>=2026-01-01\".
   - Read with `ir get` (--section, --offset, --max-chars) or `ir multi-get`, not by opening files.
   - `ir status` lists collections and their index state; `ir mcp` serves the same tools over MCP.
@@ -34,7 +35,9 @@ Examples:
   ir search \"token refresh\" --include-code        also code symbols, after the documents
 
 Modes: bm25 = keywords, instant. vector = meaning, works across languages.
-hybrid = both, plus a reranker on hard queries; the first call can wait for models to load.
+hybrid = both, weighted per query (exact keyword matches stay on top; a question in
+another language ranks by meaning), plus a reranker on hard queries; the first call
+can wait for models to load.
 Without -c: the collection containing the current directory, else all collections.
 Output: pretty (default), --json, --csv, --md, --files. --full adds document text,
 --chunk the best-matching chunk. Results that code supports list it under \"evidence\".";

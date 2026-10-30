@@ -116,7 +116,7 @@ Three-tier escalation. Each tier runs only if the previous tier's result isn't s
 | Tier | Models | Enables |
 |------|--------|---------|
 | 0 | none | BM25 (FTS5), in-process |
-| 1 | Embedder | Vector, hybrid score-fusion (0.80·vec + 0.20·bm25) |
+| 1 | Embedder | Vector, per-query hybrid fusion (`FusionPlan` in `src/search/hybrid.rs`: keyword / cross-script / 0.80·vec + 0.20·bm25; ADR-0002); BM25 and query embedding run in parallel |
 | 2 | Expander + Scorer | Query expansion (lex/vec/hyde → RRF) + reranking |
 
 Strong-signal shortcut: raw BM25 top ≥ 0.75 AND gap ≥ 0.10 → skip Tier 1+2 entirely (`src/search/hybrid.rs:is_bm25_strong_signal`). Expander without scorer is a no-op (`hybrid.rs:112`).
