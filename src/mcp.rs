@@ -58,9 +58,10 @@ struct SearchInput {
     /// Ops: =, !=, >, >=, <, <=, ~ (contains), !~ (not-contains).
     /// Example: [{"field":"modified_at","op":">=","value":"2024-01-01"},{"field":"meta.tags","op":"=","value":"rust"}]
     filter: Option<Vec<FilterClauseInput>>,
-    /// Also return matching code symbols and files from collections with a code
-    /// domain, after the documents (kind "code"). Filters apply to documents only.
-    include_code: Option<bool>,
+    /// Also return matches from auxiliary sources after the documents, each
+    /// marked by kind (e.g. "code"): ["all"] for every domain, or names such as
+    /// ["code"]. Filters apply to documents only.
+    aux: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -105,9 +106,9 @@ struct CollectionStatus {
     indexed: bool,
     size_mb: f64,
     doc_count: Option<usize>,
-    /// Indexed code symbols and files; absent without a code domain.
+    /// Indexed items per auxiliary domain, e.g. {"code": 120}; absent without one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    code_symbols: Option<usize>,
+    auxiliary: Option<std::collections::BTreeMap<String, usize>>,
 }
 
 #[derive(Serialize)]
@@ -157,8 +158,8 @@ impl IrMcpServer {
         Set full=true to include full document text inline. \
         Set include_chunk=true to include the best-matching chunk text inline (vector results only). \
         Use get or multi_get to retrieve full document text by path. \
-        Set include_code=true to also get matching code symbols (kind \"code\", after the documents) \
-        from collections with a code domain; read those files directly. \
+        Set aux=[\"all\"] (or [\"code\"]) to also get matches from auxiliary sources such as code \
+        symbols (kind \"code\", after the documents) in collections that have them; read those files directly. \
         Use filter to narrow results by metadata: fields path, modified_at, created_at, meta.<name>; \
         ops =, !=, >, >=, <, <=, ~ (contains), !~ (not-contains); multiple clauses are ANDed. \
         When the answer was degraded (e.g. BM25 only while models load, a collection not indexed, \
@@ -174,7 +175,7 @@ impl IrMcpServer {
             full,
             include_chunk,
             filter,
-            include_code,
+            aux,
         } = params.0;
         let mode = mode.unwrap_or_else(|| "hybrid".to_string());
         let limit = limit.unwrap_or(10);
@@ -209,8 +210,10 @@ impl IrMcpServer {
             } else if include_chunk {
                 crate::get::populate_chunk_content(&mut results)?;
             }
-            if include_code.unwrap_or(false) {
-                crate::append_code_results(&query, &collections, limit, &mut results)?;
+            if let Some(requested) = aux {
+                let domains = crate::auxiliary::resolve_domains(&requested)
+                    .map_err(crate::error::Error::Other)?;
+                crate::append_aux_results(&query, &collections, limit, &domains, &mut results)?;
             }
             Ok((results, notes))
         })
@@ -369,8 +372,12 @@ fn build_instructions() -> String {
                     .map(|n| format!(", {n} docs"))
                     .unwrap_or_default();
                 // ^ only collections with a code domain mention it: no tokens otherwise
-                let code = count_code_symbols(&db_path)
-                    .map(|n| format!(", code: {n} symbols"))
+                let code = aux_counts(&db_path)
+                    .map(|counts| {
+                        let list: Vec<String> =
+                            counts.iter().map(|(d, n)| format!("{d} {n}")).collect();
+                        format!(", aux: {}", list.join(", "))
+                    })
                     .unwrap_or_default();
                 format!("{docs}{code}")
             } else {
@@ -379,9 +386,9 @@ fn build_instructions() -> String {
             format!("{} ({}{})", c.name, c.path, suffix)
         })
         .collect();
-    let code_hint = if cols.iter().any(|c| c.contains(", code: ")) {
-        " For collections with code, `search` with include_code=true also lists matching \
-        functions and types after the documents."
+    let code_hint = if cols.iter().any(|c| c.contains(", aux: ")) {
+        " For collections with aux, `search` with aux=[\"all\"] also lists matching code \
+        (functions, types, files) after the documents."
     } else {
         ""
     };
@@ -397,11 +404,12 @@ fn build_instructions() -> String {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Code symbols and files indexed for the collection; `None` when it has none.
-fn count_code_symbols(db_path: &std::path::Path) -> Option<usize> {
+/// Indexed items per auxiliary domain; `None` when the collection has none.
+fn aux_counts(db_path: &std::path::Path) -> Option<std::collections::BTreeMap<String, usize>> {
     db::ensure_sqlite_vec();
     let conn = open_readonly(db_path).ok()?;
-    Some(crate::auxiliary::artifact_count(&conn)).filter(|&n| n > 0)
+    let counts = crate::auxiliary::artifact_counts(&conn);
+    (!counts.is_empty()).then(|| counts.into_iter().collect())
 }
 
 fn count_docs(db_path: &std::path::Path) -> Option<usize> {
@@ -424,18 +432,14 @@ fn build_status() -> IrResult<StatusOutput> {
         let indexed = size_bytes.is_some();
         let size_mb = size_bytes.unwrap_or(0) as f64 / 1_048_576.0;
         let doc_count = if indexed { count_docs(&db_path) } else { None };
-        let code_symbols = if indexed {
-            count_code_symbols(&db_path)
-        } else {
-            None
-        };
+        let auxiliary = if indexed { aux_counts(&db_path) } else { None };
         collections.push(CollectionStatus {
             name: col.name.clone(),
             path: col.path.clone(),
             indexed,
             size_mb,
             doc_count,
-            code_symbols,
+            auxiliary,
         });
     }
     Ok(StatusOutput {

@@ -102,7 +102,7 @@ pub struct SearchResult {
     /// (e.g. `code:src/db/schema.rs:init`). None without auxiliary domains.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Vec<String>>,
-    /// `"code"` for an auxiliary code artifact returned by `--include-code`
+    /// `"code"` for an auxiliary code artifact returned by `--aux`
     /// (always after the documents); None for documents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,

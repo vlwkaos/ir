@@ -157,7 +157,7 @@ ir search "error handling" -c notes --min-score 0.4
 
 ir search "ownership" --json | --md | --files | --full | --chunk | --quiet
 ir search "design" -f "modified_at>=2026-01-01" -f "meta.tags=rust"
-ir search "token refresh" --include-code         # also code symbols, after the documents
+ir search "token refresh" --aux                  # also code symbols, after the documents
 ```
 
 Queries and documents may be in different languages: an English question finds a Korean note in `hybrid` and `vector` mode. `bm25` matches words only.
@@ -234,13 +234,13 @@ collections:
 - A document links to a symbol when it names it: `snake_case`, `camelCase` or two-hump `PascalCase` anywhere, or any name inside backticks. It links to a file when it names its path (`src/db/schema.rs` or a unique suffix such as `db/schema.rs`).
 - A supported result has an `evidence` field in `--json` output, e.g. `["code:src/cache.rs:invalidate_entry"]`. Without a code domain, results and output are unchanged.
 - Removing `auxiliary:` from a collection drops its code index on the next `ir update`.
-- `ir status`, MCP `status` and the MCP connect instructions show `code: N symbols` only for collections with code. `ir collection add` on a folder with source files and no `--code-glob` prints a one-time hint with the config to add.
+- `ir status`, MCP `status` and the MCP connect instructions show `aux: code N` only for collections with code. `ir collection add` on a folder with source files and no `--code-glob` prints a one-time hint with the config to add.
 - Explicit links, for code a document never names:
   - in the document's frontmatter: `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` (a file path or unique suffix, `path:symbol`, or a symbol name);
   - in a code comment: `// knowledge: design/ledger.md` or `// [[Ledger design]]` (document path or title). It covers the whole file.
 - `ir update` warns about each explicit link that matches nothing, for example after a rename, so stale links can be fixed.
 - A code match counts only when it covers at least half of the query's words.
-- `ir search --include-code` (MCP: `include_code: true`) also returns the matching symbols and files themselves, **after** all documents, with `"kind": "code"`, `path` = source file, `doc_id` = `code:<path>:<line>`, and the signature and doc comment as the snippet. Off by default: code stays auxiliary. Filters (`-f`) apply to documents only.
+- `ir search --aux` (MCP: `aux: ["all"]`; `--aux=code` / `["code"]` to name domains) also returns the matching symbols and files themselves, **after** all documents, with `"kind": "code"`, `path` = source file, `doc_id` = `code:<path>:<line>`, and the signature and doc comment as the snippet. Off by default: code stays auxiliary. Filters (`-f`) apply to documents only.
 
 </details>
 
@@ -251,7 +251,7 @@ collections:
 { "mcpServers": { "ir": { "command": "ir", "args": ["mcp"] } } }
 ```
 
-Tools: `search` (with `mode`, `limit`, `min_score`, `collections`, `filter`, `include_code`), `get`, `multi_get`, `status`, `update`.
+Tools: `search` (with `mode`, `limit`, `min_score`, `collections`, `filter`, `aux`), `get`, `multi_get`, `status`, `update`.
 
 `update` is text-only: it refreshes the BM25 index and never computes embeddings. Each result reports `path`, `scanned`, `added`, `updated`, `deactivated`, `pending_embeddings`, and `notes`. Run `ir embed` or `ir sync` in a terminal to embed pending documents. `force: true` drops the collection's existing vectors until then.
 

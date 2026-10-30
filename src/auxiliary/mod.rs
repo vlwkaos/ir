@@ -20,6 +20,32 @@ use std::collections::{HashMap, HashSet};
 
 pub const CODE_DOMAIN: &str = "code";
 
+/// Every auxiliary domain ir can index. `--aux` names them; `all` means every one.
+pub const DOMAINS: &[&str] = &[CODE_DOMAIN];
+
+/// Domains named by `--aux` / MCP `aux`: none named, or `all`, means every
+/// domain; an unknown name is an error that lists the known ones.
+pub fn resolve_domains(requested: &[String]) -> std::result::Result<Vec<&'static str>, String> {
+    if requested.is_empty() || requested.iter().any(|d| d.trim() == "all") {
+        return Ok(DOMAINS.to_vec());
+    }
+    requested
+        .iter()
+        .map(|d| {
+            DOMAINS
+                .iter()
+                .find(|known| **known == d.trim())
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "unknown aux domain '{d}' (known: {}, all)",
+                        DOMAINS.join(", ")
+                    )
+                })
+        })
+        .collect()
+}
+
 /// Meta key holding the number of stored artifacts. Search skips all
 /// auxiliary work when it is absent or 0.
 const META_COUNT: &str = "aux_artifacts";
@@ -590,8 +616,22 @@ pub fn has_artifacts(conn: &Connection) -> bool {
     artifact_count(conn) > 0
 }
 
-/// Number of stored auxiliary artifacts (code symbols and files); 0 without
-/// an auxiliary domain.
+/// Stored artifacts per auxiliary domain, by domain name; empty without one.
+pub fn artifact_counts(conn: &Connection) -> Vec<(String, usize)> {
+    if !has_artifacts(conn) {
+        return vec![];
+    }
+    let Ok(mut stmt) =
+        conn.prepare("SELECT domain, COUNT(*) FROM artifacts GROUP BY domain ORDER BY domain")
+    else {
+        return vec![];
+    };
+    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?)))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+/// Number of stored auxiliary artifacts (all domains); 0 without one.
 pub fn artifact_count(conn: &Connection) -> usize {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", [META_COUNT], |r| {
         r.get::<_, String>(0)
@@ -700,7 +740,7 @@ pub fn support(db: &CollectionDb, fts_query: &str, results: &mut Vec<SearchResul
 type Evidence = Vec<(f64, String)>;
 
 /// Code artifacts matching `query` in one collection, best first, as
-/// results of kind `code` (for `--include-code`). Empty without artifacts.
+/// results of kind `code` (for `--aux`). Empty without artifacts.
 /// `path` is the source file; `doc_id` is `code:<path>:<line>`.
 pub fn code_results(db: &CollectionDb, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
     if limit == 0 || !db.has_artifacts() {

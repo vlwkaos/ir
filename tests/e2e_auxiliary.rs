@@ -521,16 +521,12 @@ fn backticked_anchor_syntax_is_an_example_not_a_link() {
 }
 
 fn search_with_code(env: &Env, collection: &str, query: &str) -> Vec<Value> {
+    search_with_aux(env, collection, query, "--aux")
+}
+
+fn search_with_aux(env: &Env, collection: &str, query: &str, aux: &str) -> Vec<Value> {
     let stdout = env.ok(&[
-        "search",
-        "--mode",
-        "bm25",
-        "--json",
-        "--quiet",
-        "--include-code",
-        "-c",
-        collection,
-        query,
+        "search", "--mode", "bm25", "--json", "--quiet", aux, "-c", collection, query,
     ]);
     serde_json::from_str::<Value>(&stdout)
         .unwrap_or_else(|e| panic!("not JSON ({e}): {stdout}"))
@@ -540,8 +536,8 @@ fn search_with_code(env: &Env, collection: &str, query: &str) -> Vec<Value> {
 }
 
 #[test]
-fn include_code_returns_code_after_documents_only_on_request() {
-    let env = Env::new("e2e-aux-include-code");
+fn aux_returns_code_after_documents_only_on_request() {
+    let env = Env::new("e2e-aux-results");
     add_with_code(&env, "notes", &[]);
     let plain = env.add_collection("plain", &[]);
     write_notes(&plain);
@@ -584,6 +580,23 @@ fn include_code_returns_code_after_documents_only_on_request() {
             .contains("Drop outdated values")
     );
 
+    // Naming the domain gives the same results as every domain; an unknown
+    // name fails and lists the known ones.
+    assert_eq!(search_with_aux(&env, "notes", query, "--aux=code"), results);
+    let (ok, _, stderr) = env.run(&[
+        "search",
+        "--mode",
+        "bm25",
+        "--aux=config",
+        "-c",
+        "notes",
+        query,
+    ]);
+    assert!(
+        !ok && stderr.contains("unknown aux domain 'config' (known: code, all)"),
+        "{stderr}"
+    );
+
     // A collection without a code domain returns no code even when asked.
     assert!(
         search_with_code(&env, "plain", query)
@@ -596,7 +609,7 @@ fn include_code_returns_code_after_documents_only_on_request() {
     let mcp_results = mcp
         .tool(
             "search",
-            serde_json::json!({"query": query, "mode": "bm25", "collections": ["notes"], "include_code": true}),
+            serde_json::json!({"query": query, "mode": "bm25", "collections": ["notes"], "aux": ["all"]}),
         )
         .expect("search tool");
     assert!(
@@ -609,7 +622,7 @@ fn include_code_returns_code_after_documents_only_on_request() {
     );
 }
 
-/// Agents learn about the code domain only where it applies: `ir collection
+/// Agents learn about auxiliary sources only where they apply: `ir collection
 /// add` hints once when a folder holds source files and no code domain was
 /// asked for; `ir status`, MCP `status` and the MCP connect instructions name
 /// the code only for collections that have it, so setups without code spend
@@ -660,13 +673,13 @@ fn code_domain_is_announced_only_where_it_applies() {
 
     let mut server = support::Mcp::start(&env);
     let mcp_status = server.tool("status", serde_json::json!({})).unwrap();
-    let code_symbols = |name: &str| {
+    let aux_counts = |name: &str| {
         mcp_status["collections"]
             .as_array()
             .unwrap()
             .iter()
             .find(|c| c["name"] == name)
-            .map(|c| c.get("code_symbols").cloned())
+            .map(|c| c.get("auxiliary").cloned())
     };
 
     assert_eq!(
@@ -674,13 +687,24 @@ fn code_domain_is_announced_only_where_it_applies() {
             hinted_repo,
             hinted_plain,
             hinted_with_code,
-            status_line("code").contains("code: "),
-            status_line("plain").contains("code: "),
-            code_symbols("code").flatten().is_some(),
-            code_symbols("plain"),
-            server.instructions.contains("include_code"),
+            status_line("code").contains("aux: code "),
+            status_line("plain").contains("aux:"),
+            aux_counts("code")
+                .flatten()
+                .map(|a| a["code"].as_u64().is_some()),
+            aux_counts("plain"),
+            server.instructions.contains("aux=[\"all\"]"),
         ),
-        (true, false, false, true, false, true, Some(None), true),
+        (
+            true,
+            false,
+            false,
+            true,
+            false,
+            Some(true),
+            Some(None),
+            true
+        ),
         "status:\n{status}\nmcp status: {mcp_status}\ninstructions: {}",
         server.instructions
     );

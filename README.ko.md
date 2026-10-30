@@ -180,7 +180,7 @@ ir search "에러 처리" -c notes --min-score 0.4
 
 ir search "소유권" --json | --md | --files | --full | --chunk | --quiet
 ir search "설계" -f "modified_at>=2026-01-01" -f "meta.tags=rust"
-ir search "token refresh" --include-code         # 코드 심볼도 문서 뒤에 함께 반환
+ir search "token refresh" --aux                  # 코드 심볼도 문서 뒤에 함께 반환
 ```
 
 쿼리와 문서의 언어가 달라도 된다. 영어 질문이 `hybrid`와 `vector` 모드에서 한국어 노트를 찾는다. `bm25`는 단어만 일치시킨다.
@@ -257,13 +257,13 @@ collections:
 - 문서가 심볼 이름을 쓰면 연결됩니다. `snake_case`, `camelCase`, 두 단어 이상의 `PascalCase`는 어디서든, 다른 이름은 백틱 안에서만 연결됩니다. 파일 경로(`src/db/schema.rs` 또는 `db/schema.rs`처럼 유일한 접미사)를 쓰면 파일과 연결됩니다.
 - 보조 근거가 있는 결과는 `--json` 출력에 `evidence` 필드가 붙습니다(예: `["code:src/cache.rs:invalidate_entry"]`). 코드 도메인이 없으면 결과와 출력은 이전과 같습니다.
 - 컬렉션에서 `auxiliary:`를 지우면 다음 `ir update`에서 코드 색인이 삭제됩니다.
-- `ir status`, MCP `status`, MCP 연결 안내문은 코드가 있는 컬렉션에만 `code: N symbols`를 표시합니다. 소스 파일이 있는 폴더를 `--code-glob` 없이 `ir collection add`로 추가하면, 추가할 설정을 담은 안내를 한 번 출력합니다.
+- `ir status`, MCP `status`, MCP 연결 안내문은 코드가 있는 컬렉션에만 `aux: code N`을 표시합니다. 소스 파일이 있는 폴더를 `--code-glob` 없이 `ir collection add`로 추가하면, 추가할 설정을 담은 안내를 한 번 출력합니다.
 - 문서가 이름을 쓰지 않는 코드는 명시적 링크로 연결합니다.
   - 문서 frontmatter: `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` (파일 경로나 유일한 접미사, `path:symbol`, 심볼 이름)
   - 코드 주석: `// knowledge: design/ledger.md` 또는 `// [[Ledger design]]` (문서 경로나 제목). 파일 전체에 적용됩니다.
 - `ir update`는 아무것도 가리키지 않는 명시적 링크마다 경고합니다(예: 이름 변경 후). 낡은 링크를 바로 고칠 수 있습니다.
 - 코드 일치는 쿼리 단어의 절반 이상을 포함할 때만 근거로 씁니다.
-- `ir search --include-code`(MCP: `include_code: true`)는 일치한 심볼과 파일 자체도 **모든 문서 뒤에** 반환합니다. 결과에는 `"kind": "code"`, 소스 파일 `path`, `code:<path>:<line>` 형식의 `doc_id`가 붙고, snippet은 시그니처와 doc comment입니다. 기본값은 꺼짐입니다. 코드는 보조 정보로 남습니다. 필터(`-f`)는 문서에만 적용됩니다.
+- `ir search --aux`(MCP: `aux: ["all"]`, 도메인을 지정하려면 `--aux=code` / `["code"]`)는 일치한 심볼과 파일 자체도 **모든 문서 뒤에** 반환합니다. 결과에는 `"kind": "code"`, 소스 파일 `path`, `code:<path>:<line>` 형식의 `doc_id`가 붙고, snippet은 시그니처와 doc comment입니다. 기본값은 꺼짐입니다. 코드는 보조 정보로 남습니다. 필터(`-f`)는 문서에만 적용됩니다.
 
 </details>
 
@@ -274,7 +274,7 @@ collections:
 { "mcpServers": { "ir": { "command": "ir", "args": ["mcp"] } } }
 ```
 
-도구: `search` (`mode`, `limit`, `min_score`, `collections`, `filter`, `include_code` 지원), `get`, `multi_get`, `status`, `update`.
+도구: `search` (`mode`, `limit`, `min_score`, `collections`, `filter`, `aux` 지원), `get`, `multi_get`, `status`, `update`.
 
 `update`는 텍스트 전용이다. BM25 인덱스만 갱신하고 임베딩은 계산하지 않는다. 결과에는 컬렉션마다 `path`, `scanned`, `added`, `updated`, `deactivated`, `pending_embeddings`, `notes`가 들어 있다. 대기 중인 문서를 임베딩하려면 터미널에서 `ir embed`나 `ir sync`를 실행한다. `force: true`는 그때까지 컬렉션의 기존 벡터를 지운다.
 

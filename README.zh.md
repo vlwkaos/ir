@@ -151,7 +151,7 @@ ir search "error handling" -c notes --min-score 0.4
 
 ir search "ownership" --json | --md | --files | --full | --chunk | --quiet
 ir search "design" -f "modified_at>=2026-01-01" -f "meta.tags=rust"
-ir search "token refresh" --include-code         # 同时返回代码符号，排在文档之后
+ir search "token refresh" --aux                  # 同时返回代码符号，排在文档之后
 ```
 
 查询和文档可以使用不同的语言：英文问题在 `hybrid` 和 `vector` 模式下可以找到韩文笔记。`bm25` 只匹配词。
@@ -228,13 +228,13 @@ collections:
 - 文档写出符号名即建立链接：`snake_case`、`camelCase` 和两段以上的 `PascalCase` 在任何位置都算，其他名称仅在反引号内算。写出文件路径（`src/db/schema.rs` 或唯一后缀如 `db/schema.rs`）则链接到该文件。
 - 有辅助证据的结果在 `--json` 输出中带 `evidence` 字段，例如 `["code:src/cache.rs:invalidate_entry"]`。未配置代码域时，结果和输出不变。
 - 从集合中删除 `auxiliary:` 后，下一次 `ir update` 会删除其代码索引。
-- `ir status`、MCP `status` 和 MCP 连接说明只对含代码的集合显示 `code: N symbols`。对含源文件的文件夹执行 `ir collection add` 且未指定 `--code-glob` 时，会打印一次提示，给出需要添加的配置。
+- `ir status`、MCP `status` 和 MCP 连接说明只对含代码的集合显示 `aux: code N`。对含源文件的文件夹执行 `ir collection add` 且未指定 `--code-glob` 时，会打印一次提示，给出需要添加的配置。
 - 对文档从未提到的代码，可以显式链接：
   - 文档 frontmatter：`code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]`（文件路径或唯一后缀、`path:symbol` 或符号名）；
   - 代码注释：`// knowledge: design/ledger.md` 或 `// [[Ledger design]]`（文档路径或标题），作用于整个文件。
 - `ir update` 会对每个指向不存在目标的显式链接发出警告（例如重命名之后），便于修复过期链接。
 - 代码匹配至少覆盖查询一半的词时才作为证据。
-- `ir search --include-code`（MCP：`include_code: true`）还会在**所有文档之后**返回匹配的符号和文件本身，带 `"kind": "code"`、源文件 `path`、`code:<path>:<line>` 形式的 `doc_id`，snippet 为签名和文档注释。默认关闭，代码仍是辅助信息。过滤器（`-f`）只作用于文档。
+- `ir search --aux`（MCP：`aux: ["all"]`；用 `--aux=code` / `["code"]` 指定域）还会在**所有文档之后**返回匹配的符号和文件本身，带 `"kind": "code"`、源文件 `path`、`code:<path>:<line>` 形式的 `doc_id`，snippet 为签名和文档注释。默认关闭，代码仍是辅助信息。过滤器（`-f`）只作用于文档。
 
 </details>
 
@@ -245,7 +245,7 @@ collections:
 { "mcpServers": { "ir": { "command": "ir", "args": ["mcp"] } } }
 ```
 
-工具：`search`（支持 `mode`、`limit`、`min_score`、`collections`、`filter`、`include_code`）、`get`、`multi_get`、`status`、`update`。
+工具：`search`（支持 `mode`、`limit`、`min_score`、`collections`、`filter`、`aux`）、`get`、`multi_get`、`status`、`update`。
 
 `update` 仅处理文本：它只刷新 BM25 索引，不计算嵌入。每个结果包含 `path`、`scanned`、`added`、`updated`、`deactivated`、`pending_embeddings` 和 `notes`。要嵌入待处理的文档，请在终端运行 `ir embed` 或 `ir sync`。`force: true` 会删除该集合现有的向量，直到运行上述命令为止。
 

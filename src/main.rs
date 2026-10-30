@@ -83,7 +83,7 @@ fn run() -> Result<()> {
             verbose,
             quiet,
             filter,
-            include_code,
+            aux,
         } => handle_search(
             query.join(" "),
             mode,
@@ -108,7 +108,7 @@ fn run() -> Result<()> {
                 types::Verbosity::Normal
             },
             filter,
-            include_code,
+            aux,
         ),
         Command::Get {
             target,
@@ -409,9 +409,12 @@ fn handle_status() -> Result<()> {
         let code = db_exists
             .then(|| get::open_readonly(&db_path).ok())
             .flatten()
-            .map(|conn| auxiliary::artifact_count(&conn))
-            .filter(|&n| n > 0)
-            .map(|n| format!("  code: {n} symbols"))
+            .map(|conn| auxiliary::artifact_counts(&conn))
+            .filter(|counts| !counts.is_empty())
+            .map(|counts| {
+                let list: Vec<String> = counts.iter().map(|(d, n)| format!("{d} {n}")).collect();
+                format!("  aux: {}", list.join(", "))
+            })
             .unwrap_or_default();
         println!(
             "  {:<20} {:<12} {}  {}{code}",
@@ -470,17 +473,22 @@ fn index_collections<'a>(
     }
 }
 
-/// Append up to `limit` auxiliary code artifacts matching `query` after the
-/// document results (`--include-code`, MCP `include_code`). Code never
-/// displaces a document; collections without a code domain add nothing.
+/// Append up to `limit` auxiliary artifacts of `domains` matching `query`
+/// after the document results (`--aux`, MCP `aux`). They never displace a
+/// document; collections without those domains add nothing.
 /// Document filters (`-f`) do not apply to code.
 /// knowledge: bigpicture/Multiscript and Auxiliary Retrieval Roadmap.md (Branch 2)
-pub(crate) fn append_code_results(
+pub(crate) fn append_aux_results(
     query: &str,
     collection_filter: &[String],
     limit: usize,
+    domains: &[&str],
     results: &mut Vec<types::SearchResult>,
 ) -> Result<()> {
+    // ^ code is the only domain so far; each new domain adds its own lookup here
+    if !domains.contains(&auxiliary::CODE_DOMAIN) {
+        return Ok(());
+    }
     let config = Config::load()?;
     let mut code = Vec::new();
     for name in resolve_collections(&config, collection_filter)? {
@@ -788,7 +796,7 @@ fn handle_search(
     files: bool,
     verbosity: types::Verbosity,
     filter_strs: Vec<String>,
-    include_code: bool,
+    aux: Option<Vec<String>>,
 ) -> Result<()> {
     let filter = types::Filter::parse(&filter_strs).map_err(error::Error::Other)?;
 
@@ -826,8 +834,9 @@ fn handle_search(
     } else if chunk {
         get::populate_chunk_content(&mut results)?;
     }
-    if include_code {
-        append_code_results(&query, &collection_filter, limit, &mut results)?;
+    if let Some(requested) = aux {
+        let domains = auxiliary::resolve_domains(&requested).map_err(error::Error::Other)?;
+        append_aux_results(&query, &collection_filter, limit, &domains, &mut results)?;
     }
 
     output::print_results(&results, fmt);

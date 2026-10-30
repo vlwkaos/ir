@@ -23,8 +23,8 @@ For agents:
   - Narrow with -c <collection>, -n <count>, -f \"meta.tags=rust\", -f \"modified_at>=2026-01-01\".
   - Read with `ir get` (--section, --offset, --max-chars) or `ir multi-get`, not by opening files.
   - `ir status` lists collections and their index state; `ir mcp` serves the same tools over MCP.
-  - Collections with code (status shows `code: N symbols`): --include-code also lists
-    matching functions and types after the documents.
+  - Collections with auxiliary sources (status shows `aux: code N`): --aux also lists
+    matching code (functions, types, files) after the documents.
 
 Run `ir <command> --help` for options and examples.";
 
@@ -34,7 +34,7 @@ Examples:
   ir search max_connections --mode bm25           exact identifier, no model load
   ir search \"배포 롤백 절차\" -c notes -n 5
   ir search release -f \"meta.status=draft\" -f \"modified_at>=2026-01-01\"
-  ir search \"token refresh\" --include-code        also code symbols, after the documents
+  ir search \"token refresh\" --aux                 also code symbols, after the documents
 
 Modes: bm25 = keywords, instant. vector = meaning, works across languages.
 hybrid = both, weighted per query (exact keyword matches stay on top; a question in
@@ -162,10 +162,12 @@ pub enum Command {
         /// Dates normalized to UTC RFC3339. Example: -f "modified_at>=2024-01-01"
         #[arg(short = 'f', long = "filter", action = clap::ArgAction::Append, value_name = "CLAUSE")]
         filter: Vec<String>,
-        /// Also return matching code symbols and files (collections with a code
-        /// domain), after the documents. Filters apply to documents only.
-        #[arg(long)]
-        include_code: bool,
+        /// Also return matches from auxiliary sources (code symbols and files),
+        /// after the documents. --aux = every domain; --aux=code names them.
+        /// Filters apply to documents only.
+        #[arg(long, value_name = "DOMAINS", num_args = 0..=1, require_equals = true,
+              value_delimiter = ',', default_missing_value = "all")]
+        aux: Option<Vec<String>>,
     },
     /// Print a document (or one section) by path; partial paths match
     #[command(after_help = GET_HELP)]
