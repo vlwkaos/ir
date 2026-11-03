@@ -22,30 +22,62 @@ ir search "memory safety in rust"    # 搜索（守护进程自动启动）
 
 BM25 检索无需任何模型。向量/混合检索在首次使用时自动从 HuggingFace 下载模型。从源码构建需要 Rust 1.80 及以上；macOS 上自动链接 Metal，Linux GPU 后端为可选启用（`--features llama-cuda|llama-rocm|llama-vulkan`）。
 
+## 0.19 新功能
+
+| 功能 | 需要做什么 |
+|---|---|
+| 用一种语言提问，找到另一种语言的笔记 | 无需操作（hybrid 或 vector 模式）。现有集合无需重新索引。 |
+| 代码帮助相关笔记排得更靠前 | 添加 `--code-glob 'src/**/*.rs'`。见[文档](#文档)中的**代码域**。 |
+| 在文档之后查看匹配的代码 | `ir search "…" --aux`（MCP `aux: ["all"]`） |
+| 更快的混合搜索（中位数 ~67 → 50 ms） | 无需操作。 |
+
 ## 检索流程 — 只为困难查询付出代价
 
 三层。每层**仅在上一层信心不足时**才运行，因此大多数查询在第 0 或第 1 层就返回，不触及 LLM。单个热守护进程将所有模型常驻内存，所有 LLM 输出都缓存在 SQLite 中。
 
 ```
-query
+ir search "query"
   │
-  ▼  TIER 0 · no model · instant
-  BM25 (+ doc-graph neighbours, + documents that matching code links to)
-  clear keyword winner? ─── yes ──► results
+  ▼  第 0 层 · 无模型 · ~1 ms
+  BM25 (FTS5) + doc-graph 邻居 + 匹配代码所链接的笔记
+  关键词赢家明确？ ── 是 ──► 结果
   │
-  ▼  TIER 1 · embedding model · ~50 ms
-  BM25  ∥  embed query ─► vector kNN (HNSW)          run in parallel
-  fuse, choosing per query:
-    a top BM25 passage holds every query word ─► vector + BM25 boost for exact matches
-    answers are in another script than the query ─► vector only (cross-language)
-    otherwise ─► 0.8 · vector + 0.2 · BM25
-  confident? ─── yes ──► results
+  ▼  第 1 层 · 嵌入模型 · ~50 ms
+  BM25 ∥ 向量 kNN (HNSW) 并行运行 ─► 按查询选择融合方式
+  足够确定？ ── 是 ──► 结果
   │
-  ▼  TIER 2 · reranker 0.6B · ~2–5 s
-  rerank the top 100 ─► results
+  ▼  第 2 层 · 重排序器 0.6B · ~2–5 s
+  对前 100 个重排序 ─► 结果
 ```
 
 按查询选择融合方式，既让关键词查找保持精确，也让问题能找到用另一种语言写成的答案：英文问题可以匹配韩文笔记，反过来也一样。
+
+| 查询（示例） | 第 1 层看到的情况 | 融合方式 |
+|---|---|---|
+| `rustls 0.23.46` | BM25 前 3 个段落中有一个包含全部查询词 | 向量，并只给这些段落加 BM25 分 |
+| 对韩文笔记查询 `how long are logs kept?` | 最佳向量结果是韩文，查询是拉丁字母 | 仅向量 |
+| 对英文笔记查询 `memory safety in rust` | 以上都不是 | 0.8 · vector + 0.2 · BM25 |
+
+查询词指小写拉丁单词和连续数字，以及中日韩文字的二字组。`ir search -v` 会以 `[fusion]` 行输出所选方式。
+
+### `ir sync` 构建的内容
+
+```
+~/notes/**/*.md
+  │
+  ▼  ir update · 无模型
+  读取文件 ─► 预处理（ko/ja/zh，可选）─► BM25 索引（FTS5）
+  + tree-sitter 代码符号（仅在指定 --code-glob 时）
+  │
+  ▼  ir embed · 嵌入模型
+  分块 ─► 嵌入 ─► 向量 ─► doc graph + HNSW ANN 索引
+  （未改变或被移动的文本复用缓存的向量）
+  │
+  ▼
+  ~/.config/ir/collections/notes.sqlite   （+ ANN 索引 notes.usearch）
+```
+
+`ir sync` 运行这两步。再次运行只处理有变化的文件。
 
 预处理器是中日韩 BM25 检索成败的关键：它对索引文本和查询做相同的形态素切分，没有它 CJK BM25 分数接近零。
 
@@ -72,7 +104,7 @@ query
 - **0.16** — `ir sync`（一条命令完成索引 + 嵌入）；已删除的文件会被移除，被移动的内容复用缓存的向量。
 - **0.17** — 可选的研究路径：文档图和 HNSW ANN 索引。
 - **0.18** — 这些路径成为默认（HNSW ANN、第 0 层图扩展、重排序窗口 100）；LLM 查询扩展器交给调用方 agent。[ADR-0001](research/adr-0001-default-retrieval-pipeline.md)。
-- **下一版** — 面向多语言集合的按查询混合融合、并行的第 1 层、代码域、重写的 `--help`。[ADR-0002](research/adr-0002-per-query-fusion.md)。现有集合无需重新索引即可继续使用。
+- **0.19** — 面向多语言集合的按查询混合融合、并行的第 1 层、代码域、重写的 `--help`。[ADR-0002](research/adr-0002-per-query-fusion.md)。现有集合无需重新索引即可继续使用。
 
 ## 文档
 
@@ -206,13 +238,16 @@ ir preprocessor bind ko wiki  # 绑定到集合并重新索引
 <details>
 <summary><strong>代码域 — 以源代码作为辅助证据</strong></summary>
 
-在集合文档旁同时索引源代码文件。代码文件不会作为搜索结果返回；其符号和文档注释会提升或补充提到这些符号的文档：
+在笔记旁边为源代码建立索引。代码本身不会成为搜索结果，它会提升提到它的笔记的排名。
+
+**1. 为集合添加代码**
 
 ```bash
-ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs' --code-glob 'src/**/*.py'
-ir update notes
-ir search "drop outdated values after a migration" --json   # 找到提到对应函数的文档
+ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs'
+ir sync notes
 ```
+
+对于已有的集合，在 `config.yml` 中加入 `auxiliary:`，然后运行 `ir update notes`：
 
 ```yaml
 collections:
@@ -224,17 +259,37 @@ collections:
         excludes: ["src/generated/**"]   # 可选
 ```
 
-- 支持：`.rs`、`.py`、`.js`/`.jsx`/`.mjs`/`.cjs`、`.ts`/`.tsx`、`.go`（tree-sitter）。函数、方法、类型、trait/interface、常量和模块连同文档注释一起索引；不索引函数体。
-- 文档写出符号名即建立链接：`snake_case`、`camelCase` 和两段以上的 `PascalCase` 在任何位置都算，其他名称仅在反引号内算。写出文件路径（`src/db/schema.rs` 或唯一后缀如 `db/schema.rs`）则链接到该文件。
-- 有辅助证据的结果在 `--json` 输出中带 `evidence` 字段，例如 `["code:src/cache.rs:invalidate_entry"]`。未配置代码域时，结果和输出不变。
-- 从集合中删除 `auxiliary:` 后，下一次 `ir update` 会删除其代码索引。
-- `ir status`、MCP `status` 和 MCP 连接说明只对含代码的集合显示 `aux: code N`。对含源文件的文件夹执行 `ir collection add` 且未指定 `--code-glob` 时，会打印一次提示，给出需要添加的配置。
-- 对文档从未提到的代码，可以显式链接：
-  - 文档 frontmatter：`code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]`（文件路径或唯一后缀、`path:symbol` 或符号名）；
-  - 代码注释：`// knowledge: design/ledger.md` 或 `// [[Ledger design]]`（文档路径或标题），作用于整个文件。
-- `ir update` 会对每个指向不存在目标的显式链接发出警告（例如重命名之后），便于修复过期链接。
-- 代码匹配至少覆盖查询一半的词时才作为证据。
-- `ir search --aux`（MCP：`aux: ["all"]`；用 `--aux=code` / `["code"]` 指定域）还会在**所有文档之后**返回匹配的符号和文件本身，带 `"kind": "code"`、源文件 `path`、`code:<path>:<line>` 形式的 `doc_id`，snippet 为签名和文档注释。默认关闭，代码仍是辅助信息。过滤器（`-f`）只作用于文档。
+**2. 照常搜索**
+
+```bash
+ir search "drop outdated values after a migration" --json
+```
+
+提到匹配函数或文件的笔记排名会上升。结果的 `evidence` 字段说明原因：`["code:src/cache.rs:invalidate_entry"]`。
+
+**3. 链接笔记中没有提到名字的代码**
+
+| 位置 | 写法 |
+|---|---|
+| 笔记 frontmatter | `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` |
+| 代码注释（作用于整个文件） | `// knowledge: design/ledger.md` 或 `// [[Ledger design]]` |
+
+`ir update` 会对没有匹配任何内容的链接给出警告（例如重命名之后）。
+
+**4. 同时查看代码本身（可选）**
+
+```bash
+ir search "rotate keys" --aux        # 先列出所有文档，再列出匹配的代码
+```
+
+MCP：`aux: ["all"]`。代码结果带有 `"kind": "code"`；`-f` 过滤只作用于文档。
+
+参考：
+- 语言：`.rs`、`.py`、`.js`/`.jsx`/`.mjs`/`.cjs`、`.ts`/`.tsx`、`.go`。索引签名和文档注释，不索引函数体。
+- 笔记用 `snake_case`、`camelCase`、至少两段的 `PascalCase` 或反引号中的名字指向符号，用路径或唯一的路径后缀（`db/schema.rs`）指向文件。
+- 只有覆盖查询中至少一半词语的代码匹配才会计入。
+- `ir status` 和 MCP `status` 只对含代码的集合显示 `aux: code N`。对包含源文件的文件夹运行 `ir collection add` 时会输出一次提示。
+- 删除 `auxiliary:` 并运行 `ir update` 即可删除代码索引。没有代码的集合行为不变。
 
 </details>
 

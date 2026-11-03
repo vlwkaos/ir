@@ -22,6 +22,15 @@ ir search "memory safety in rust"    # search (daemon auto-starts)
 
 BM25 search works with no models at all. Vector/hybrid search downloads models automatically from HuggingFace on first use. Requires Rust 1.80+ if building from source; Metal is linked automatically on macOS, and Linux GPU backends are opt-in (`--features llama-cuda|llama-rocm|llama-vulkan`).
 
+## New in 0.19
+
+| Feature | What to do |
+|---|---|
+| Ask in one language, find notes in another | Nothing (hybrid or vector mode). Existing collections need no re-index. |
+| Code helps the right notes rank higher | Add `--code-glob 'src/**/*.rs'`. See **Code domain** under [Documentation](#documentation). |
+| See matching code after the documents | `ir search "…" --aux` (MCP `aux: ["all"]`) |
+| Faster hybrid search (~67 → 50 ms median) | Nothing. |
+
 ## How it searches — you only pay for what's hard
 
 Three tiers. Each runs **only if the previous one wasn't confident**, so most queries
@@ -29,26 +38,50 @@ return from tier 0 or 1 and never touch an LLM. One warm daemon holds every mode
 memory; every LLM output is cached in SQLite.
 
 ```
-query
+ir search "query"
   │
-  ▼  TIER 0 · no model · instant
-  BM25 (+ doc-graph neighbours, + documents that matching code links to)
-  clear keyword winner? ─── yes ──► results
+  ▼  TIER 0 · no model · ~1 ms
+  BM25 (FTS5) + doc-graph neighbours + notes that matching code links to
+  clear keyword winner? ── yes ──► results
   │
   ▼  TIER 1 · embedding model · ~50 ms
-  BM25  ∥  embed query ─► vector kNN (HNSW)          run in parallel
-  fuse, choosing per query:
-    a top BM25 passage holds every query word ─► vector + BM25 boost for exact matches
-    answers are in another script than the query ─► vector only (cross-language)
-    otherwise ─► 0.8 · vector + 0.2 · BM25
-  confident? ─── yes ──► results
+  BM25 ∥ vector kNN (HNSW), run in parallel ─► fuse, choosing per query
+  confident? ── yes ──► results
   │
   ▼  TIER 2 · reranker 0.6B · ~2–5 s
   rerank the top 100 ─► results
 ```
 
-The per-query choice keeps keyword lookups exact while a question finds its answer
-in another language: an English question matches a Korean note, and the other way round.
+Tier 1 picks the fusion per query. Keyword lookups stay exact, and a question finds its
+answer in another language: an English question matches a Korean note, and the other way round.
+
+| Query (example) | What tier 1 sees | Fusion |
+|---|---|---|
+| `rustls 0.23.46` | one of the top 3 BM25 passages holds every query word | vector, plus a BM25 boost for those passages only |
+| `how long are logs kept?` over Korean notes | the best vector hits are Hangul, the query is Latin | vector only |
+| `memory safety in rust` over English notes | neither of the above | 0.8 · vector + 0.2 · BM25 |
+
+Query words are lowercase Latin words and digit runs, plus character pairs for
+Chinese, Japanese and Korean. `ir search -v` prints the choice as a `[fusion]` line.
+
+### What `ir sync` builds
+
+```
+~/notes/**/*.md
+  │
+  ▼  ir update · no model
+  read files ─► preprocess (ko/ja/zh, optional) ─► BM25 index (FTS5)
+  + code symbols with tree-sitter (only with --code-glob)
+  │
+  ▼  ir embed · embedding model
+  chunk ─► embed ─► vectors ─► doc graph + HNSW ANN index
+  (unchanged or moved text reuses its cached vectors)
+  │
+  ▼
+  ~/.config/ir/collections/notes.sqlite   (+ notes.usearch, the ANN index)
+```
+
+`ir sync` runs both steps. Re-running it touches only files that changed.
 
 The preprocessor is the make-or-break stage for Korean/Japanese/Chinese BM25: it
 tokenizes both the indexed text and the query, and without it CJK BM25 scores near zero.
@@ -78,7 +111,7 @@ Cross-language questions are English questions about Korean, Japanese or Chinese
 - **0.16** — `ir sync` (index + embed in one command); deleted files are removed and moved content reuses cached vectors.
 - **0.17** — opt-in research paths: document graph and HNSW ANN index.
 - **0.18** — those paths become the default (HNSW ANN, tier-0 graph expansion, reranker window 100); the LLM query expander moves to the calling agent. [ADR-0001](research/adr-0001-default-retrieval-pipeline.md).
-- **Next** — per-query hybrid fusion for collections in several languages, parallel tier 1, code domain, rewritten `--help`. [ADR-0002](research/adr-0002-per-query-fusion.md). Existing collections keep working with no re-index.
+- **0.19** — per-query hybrid fusion for collections in several languages, parallel tier 1, code domain, rewritten `--help`. [ADR-0002](research/adr-0002-per-query-fusion.md). Existing collections keep working with no re-index.
 
 ## Documentation
 
@@ -212,13 +245,16 @@ Any executable can be a preprocessor: UTF-8 lines on stdin → 0-or-1 tokenized 
 <details>
 <summary><strong>Code domain — source code as supporting evidence</strong></summary>
 
-Index source files beside a collection's documents. Code files are never search results. Their symbols and doc comments raise, or add, the documents that mention them:
+Index source code beside your notes. Code is never a search result on its own. It lifts the notes that talk about it.
+
+**1. Add code to a collection**
 
 ```bash
-ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs' --code-glob 'src/**/*.py'
-ir update notes
-ir search "drop outdated values after a migration" --json   # finds docs that name the matching function
+ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs'
+ir sync notes
 ```
+
+For a collection that already exists, add `auxiliary:` to `config.yml`, then run `ir update notes`:
 
 ```yaml
 collections:
@@ -230,17 +266,37 @@ collections:
         excludes: ["src/generated/**"]   # optional
 ```
 
-- Supported: `.rs`, `.py`, `.js`/`.jsx`/`.mjs`/`.cjs`, `.ts`/`.tsx`, `.go` (tree-sitter). Functions, methods, types, traits/interfaces, constants and modules are indexed with their doc comments; function bodies are not.
-- A document links to a symbol when it names it: `snake_case`, `camelCase` or two-hump `PascalCase` anywhere, or any name inside backticks. It links to a file when it names its path (`src/db/schema.rs` or a unique suffix such as `db/schema.rs`).
-- A supported result has an `evidence` field in `--json` output, e.g. `["code:src/cache.rs:invalidate_entry"]`. Without a code domain, results and output are unchanged.
-- Removing `auxiliary:` from a collection drops its code index on the next `ir update`.
-- `ir status`, MCP `status` and the MCP connect instructions show `aux: code N` only for collections with code. `ir collection add` on a folder with source files and no `--code-glob` prints a one-time hint with the config to add.
-- Explicit links, for code a document never names:
-  - in the document's frontmatter: `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` (a file path or unique suffix, `path:symbol`, or a symbol name);
-  - in a code comment: `// knowledge: design/ledger.md` or `// [[Ledger design]]` (document path or title). It covers the whole file.
-- `ir update` warns about each explicit link that matches nothing, for example after a rename, so stale links can be fixed.
+**2. Search as usual**
+
+```bash
+ir search "drop outdated values after a migration" --json
+```
+
+A note that names the matching function or file ranks higher. Its `evidence` field says why: `["code:src/cache.rs:invalidate_entry"]`.
+
+**3. Link code that a note never names**
+
+| Where | Write |
+|---|---|
+| note frontmatter | `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` |
+| code comment (covers the file) | `// knowledge: design/ledger.md` or `// [[Ledger design]]` |
+
+`ir update` warns about a link that matches nothing, for example after a rename.
+
+**4. See the code itself (optional)**
+
+```bash
+ir search "rotate keys" --aux        # all documents first, then matching code
+```
+
+MCP: `aux: ["all"]`. Code results have `"kind": "code"`; `-f` filters apply to documents only.
+
+Reference:
+- Languages: `.rs`, `.py`, `.js`/`.jsx`/`.mjs`/`.cjs`, `.ts`/`.tsx`, `.go`. Signatures and doc comments are indexed, function bodies are not.
+- A note names a symbol with `snake_case`, `camelCase`, two-hump `PascalCase` or any name in backticks, and a file with its path or a unique suffix (`db/schema.rs`).
 - A code match counts only when it covers at least half of the query's words.
-- `ir search --aux` (MCP: `aux: ["all"]`; `--aux=code` / `["code"]` to name domains) also returns the matching symbols and files themselves, **after** all documents, with `"kind": "code"`, `path` = source file, `doc_id` = `code:<path>:<line>`, and the signature and doc comment as the snippet. Off by default: code stays auxiliary. Filters (`-f`) apply to documents only.
+- `ir status` and MCP `status` show `aux: code N` for collections with code. `ir collection add` on a folder with source files prints a one-time hint.
+- Remove `auxiliary:` and run `ir update` to drop the code index. Collections without code behave as before.
 
 </details>
 

@@ -1,12 +1,13 @@
 
 # ir — Search Pipeline
 
-## Pipeline at a glance (0.18 defaults)
+## Pipeline at a glance (0.19 defaults)
 
 Three-tier escalation. Each tier runs only if the previous tier's signal isn't
-strong enough, so cheap queries stay cheap. 0.18 defaults: ANN on, tier-0 graph
-expansion on, rerank window 100 + keep-window on, LLM expander off (delegated to
-the caller).
+strong enough, so cheap queries stay cheap. Defaults (since 0.18): ANN on, tier-0
+graph expansion on, rerank window 100 + keep-window on, LLM expander off (delegated
+to the caller). 0.19: tier 1 runs BM25 and the query embedding in parallel and picks
+the fusion weighting per query (ADR-0002).
 
 ```mermaid
 flowchart TD
@@ -20,7 +21,7 @@ flowchart TD
 
     subgraph S1["TIER 1 — embedder · ~50–280ms"]
         direction TB
-        T1["Vector kNN · HNSW ANN<br/>exact fallback · NEW in 0.18"] --> FUSE["Per-query hybrid fusion<br/>keyword · cross-script · 0.80·vec + 0.20·bm25<br/>(ADR-0002)"]
+        T1["BM25 ∥ query embedding<br/>Vector kNN · HNSW ANN · exact fallback"] --> FUSE["Per-query hybrid fusion<br/>keyword · cross-script · 0.80·vec + 0.20·bm25<br/>(ADR-0002)"]
     end
 
     subgraph S2["TIER 2 — reranker 0.6B · ~2s"]

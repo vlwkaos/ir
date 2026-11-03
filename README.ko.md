@@ -22,30 +22,62 @@ ir search "러스트 메모리 안전성"     # 검색 (데몬 자동 시작)
 
 BM25 검색은 모델 없이 동작한다. 벡터/하이브리드 검색은 첫 사용 시 HuggingFace에서 모델을 자동 다운로드한다. 소스 빌드는 Rust 1.80+ 필요; macOS에서는 Metal이 자동 링크되고, Linux GPU 백엔드는 opt-in (`--features llama-cuda|llama-rocm|llama-vulkan`).
 
+## 0.19의 새 기능
+
+| 기능 | 할 일 |
+|---|---|
+| 한 언어로 묻고 다른 언어의 노트 찾기 | 없음 (hybrid 또는 vector 모드). 기존 컬렉션은 재색인이 필요 없다. |
+| 코드가 맞는 노트의 순위를 올림 | `--code-glob 'src/**/*.rs'` 추가. [문서](#문서)의 **코드 도메인** 참고. |
+| 문서 다음에 일치하는 코드 보기 | `ir search "…" --aux` (MCP `aux: ["all"]`) |
+| 더 빠른 하이브리드 검색 (중앙값 ~67 → 50 ms) | 없음. |
+
 ## 검색 동작 방식 — 어려운 쿼리에만 비용을 낸다
 
 3개 티어. 각 티어는 **이전 티어가 확실하지 않을 때만** 실행되므로, 대부분의 쿼리는 티어 0 또는 1에서 반환되고 LLM을 건드리지 않는다. 하나의 웜 데몬이 모든 모델을 메모리에 유지하고, 모든 LLM 출력은 SQLite에 캐시된다.
 
 ```
-query
+ir search "query"
   │
-  ▼  TIER 0 · no model · instant
-  BM25 (+ doc-graph neighbours, + documents that matching code links to)
-  clear keyword winner? ─── yes ──► results
+  ▼  티어 0 · 모델 없음 · ~1 ms
+  BM25 (FTS5) + doc-graph 이웃 + 일치한 코드가 연결하는 노트
+  키워드 승자가 확실한가? ── 예 ──► 결과
   │
-  ▼  TIER 1 · embedding model · ~50 ms
-  BM25  ∥  embed query ─► vector kNN (HNSW)          run in parallel
-  fuse, choosing per query:
-    a top BM25 passage holds every query word ─► vector + BM25 boost for exact matches
-    answers are in another script than the query ─► vector only (cross-language)
-    otherwise ─► 0.8 · vector + 0.2 · BM25
-  confident? ─── yes ──► results
+  ▼  티어 1 · 임베딩 모델 · ~50 ms
+  BM25 ∥ 벡터 kNN (HNSW) 병렬 실행 ─► 쿼리마다 융합 방식 선택
+  확실한가? ── 예 ──► 결과
   │
-  ▼  TIER 2 · reranker 0.6B · ~2–5 s
-  rerank the top 100 ─► results
+  ▼  티어 2 · 재순위기 0.6B · ~2–5 s
+  상위 100개 재순위 ─► 결과
 ```
 
 쿼리마다 융합 방식을 고르므로 키워드 조회는 정확하게 유지되고, 질문은 다른 언어로 쓰인 답도 찾는다. 영어 질문이 한국어 노트와 일치하고, 그 반대도 마찬가지다.
+
+| 쿼리 (예시) | 티어 1이 보는 것 | 융합 |
+|---|---|---|
+| `rustls 0.23.46` | BM25 상위 3개 패시지 중 하나가 쿼리 단어를 모두 포함 | 벡터 + 그 패시지에만 BM25 가산 |
+| 한국어 노트에 대한 `how long are logs kept?` | 벡터 상위 결과는 한글, 쿼리는 라틴 문자 | 벡터만 |
+| 영어 노트에 대한 `memory safety in rust` | 위 둘 다 아님 | 0.8 · vector + 0.2 · BM25 |
+
+쿼리 단어는 소문자 라틴 단어와 숫자 묶음, 그리고 한국어·일본어·중국어의 두 글자 묶음이다. `ir search -v`는 선택 결과를 `[fusion]` 줄로 출력한다.
+
+### `ir sync`가 만드는 것
+
+```
+~/notes/**/*.md
+  │
+  ▼  ir update · 모델 없음
+  파일 읽기 ─► 전처리 (ko/ja/zh, 선택) ─► BM25 색인 (FTS5)
+  + tree-sitter 코드 심볼 (--code-glob 지정 시에만)
+  │
+  ▼  ir embed · 임베딩 모델
+  청크 분할 ─► 임베딩 ─► 벡터 ─► doc graph + HNSW ANN 색인
+  (바뀌지 않았거나 이동한 텍스트는 캐시된 벡터를 재사용)
+  │
+  ▼
+  ~/.config/ir/collections/notes.sqlite   (+ ANN 색인 notes.usearch)
+```
+
+`ir sync`는 두 단계를 모두 실행한다. 다시 실행하면 바뀐 파일만 처리한다.
 
 전처리기는 한국어·일본어·중국어 BM25 검색의 성패를 가르는 단계다: 색인 텍스트와 쿼리를 동일하게 형태소 단위로 토큰화하며, 없으면 CJK BM25 점수가 0에 가깝다.
 
@@ -72,7 +104,7 @@ query
 - **0.16** — `ir sync` (인덱스 + 임베딩 단일 명령); 삭제된 파일은 제거되고 이동된 콘텐츠는 캐시된 벡터를 재사용.
 - **0.17** — opt-in 연구 경로: 문서 그래프와 HNSW ANN 인덱스.
 - **0.18** — 그 경로들이 기본값이 된다 (HNSW ANN, 티어-0 그래프 확장, 재순위 윈도우 100); LLM 쿼리 확장기는 호출 에이전트로 이관. [ADR-0001](research/adr-0001-default-retrieval-pipeline.md).
-- **다음** — 여러 언어가 섞인 컬렉션을 위한 쿼리별 하이브리드 융합, 병렬 티어 1, 코드 도메인, 다시 쓴 `--help`. [ADR-0002](research/adr-0002-per-query-fusion.md). 기존 컬렉션은 재색인 없이 그대로 동작한다.
+- **0.19** — 여러 언어가 섞인 컬렉션을 위한 쿼리별 하이브리드 융합, 병렬 티어 1, 코드 도메인, 다시 쓴 `--help`. [ADR-0002](research/adr-0002-per-query-fusion.md). 기존 컬렉션은 재색인 없이 그대로 동작한다.
 
 ## 문서
 
@@ -235,13 +267,16 @@ ir preprocessor bind ko wiki  # 컬렉션에 연결하고 재인덱싱
 <details>
 <summary><strong>코드 도메인 — 소스 코드를 보조 근거로</strong></summary>
 
-컬렉션 문서 옆의 소스 파일을 함께 색인합니다. 코드 파일은 검색 결과로 나오지 않습니다. 대신 심볼과 doc comment가 그 심볼을 언급한 문서의 순위를 올리거나 결과에 추가합니다.
+소스 코드를 노트 옆에 색인한다. 코드는 그 자체로 검색 결과가 되지 않는다. 코드를 언급하는 노트의 순위를 올린다.
+
+**1. 컬렉션에 코드 추가**
 
 ```bash
-ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs' --code-glob 'src/**/*.py'
-ir update notes
-ir search "drop outdated values after a migration" --json   # 해당 함수를 언급한 문서를 찾습니다
+ir collection add notes ~/project --glob 'docs/**/*.md' --code-glob 'src/**/*.rs'
+ir sync notes
 ```
+
+이미 있는 컬렉션이면 `config.yml`에 `auxiliary:`를 추가하고 `ir update notes`를 실행한다:
 
 ```yaml
 collections:
@@ -253,17 +288,37 @@ collections:
         excludes: ["src/generated/**"]   # 선택
 ```
 
-- 지원 형식: `.rs`, `.py`, `.js`/`.jsx`/`.mjs`/`.cjs`, `.ts`/`.tsx`, `.go` (tree-sitter). 함수, 메서드, 타입, trait/interface, 상수, 모듈을 doc comment와 함께 색인합니다. 함수 본문은 색인하지 않습니다.
-- 문서가 심볼 이름을 쓰면 연결됩니다. `snake_case`, `camelCase`, 두 단어 이상의 `PascalCase`는 어디서든, 다른 이름은 백틱 안에서만 연결됩니다. 파일 경로(`src/db/schema.rs` 또는 `db/schema.rs`처럼 유일한 접미사)를 쓰면 파일과 연결됩니다.
-- 보조 근거가 있는 결과는 `--json` 출력에 `evidence` 필드가 붙습니다(예: `["code:src/cache.rs:invalidate_entry"]`). 코드 도메인이 없으면 결과와 출력은 이전과 같습니다.
-- 컬렉션에서 `auxiliary:`를 지우면 다음 `ir update`에서 코드 색인이 삭제됩니다.
-- `ir status`, MCP `status`, MCP 연결 안내문은 코드가 있는 컬렉션에만 `aux: code N`을 표시합니다. 소스 파일이 있는 폴더를 `--code-glob` 없이 `ir collection add`로 추가하면, 추가할 설정을 담은 안내를 한 번 출력합니다.
-- 문서가 이름을 쓰지 않는 코드는 명시적 링크로 연결합니다.
-  - 문서 frontmatter: `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` (파일 경로나 유일한 접미사, `path:symbol`, 심볼 이름)
-  - 코드 주석: `// knowledge: design/ledger.md` 또는 `// [[Ledger design]]` (문서 경로나 제목). 파일 전체에 적용됩니다.
-- `ir update`는 아무것도 가리키지 않는 명시적 링크마다 경고합니다(예: 이름 변경 후). 낡은 링크를 바로 고칠 수 있습니다.
-- 코드 일치는 쿼리 단어의 절반 이상을 포함할 때만 근거로 씁니다.
-- `ir search --aux`(MCP: `aux: ["all"]`, 도메인을 지정하려면 `--aux=code` / `["code"]`)는 일치한 심볼과 파일 자체도 **모든 문서 뒤에** 반환합니다. 결과에는 `"kind": "code"`, 소스 파일 `path`, `code:<path>:<line>` 형식의 `doc_id`가 붙고, snippet은 시그니처와 doc comment입니다. 기본값은 꺼짐입니다. 코드는 보조 정보로 남습니다. 필터(`-f`)는 문서에만 적용됩니다.
+**2. 평소처럼 검색**
+
+```bash
+ir search "drop outdated values after a migration" --json
+```
+
+일치하는 함수나 파일을 언급하는 노트의 순위가 올라간다. 결과의 `evidence` 필드가 이유를 보여 준다: `["code:src/cache.rs:invalidate_entry"]`.
+
+**3. 노트가 이름을 쓰지 않는 코드 연결**
+
+| 위치 | 작성 |
+|---|---|
+| 노트 frontmatter | `code: [src/keys.rs:rotate_all, src/ledger.rs, parse_config]` |
+| 코드 주석 (파일 전체에 적용) | `// knowledge: design/ledger.md` 또는 `// [[Ledger design]]` |
+
+`ir update`는 아무것과도 일치하지 않는 링크를 경고한다(예: 이름 변경 후).
+
+**4. 코드 자체도 보기 (선택)**
+
+```bash
+ir search "rotate keys" --aux        # 모든 문서 먼저, 그다음 일치하는 코드
+```
+
+MCP: `aux: ["all"]`. 코드 결과는 `"kind": "code"`이고, `-f` 필터는 문서에만 적용된다.
+
+참고:
+- 언어: `.rs`, `.py`, `.js`/`.jsx`/`.mjs`/`.cjs`, `.ts`/`.tsx`, `.go`. 시그니처와 doc 주석을 색인하고, 함수 본문은 색인하지 않는다.
+- 노트는 `snake_case`, `camelCase`, 두 마디 이상의 `PascalCase`, 또는 백틱 안의 이름으로 심볼을 가리키고, 경로나 고유한 끝부분(`db/schema.rs`)으로 파일을 가리킨다.
+- 코드 일치는 쿼리 단어의 절반 이상을 포함할 때만 인정된다.
+- `ir status`와 MCP `status`는 코드가 있는 컬렉션에만 `aux: code N`을 표시한다. 소스 파일이 있는 폴더에 `ir collection add`를 하면 한 번 안내를 출력한다.
+- `auxiliary:`를 지우고 `ir update`를 실행하면 코드 색인이 삭제된다. 코드가 없는 컬렉션은 이전과 같이 동작한다.
 
 </details>
 
