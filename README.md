@@ -37,20 +37,10 @@ Three tiers. Each runs **only if the previous one wasn't confident**, so most qu
 return from tier 0 or 1 and never touch an LLM. One warm daemon holds every model in
 memory; every LLM output is cached in SQLite.
 
-```
-ir search "query"
-  │
-  ▼  TIER 0 · no model · ~1 ms
-  BM25 (FTS5) + doc-graph neighbours + notes that matching code links to
-  clear keyword winner? ── yes ──► results
-  │
-  ▼  TIER 1 · embedding model · ~50 ms
-  BM25 ∥ vector kNN (HNSW), run in parallel ─► fuse, choosing per query
-  confident? ── yes ──► results
-  │
-  ▼  TIER 2 · reranker 0.6B · ~2–5 s
-  rerank the top 100 ─► results
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/search-pipeline-dark.svg">
+  <img alt="Search pipeline: tier 0 BM25, tier 1 BM25 and vector in parallel with per-query fusion, tier 2 rerank" src="docs/img/search-pipeline-light.svg" width="100%">
+</picture>
 
 Tier 1 picks the fusion per query. Keyword lookups stay exact, and a question finds its
 answer in another language: an English question matches a Korean note, and the other way round.
@@ -66,20 +56,10 @@ Chinese, Japanese and Korean. `ir search -v` prints the choice as a `[fusion]` l
 
 ### What `ir sync` builds
 
-```
-~/notes/**/*.md
-  │
-  ▼  ir update · no model
-  read files ─► preprocess (ko/ja/zh, optional) ─► BM25 index (FTS5)
-  + code symbols with tree-sitter (only with --code-glob)
-  │
-  ▼  ir embed · embedding model
-  chunk ─► embed ─► vectors ─► doc graph + HNSW ANN index
-  (unchanged or moved text reuses its cached vectors)
-  │
-  ▼
-  ~/.config/ir/collections/notes.sqlite   (+ notes.usearch, the ANN index)
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/index-lifecycle-dark.svg">
+  <img alt="What ir sync builds: BM25 index, optional code symbols, vectors, doc graph, HNSW ANN index" src="docs/img/index-lifecycle-light.svg" width="100%">
+</picture>
 
 `ir sync` runs both steps. Re-running it touches only files that changed.
 

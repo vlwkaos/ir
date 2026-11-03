@@ -4,6 +4,7 @@
 
 - **README (English, Korean, Chinese) has a "New in 0.19" table** that says what to do for each new feature, and the code domain section is now four steps: add code, search, link code a note never names, see code with `--aux`.
 - **README shows how a search and an index are built.** A table gives example queries and the tier-1 fusion each one gets, and says how to see the choice (`ir search -v` prints a `[fusion]` line). A diagram shows what `ir sync` builds: `ir update` writes the BM25 index (and code symbols with `--code-glob`), and `ir embed` writes the vectors, the doc graph and the `.usearch` ANN index. The tier diagram is shorter, and its labels are translated in the Korean and Chinese READMEs. The version list now names 0.19.
+- **README diagrams are drawn images** (light and dark SVG in `docs/img/`, built by `scripts/readme-diagrams.py`) for the search pipeline and for what `ir sync` builds.
 - `research/pipeline.md` describes the 0.19 tier 1 (parallel BM25 and query embedding, per-query fusion).
 
 ## [0.19.0] - 2026-10-30

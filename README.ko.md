@@ -35,20 +35,10 @@ BM25 검색은 모델 없이 동작한다. 벡터/하이브리드 검색은 첫 
 
 3개 티어. 각 티어는 **이전 티어가 확실하지 않을 때만** 실행되므로, 대부분의 쿼리는 티어 0 또는 1에서 반환되고 LLM을 건드리지 않는다. 하나의 웜 데몬이 모든 모델을 메모리에 유지하고, 모든 LLM 출력은 SQLite에 캐시된다.
 
-```
-ir search "query"
-  │
-  ▼  티어 0 · 모델 없음 · ~1 ms
-  BM25 (FTS5) + doc-graph 이웃 + 일치한 코드가 연결하는 노트
-  키워드 승자가 확실한가? ── 예 ──► 결과
-  │
-  ▼  티어 1 · 임베딩 모델 · ~50 ms
-  BM25 ∥ 벡터 kNN (HNSW) 병렬 실행 ─► 쿼리마다 융합 방식 선택
-  확실한가? ── 예 ──► 결과
-  │
-  ▼  티어 2 · 재순위기 0.6B · ~2–5 s
-  상위 100개 재순위 ─► 결과
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/search-pipeline-dark.svg">
+  <img alt="검색 파이프라인: 티어 0 BM25, 티어 1 BM25와 벡터 병렬 실행 후 쿼리별 융합, 티어 2 재순위" src="docs/img/search-pipeline-light.svg" width="100%">
+</picture>
 
 쿼리마다 융합 방식을 고르므로 키워드 조회는 정확하게 유지되고, 질문은 다른 언어로 쓰인 답도 찾는다. 영어 질문이 한국어 노트와 일치하고, 그 반대도 마찬가지다.
 
@@ -62,20 +52,10 @@ ir search "query"
 
 ### `ir sync`가 만드는 것
 
-```
-~/notes/**/*.md
-  │
-  ▼  ir update · 모델 없음
-  파일 읽기 ─► 전처리 (ko/ja/zh, 선택) ─► BM25 색인 (FTS5)
-  + tree-sitter 코드 심볼 (--code-glob 지정 시에만)
-  │
-  ▼  ir embed · 임베딩 모델
-  청크 분할 ─► 임베딩 ─► 벡터 ─► doc graph + HNSW ANN 색인
-  (바뀌지 않았거나 이동한 텍스트는 캐시된 벡터를 재사용)
-  │
-  ▼
-  ~/.config/ir/collections/notes.sqlite   (+ ANN 색인 notes.usearch)
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/index-lifecycle-dark.svg">
+  <img alt="ir sync가 만드는 것: BM25 색인, 선택적 코드 심볼, 벡터, doc graph, HNSW ANN 색인" src="docs/img/index-lifecycle-light.svg" width="100%">
+</picture>
 
 `ir sync`는 두 단계를 모두 실행한다. 다시 실행하면 바뀐 파일만 처리한다.
 

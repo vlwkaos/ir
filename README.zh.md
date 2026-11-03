@@ -35,20 +35,10 @@ BM25 检索无需任何模型。向量/混合检索在首次使用时自动从 H
 
 三层。每层**仅在上一层信心不足时**才运行，因此大多数查询在第 0 或第 1 层就返回，不触及 LLM。单个热守护进程将所有模型常驻内存，所有 LLM 输出都缓存在 SQLite 中。
 
-```
-ir search "query"
-  │
-  ▼  第 0 层 · 无模型 · ~1 ms
-  BM25 (FTS5) + doc-graph 邻居 + 匹配代码所链接的笔记
-  关键词赢家明确？ ── 是 ──► 结果
-  │
-  ▼  第 1 层 · 嵌入模型 · ~50 ms
-  BM25 ∥ 向量 kNN (HNSW) 并行运行 ─► 按查询选择融合方式
-  足够确定？ ── 是 ──► 结果
-  │
-  ▼  第 2 层 · 重排序器 0.6B · ~2–5 s
-  对前 100 个重排序 ─► 结果
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/search-pipeline-dark.svg">
+  <img alt="检索管线：第 0 层 BM25，第 1 层 BM25 与向量并行并按查询融合，第 2 层重排序" src="docs/img/search-pipeline-light.svg" width="100%">
+</picture>
 
 按查询选择融合方式，既让关键词查找保持精确，也让问题能找到用另一种语言写成的答案：英文问题可以匹配韩文笔记，反过来也一样。
 
@@ -62,20 +52,10 @@ ir search "query"
 
 ### `ir sync` 构建的内容
 
-```
-~/notes/**/*.md
-  │
-  ▼  ir update · 无模型
-  读取文件 ─► 预处理（ko/ja/zh，可选）─► BM25 索引（FTS5）
-  + tree-sitter 代码符号（仅在指定 --code-glob 时）
-  │
-  ▼  ir embed · 嵌入模型
-  分块 ─► 嵌入 ─► 向量 ─► doc graph + HNSW ANN 索引
-  （未改变或被移动的文本复用缓存的向量）
-  │
-  ▼
-  ~/.config/ir/collections/notes.sqlite   （+ ANN 索引 notes.usearch）
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/index-lifecycle-dark.svg">
+  <img alt="ir sync 构建的内容：BM25 索引、可选的代码符号、向量、doc graph、HNSW ANN 索引" src="docs/img/index-lifecycle-light.svg" width="100%">
+</picture>
 
 `ir sync` 运行这两步。再次运行只处理有变化的文件。
 
