@@ -350,3 +350,101 @@ fn xdg_config_home_is_a_deprecated_fallback_for_the_data_dir() {
         "stderr: {stderr}"
     );
 }
+
+// ^ Bytes written by ir 0.19.0 (serde_yaml 0.9) for HAND_WRITTEN_CONFIG. The YAML
+//   crate swap (serde_yaml -> yaml_serde) must keep them identical.
+const SERDE_YAML_0_9_CONFIG: &str = r#"collections:
+- name: notes
+  path: /nonexistent/ir test/notes
+  globs:
+  - '**/*.md'
+  - '*.txt'
+  excludes:
+  - drafts/**
+  description: 'Notes: "quoted", colon: yes, 한국어 메모, emoji ✓'
+  preprocessor:
+  - ko
+  routing:
+    fused_strong_floor: 0.4
+    bm25_strong_gap: 0.1
+  retrieval:
+    ann: false
+    rerank_window: 50
+    expander: true
+  auxiliary:
+    code:
+      globs:
+      - src/**/*.rs
+      - lib/*.py
+      excludes:
+      - src/gen/**
+- name: '123'
+  path: /nonexistent/yes
+  globs: []
+  excludes: []
+  description: |
+    multi
+    line
+  auxiliary:
+    code:
+      globs:
+      - '*.go'
+preprocessors:
+  ko: $IR_DIR/preprocessors/ko/lindera-tokenize --dict ko-dic
+retrieval:
+  t0_graph_expand: true
+  expander: false
+"#;
+
+const HAND_WRITTEN_CONFIG: &str = r#"collections:
+  - name: notes
+    path: "/nonexistent/ir test/notes"
+    globs: ["**/*.md", "*.txt"]
+    excludes: ["drafts/**"]
+    description: "Notes: \"quoted\", colon: yes, 한국어 메모, emoji ✓"
+    preprocessor: [ko]
+    routing:
+      fused_strong_floor: 0.4
+      bm25_strong_gap: 0.1
+    retrieval:
+      ann: false
+      rerank_window: 50
+      expander: true
+    auxiliary:
+      code:
+        globs: ["src/**/*.rs", "lib/*.py"]
+        excludes: ["src/gen/**"]
+  - name: "123"
+    path: /nonexistent/yes
+    description: |
+      multi
+      line
+    auxiliary:
+      code:
+        globs: ["*.go"]
+preprocessors:
+  ko: $IR_DIR/preprocessors/ko/lindera-tokenize --dict ko-dic
+retrieval:
+  expander: false
+  t0_graph_expand: true
+"#;
+
+#[test]
+fn config_yml_is_saved_byte_for_byte_like_earlier_releases() {
+    for (label, start) in [
+        ("hand-written", HAND_WRITTEN_CONFIG),
+        ("saved by 0.19.0", SERDE_YAML_0_9_CONFIG),
+    ] {
+        let env = Env::new("e2e-config-bytes");
+        let config = env.config_dir.join("config.yml");
+        fs::write(&config, start).unwrap();
+        // ^ add + rm loads and saves the file twice and leaves the same collections.
+        env.add_collection("scratch", &[]);
+        env.ok(&["collection", "rm", "scratch"]);
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            SERDE_YAML_0_9_CONFIG,
+            "{label} config.yml"
+        );
+    }
+}

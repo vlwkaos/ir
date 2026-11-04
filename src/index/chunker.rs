@@ -238,12 +238,12 @@ pub fn extract_title(doc: &str, path_hint: &str) -> String {
 
     if let Some((yaml_block, end)) = crate::frontmatter::find_block(doc) {
         body_start = end;
-        if let Ok(serde_yaml::Value::Mapping(m)) =
-            serde_yaml::from_str::<serde_yaml::Value>(yaml_block)
+        if let Ok(yaml_serde::Value::Mapping(m)) =
+            yaml_serde::from_str::<yaml_serde::Value>(yaml_block)
         {
             for key in ["title", "name"] {
-                let k = serde_yaml::Value::String(key.to_string());
-                if let Some(serde_yaml::Value::String(s)) = m.get(&k)
+                let k = yaml_serde::Value::String(key.to_string());
+                if let Some(yaml_serde::Value::String(s)) = m.get(&k)
                     && !s.is_empty()
                 {
                     return s.clone();

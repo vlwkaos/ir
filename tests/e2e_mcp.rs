@@ -211,3 +211,91 @@ fn mcp_reports_the_warnings_the_cli_prints() {
         "search notes name the skipped collection and the preprocessor: {cli_notes:?}"
     );
 }
+
+/// Send one raw HTTP/1.1 request and return what arrives before the server
+/// closes the connection or goes quiet for 2 s.
+fn http_exchange(port: u16, request: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = stream.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn http_server_answers_cors_preflight_and_initialize() {
+    let env = Env::new("e2e-mcp-http");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = env
+        .ir()
+        .args([
+            "mcp",
+            "--http",
+            &port.to_string(),
+            "--cors",
+            "https://app.example",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn ir mcp --http");
+    let up = support::eventually(std::time::Duration::from_secs(10), || {
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
+
+    // ^ A browser client on the 2026-07-28 protocol sends Mcp-Method / Mcp-Name.
+    let preflight = http_exchange(
+        port,
+        "OPTIONS /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://app.example\r\n\
+         Access-Control-Request-Method: POST\r\n\
+         Access-Control-Request-Headers: content-type,mcp-protocol-version,mcp-method,mcp-name\r\n\
+         Connection: close\r\n\r\n",
+    );
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}"#;
+    let initialize = http_exchange(
+        port,
+        &format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://app.example\r\n\
+             Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    child.kill().ok();
+    child.wait().ok();
+
+    assert!(up, "ir mcp --http did not listen on {port}");
+    let allowed = preflight
+        .lines()
+        .find(|l| {
+            l.to_ascii_lowercase()
+                .starts_with("access-control-allow-headers")
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    for name in ["mcp-protocol-version", "mcp-method", "mcp-name"] {
+        assert!(allowed.contains(name), "{name} not allowed:\n{preflight}");
+    }
+    assert!(
+        initialize.starts_with("HTTP/1.1 200"),
+        "initialize failed:\n{initialize}"
+    );
+    assert!(
+        initialize.contains(r#""name":"ir""#),
+        "no server info:\n{initialize}"
+    );
+}

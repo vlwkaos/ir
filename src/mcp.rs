@@ -219,9 +219,9 @@ impl IrMcpServer {
         })
         .await?;
         // ^ The results stay the first block, unchanged, for clients that read only it.
-        let mut content = vec![Content::text(ok_json(&results)?)];
+        let mut content = vec![ContentBlock::text(ok_json(&results)?)];
         if !notes.is_empty() {
-            content.push(Content::text(format!("notes:\n{}", notes.join("\n"))));
+            content.push(ContentBlock::text(format!("notes:\n{}", notes.join("\n"))));
         }
         Ok(CallToolResult::success(content))
     }
@@ -318,8 +318,8 @@ impl IrMcpServer {
 
 #[tool_handler]
 impl ServerHandler for IrMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("ir", env!("CARGO_PKG_VERSION")))
             .with_instructions(build_instructions())
     }
@@ -520,6 +520,9 @@ fn build_cors_layer(origin: &str) -> IrResult<tower_http::cors::CorsLayer> {
             header::HeaderName::from_static("mcp-session-id"),
             header::HeaderName::from_static("mcp-protocol-version"),
             header::HeaderName::from_static("last-event-id"),
+            // ^ SEP-2243 request headers sent by 2026-07-28 protocol clients (rmcp 3.x).
+            header::HeaderName::from_static("mcp-method"),
+            header::HeaderName::from_static("mcp-name"),
         ])
         .expose_headers([header::HeaderName::from_static("mcp-session-id")]))
 }
