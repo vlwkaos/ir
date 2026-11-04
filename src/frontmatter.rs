@@ -41,10 +41,10 @@ pub(crate) fn find_block(doc: &str) -> Option<(&str, usize)> {
 /// Parse YAML frontmatter from `doc`.
 /// Returns the mapping if frontmatter is present and valid; None otherwise.
 /// Malformed YAML is logged to stderr — the document is still indexed without metadata.
-pub(crate) fn extract(doc: &str) -> Option<serde_yaml::Mapping> {
+pub(crate) fn extract(doc: &str) -> Option<yaml_serde::Mapping> {
     let (yaml_block, _) = find_block(doc)?;
-    match serde_yaml::from_str::<serde_yaml::Value>(yaml_block) {
-        Ok(serde_yaml::Value::Mapping(m)) => Some(m),
+    match yaml_serde::from_str::<yaml_serde::Value>(yaml_block) {
+        Ok(yaml_serde::Value::Mapping(m)) => Some(m),
         Ok(_) => None,
         Err(e) => {
             eprintln!("warn: malformed frontmatter YAML: {e}");
@@ -59,11 +59,11 @@ pub(crate) fn extract(doc: &str) -> Option<serde_yaml::Mapping> {
 /// - YAML date strings (YYYY-MM-DD or RFC3339+offset) → UTC RFC3339
 /// - Sequences: one pair per element (same key, each element stringified)
 /// - Nested mappings: skipped with a warning
-pub(crate) fn flatten(mapping: &serde_yaml::Mapping) -> Vec<(String, String)> {
+pub(crate) fn flatten(mapping: &yaml_serde::Mapping) -> Vec<(String, String)> {
     let mut result = Vec::new();
     for (key, value) in mapping {
         let key_str = match key {
-            serde_yaml::Value::String(s) => s.clone(),
+            yaml_serde::Value::String(s) => s.clone(),
             _ => continue,
         };
         flatten_value(&key_str, value, &mut result);
@@ -71,25 +71,25 @@ pub(crate) fn flatten(mapping: &serde_yaml::Mapping) -> Vec<(String, String)> {
     result
 }
 
-fn flatten_value(key: &str, value: &serde_yaml::Value, out: &mut Vec<(String, String)>) {
+fn flatten_value(key: &str, value: &yaml_serde::Value, out: &mut Vec<(String, String)>) {
     match value {
-        serde_yaml::Value::Null => {}
-        serde_yaml::Value::Bool(b) => out.push((key.to_string(), b.to_string())),
-        serde_yaml::Value::Number(n) => out.push((key.to_string(), n.to_string())),
-        serde_yaml::Value::String(s) => out.push((key.to_string(), normalize_date(s))),
-        serde_yaml::Value::Sequence(seq) => {
+        yaml_serde::Value::Null => {}
+        yaml_serde::Value::Bool(b) => out.push((key.to_string(), b.to_string())),
+        yaml_serde::Value::Number(n) => out.push((key.to_string(), n.to_string())),
+        yaml_serde::Value::String(s) => out.push((key.to_string(), normalize_date(s))),
+        yaml_serde::Value::Sequence(seq) => {
             for item in seq {
                 match item {
-                    serde_yaml::Value::String(s) => {
+                    yaml_serde::Value::String(s) => {
                         out.push((key.to_string(), normalize_date(s)));
                     }
-                    serde_yaml::Value::Number(n) => out.push((key.to_string(), n.to_string())),
-                    serde_yaml::Value::Bool(b) => out.push((key.to_string(), b.to_string())),
+                    yaml_serde::Value::Number(n) => out.push((key.to_string(), n.to_string())),
+                    yaml_serde::Value::Bool(b) => out.push((key.to_string(), b.to_string())),
                     _ => {}
                 }
             }
         }
-        serde_yaml::Value::Mapping(_) => {
+        yaml_serde::Value::Mapping(_) => {
             eprintln!("warn: skipping nested map at frontmatter key '{key}'");
         }
         _ => {}

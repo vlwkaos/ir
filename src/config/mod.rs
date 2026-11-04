@@ -1,5 +1,5 @@
 // ~/.config/ir/config.yml — collection registry
-// docs: https://docs.rs/serde_yaml
+// docs: https://docs.rs/yaml_serde
 
 mod context;
 pub use context::detect_collection;
@@ -33,7 +33,7 @@ impl Config {
             return Ok(Self::default());
         }
         let content = fs::read_to_string(&path)?;
-        let mut config: Self = serde_yaml::from_str(&content)?;
+        let mut config: Self = yaml_serde::from_str(&content)?;
         for col in &mut config.collections {
             if col.path.contains('~') || col.path.contains('$') {
                 col.path = expand_path(&col.path).to_string_lossy().into_owned();
@@ -52,7 +52,7 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let yaml = serde_yaml::to_string(self)?;
+        let yaml = yaml_serde::to_string(self)?;
         let mut tmp = path.clone().into_os_string();
         tmp.push(format!(".tmp.{}", std::process::id()));
         let tmp = PathBuf::from(tmp);
