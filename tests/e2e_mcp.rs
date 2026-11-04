@@ -240,22 +240,32 @@ fn http_server_answers_cors_preflight_and_initialize() {
         .local_addr()
         .unwrap()
         .port();
-    let mut child = env
-        .ir()
-        .args([
-            "mcp",
-            "--http",
-            &port.to_string(),
-            "--cors",
-            "https://app.example",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn ir mcp --http");
+    // ^ Kills the server on every exit path, including a panic below.
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _server = KillOnDrop(
+        env.ir()
+            .args([
+                "mcp",
+                "--http",
+                &port.to_string(),
+                "--cors",
+                "https://app.example",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ir mcp --http"),
+    );
     let up = support::eventually(std::time::Duration::from_secs(10), || {
         std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
     });
+    assert!(up, "ir mcp --http did not listen on {port}");
 
     // ^ A browser client on the 2026-07-28 protocol sends Mcp-Method / Mcp-Name.
     let preflight = http_exchange(
@@ -275,10 +285,7 @@ fn http_server_answers_cors_preflight_and_initialize() {
             body.len()
         ),
     );
-    child.kill().ok();
-    child.wait().ok();
 
-    assert!(up, "ir mcp --http did not listen on {port}");
     let allowed = preflight
         .lines()
         .find(|l| {
