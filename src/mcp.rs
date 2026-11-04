@@ -500,9 +500,15 @@ async fn run_stdio() -> IrResult<()> {
 }
 
 fn build_cors_layer(origin: &str) -> IrResult<tower_http::cors::CorsLayer> {
-    use axum::http::{HeaderValue, Method, header};
+    use axum::http::{HeaderName, HeaderValue, Method, header};
+    use rmcp::transport::common::http_header::{
+        HEADER_LAST_EVENT_ID, HEADER_MCP_METHOD, HEADER_MCP_NAME, HEADER_MCP_PROTOCOL_VERSION,
+        HEADER_SESSION_ID,
+    };
     use tower_http::cors::CorsLayer;
 
+    // ^ rmcp's names are mixed-case; from_bytes lowercases them (from_static would panic).
+    let name = |n: &str| HeaderName::from_bytes(n.as_bytes()).expect("valid rmcp header name");
     let allow_origin = if origin == "*" {
         tower_http::cors::AllowOrigin::any()
     } else {
@@ -517,14 +523,14 @@ fn build_cors_layer(origin: &str) -> IrResult<tower_http::cors::CorsLayer> {
         .allow_headers([
             header::CONTENT_TYPE,
             header::ACCEPT,
-            header::HeaderName::from_static("mcp-session-id"),
-            header::HeaderName::from_static("mcp-protocol-version"),
-            header::HeaderName::from_static("last-event-id"),
-            // ^ SEP-2243 request headers sent by 2026-07-28 protocol clients (rmcp 3.x).
-            header::HeaderName::from_static("mcp-method"),
-            header::HeaderName::from_static("mcp-name"),
+            name(HEADER_SESSION_ID),
+            name(HEADER_MCP_PROTOCOL_VERSION),
+            name(HEADER_LAST_EVENT_ID),
+            // ^ SEP-2243 request headers sent by 2026-07-28 protocol clients.
+            name(HEADER_MCP_METHOD),
+            name(HEADER_MCP_NAME),
         ])
-        .expose_headers([header::HeaderName::from_static("mcp-session-id")]))
+        .expose_headers([name(HEADER_SESSION_ID)]))
 }
 
 async fn run_http(port: u16, cors: Option<String>) -> IrResult<()> {
