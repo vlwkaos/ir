@@ -147,6 +147,7 @@ Idle timeout: 3600s (configurable via `ir daemon start --timeout`).
 ## Release
 
 release.flow: rust-ci
+release.notes: changelog   # CD - release extracts the notes from the CHANGELOG version heading
 
 - Release atomic references resolve under `~/.claude/skills/release/atomic/`; run release state checks separately because an empty `rg --files knowledge/sessions` exits 1
 - Before editing release guidance, inspect the checked-in section with `rg -n -A45 -B3 '^## Release|release\.flow|GitHub Actions|git push origin' AGENTS.md`; session-provided instructions may omit local additions
