@@ -34,7 +34,7 @@ jobs:
             preship: true
           # ^ macOS has its own install and upgrade paths (clonefile, symlinked
           #   executables), which the daemon scenarios cover.
-          - os: macos-14
+          - os: macos-15
             features: ''
             preship: false
     env:

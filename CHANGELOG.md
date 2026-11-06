@@ -8,6 +8,10 @@
 
 - **Dependencies updated to clear the remaining `cargo audit` warnings and the rmcp advisories:** rmcp 3.8.0 (from 1.5, several GHSA advisories), anyhow 1.0.104 (RUSTSEC-2026-0190), tokio 1.54.1 (RUSTSEC-2026-0386) and chacha20 0.10.2 (0.10.0 was yanked). indicatif 0.18.6 drops the unmaintained `number_prefix` (RUSTSEC-2025-0119). The YAML library is now `yaml_serde` (maintained by the YAML organization) instead of the deprecated `serde_yaml`, which removes `unsafe-libyaml` (RUSTSEC-2024-0449). `config.yml` is read and written byte for byte as before. Also picks up crossbeam-epoch 0.9.21 and webpki-roots 1.0.11.
 
+### Build
+
+- The macOS release and evaluation builds run on GitHub's macOS 15 runners, because macOS 14 runners were retired on 2026-11-02. The release binary still runs on macOS 11 and later (Apple silicon) and 10.15 and later (Intel).
+
 ### Documentation
 
 - **README (English, Korean, Chinese) has a "New in 0.19" table** that says what to do for each new feature, and the code domain section is now four steps: add code, search, link code a note never names, see code with `--aux`.
