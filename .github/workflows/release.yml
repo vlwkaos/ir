@@ -49,6 +49,11 @@ jobs:
     name: macOS (universal)
     needs: [check]
     runs-on: macos-15
+    env:
+      # ^ The runner's Homebrew OpenSSL 3.6 breaks llama.cpp's cpp-httplib CMake step
+      #   (OpenSSL::SSL target not found); ir never uses llama.cpp's HTTPS. llama-cpp-sys-2
+      #   forwards CMAKE_* env vars as CMake defines.
+      CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: 'TRUE'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:

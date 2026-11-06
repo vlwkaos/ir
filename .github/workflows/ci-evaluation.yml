@@ -39,6 +39,9 @@ jobs:
             preship: false
     env:
       IR_FORCE_CPU_BACKEND: '1'
+      # ^ Same as release.yml build-macos: the macOS 15 runner's OpenSSL breaks llama.cpp's
+      #   cpp-httplib CMake step; ir never uses llama.cpp's HTTPS.
+      CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: 'TRUE'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:

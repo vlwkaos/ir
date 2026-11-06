@@ -10,7 +10,7 @@
 
 ### Build
 
-- The macOS release and evaluation builds run on GitHub's macOS 15 runners, because macOS 14 runners were retired on 2026-11-02. The release binary still runs on macOS 11 and later (Apple silicon) and 10.15 and later (Intel).
+- The macOS release and evaluation builds run on GitHub's macOS 15 runners, because macOS 14 runners were retired on 2026-11-02. They build llama.cpp without its OpenSSL support, which `ir` does not use (models download through `hf-hub`). The release binary still runs on macOS 11 and later (Apple silicon) and 10.15 and later (Intel).
 
 ### Documentation
 
