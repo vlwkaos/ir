@@ -127,7 +127,9 @@ pub fn pending_count(conn: &Connection, force: bool) -> Result<usize> {
           )
         "
     };
-    conn.query_row(sql, [], |row| row.get(0))
+    // ^ rusqlite 0.41 reads integers as i64 only; COUNT is never negative.
+    conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+        .map(|n| n as usize)
         .map_err(Into::into)
 }
 

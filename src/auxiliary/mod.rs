@@ -626,9 +626,11 @@ pub fn artifact_counts(conn: &Connection) -> Vec<(String, usize)> {
     else {
         return vec![];
     };
-    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?)))
-        .map(|rows| rows.flatten().collect())
-        .unwrap_or_default()
+    stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+    })
+    .map(|rows| rows.flatten().collect())
+    .unwrap_or_default()
 }
 
 /// Number of stored auxiliary artifacts (all domains); 0 without one.

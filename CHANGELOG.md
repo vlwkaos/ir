@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Security
+
+- **rmcp 3.9.0 (RUSTSEC-2026-0462) and rusqlite 0.41.1 with libsqlite3-sys 0.39.1 (RUSTSEC-2026-0459).** rmcp 3.8.0 read HTTP response bodies with no size limit in its Streamable HTTP clients. `ir mcp` is a server and does not use those clients, but `cargo audit` flagged the version. The bundled SQLite is now 3.54.1. SQLite before 3.54.0 could return uninitialized memory when it opened a database together with a crafted `-wal` file whose page size differed. `ir` opens its collection databases in WAL mode.
+
 ## [0.19.1] - 2026-11-06
 
 ### Changed

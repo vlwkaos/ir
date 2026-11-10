@@ -418,9 +418,10 @@ fn count_docs(db_path: &std::path::Path) -> Option<usize> {
     conn.query_row(
         "SELECT COUNT(*) FROM documents WHERE active = 1",
         [],
-        |row| row.get::<_, usize>(0),
+        |row| row.get::<_, i64>(0),
     )
     .ok()
+    .map(|n| n as usize)
 }
 
 fn build_status() -> IrResult<StatusOutput> {

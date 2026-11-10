@@ -161,9 +161,9 @@ impl CollectionDb {
     pub fn active_doc_count(&self) -> usize {
         self.conn
             .query_row("SELECT COUNT(*) FROM documents WHERE active = 1", [], |r| {
-                r.get::<_, usize>(0)
+                r.get::<_, i64>(0)
             })
-            .unwrap_or(0)
+            .map_or(0, |n| n as usize)
     }
 
     /// Why `preprocess_query` could not start this collection's preprocessor,
