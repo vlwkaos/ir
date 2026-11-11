@@ -48,6 +48,11 @@ jobs:
       # ^ numkong 7.7.1 (usearch dep) enables its sapphireamx kernels on GCC 11, but they
       #   need target("avx512fp16") (GCC 12+). build.rs override; run 43019698386 failed on it.
       NK_TARGET_SAPPHIREAMX: '0'
+      # ^ ggml GGML_CUDA_NCCL defaults ON and finds the image's libnccl, but
+      #   llama-cpp-sys-2 0.1.145 does not link it (run 43028557699: undefined ncclAllReduce).
+      #   Kaggle runs one GPU. build.rs passes CMAKE_* env to cmake but does not rerun when
+      #   it changes: change the rust-cache key if a cached build predates a CMAKE_* edit.
+      CMAKE_DISABLE_FIND_PACKAGE_NCCL: 'TRUE'
     steps:
       - name: System packages
         run: |
