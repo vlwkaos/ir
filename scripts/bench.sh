@@ -3,6 +3,15 @@
 #
 # Usage:
 #   scripts/bench.sh <dataset> [baseline-ref] [--mode bm25|vector|hybrid|all] [--size N] [--seed N]
+#                    [--ir-bin PATH --git7 SHA] [--data-dir DIR] [--index-in DIR] [--index-out DIR]
+#
+# Prebuilt inputs (used by scripts/kaggle/run.py; see research/kaggle-eval.md):
+#   --ir-bin PATH   use this binary, skip cargo build (no baseline-ref); --git7 names the result
+#   --data-dir DIR  dataset dir (queries.jsonl, qrels/test.tsv[, corpus.jsonl]); no download
+#   --index-in DIR  copy <collection>.sqlite (+ .usearch) from DIR (may be read-only); no prepare
+#   --index-out DIR after prepare, save a consistent copy of the index to DIR
+#   With --index-in or --index-out the collection is eval-<dataset> (no git hash), so one
+#   index serves many commits.
 #
 # Examples:
 #   scripts/bench.sh fiqa
@@ -50,12 +59,22 @@ BASELINE_REF=""
 MODE="all"
 SAMPLE_SIZE=""
 SAMPLE_SEED="42"
+IR_BIN_ARG=""
+GIT7_ARG=""
+DATA_DIR_ARG=""
+INDEX_IN=""
+INDEX_OUT=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mode) MODE="$2"; shift 2 ;;
         --size) SAMPLE_SIZE="$2"; shift 2 ;;
         --seed) SAMPLE_SEED="$2"; shift 2 ;;
+        --ir-bin) IR_BIN_ARG="$2"; shift 2 ;;
+        --git7) GIT7_ARG="$2"; shift 2 ;;
+        --data-dir) DATA_DIR_ARG="$2"; shift 2 ;;
+        --index-in) INDEX_IN="$2"; shift 2 ;;
+        --index-out) INDEX_OUT="$2"; shift 2 ;;
         --) shift; break ;;
         -*)  echo "unknown flag: $1" >&2; exit 1 ;;
         *)
@@ -137,6 +156,25 @@ if [[ ! "$SAMPLE_SEED" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
+if [[ -n "$IR_BIN_ARG" ]]; then
+    [[ -x "$IR_BIN_ARG" ]] || { echo "--ir-bin '$IR_BIN_ARG' is not an executable file" >&2; exit 1; }
+    [[ -z "$BASELINE_REF" ]] || { echo "--ir-bin cannot be combined with a baseline ref" >&2; exit 1; }
+fi
+if [[ -n "$GIT7_ARG" && ! "$GIT7_ARG" =~ ^[0-9a-f]{7}$ ]]; then
+    echo "invalid --git7 '$GIT7_ARG' (expected 7 hex chars)" >&2
+    exit 1
+fi
+if [[ -n "$DATA_DIR_ARG" ]]; then
+    for f in queries.jsonl qrels/test.tsv; do
+        [[ -f "$DATA_DIR_ARG/$f" ]] || { echo "--data-dir: missing $DATA_DIR_ARG/$f" >&2; exit 1; }
+    done
+    DATA_PATH="$DATA_DIR_ARG"
+fi
+if [[ -n "$INDEX_IN" && ! -d "$INDEX_IN" ]]; then
+    echo "--index-in '$INDEX_IN' is not a directory" >&2
+    exit 1
+fi
+
 # BM25-only mode: skip embedding
 if [[ "$MODE" == "bm25" ]]; then
     EMBED_FLAG=""
@@ -153,7 +191,7 @@ fi
 
 # ── Download dataset if missing ───────────────────────────────────────────────
 
-if [[ ! -f "$DATA_PATH/corpus.jsonl" ]]; then
+if [[ -z "$DATA_DIR_ARG" && ! -f "$DATA_PATH/corpus.jsonl" ]]; then
     _log "Dataset '$DATASET' not found. Downloading..."
     eval "$DOWNLOAD_CMD"
 fi
@@ -175,10 +213,15 @@ fi
 
 # ── Build ir binary ───────────────────────────────────────────────────────────
 
-_log "Building ir (HEAD)..."
-cargo build --release --bin ir 2>&1
-HEAD_BIN="$REPO_ROOT/target/release/ir"
-HEAD_HASH=$(git rev-parse --short=7 HEAD)
+if [[ -n "$IR_BIN_ARG" ]]; then
+    HEAD_BIN="$(cd "$(dirname "$IR_BIN_ARG")" && pwd)/$(basename "$IR_BIN_ARG")"
+    _log "Using prebuilt ir: $HEAD_BIN"
+else
+    _log "Building ir (HEAD)..."
+    cargo build --release --bin ir 2>&1
+    HEAD_BIN="$REPO_ROOT/target/release/ir"
+fi
+HEAD_HASH="${GIT7_ARG:-$(git rev-parse --short=7 HEAD)}"
 _log "HEAD: $HEAD_HASH"
 
 # ── Build baseline if requested ───────────────────────────────────────────────
@@ -292,11 +335,62 @@ prepared_marker_for_mode() {
     fi
 }
 
+# Copy a prebuilt index into the isolated state dir and register its collection.
+# The copy is writable: search opens the DB read-write (WAL, rerank cache).
+load_index() {
+    local ir_bin="$1"
+    local collection="$2"
+    local dir="${IR_CONFIG_DIR:?}/collections"
+    [[ -f "$INDEX_IN/$collection.sqlite" ]] || {
+        echo "--index-in: missing $INDEX_IN/$collection.sqlite" >&2; return 1
+    }
+    mkdir -p "$dir"
+    rm -f "$dir/${collection:?}".sqlite* "$dir/${collection:?}.usearch"
+    cp "$INDEX_IN/$collection.sqlite" "$dir/"
+    [[ -f "$INDEX_IN/$collection.usearch" ]] && cp "$INDEX_IN/$collection.usearch" "$dir/"
+    chmod u+w "$dir/$collection".*
+    # ^ `collection ls` prints "<name> <path>" per line; match the name exactly.
+    if ! "$ir_bin" collection ls 2>/dev/null | awk -v c="$collection" '$1 == c {f=1} END {exit !f}'; then
+        # ^ Search reads only the DB; the source path just has to exist.
+        local add_args=(collection add "$collection" "$DATA_PATH" --glob '**/*.txt')
+        [[ -n "$PREPROCESSOR" ]] && add_args+=(--preprocessor "$PREPROCESSOR")
+        "$ir_bin" "${add_args[@]}" >/dev/null
+    fi
+    _log "index: loaded $collection from $INDEX_IN"
+}
+
+# Save a consistent copy of the index (sqlite backup API folds in the WAL).
+save_index() {
+    local ir_bin="$1"
+    local collection="$2"
+    local src="${IR_CONFIG_DIR:?}/collections/$collection"
+    local out="${INDEX_OUT:?}/${collection:?}"
+    [[ -f "$src.sqlite" ]] || { echo "--index-out: no index at $src.sqlite" >&2; return 1; }
+    "$ir_bin" daemon stop >/dev/null 2>&1 || true
+    mkdir -p "$INDEX_OUT"
+    rm -f "$out.sqlite"
+    python3 - "$src.sqlite" "$out.sqlite" <<'PY'
+import sqlite3, sys
+src = sqlite3.connect(sys.argv[1])
+dst = sqlite3.connect(sys.argv[2])
+src.backup(dst)
+dst.close()
+src.close()
+PY
+    if [[ -f "$src.usearch" ]]; then
+        cp "$src.usearch" "$out.usearch"
+    else
+        rm -f "$out.usearch"
+    fi
+    _log "index: saved $collection to $INDEX_OUT"
+}
+
 run_version() {
     local label="$1"
     local git7="$2"
     local ir_bin="$3"
     local collection="eval-${DATASET_LABEL}-${git7}"
+    [[ -n "$INDEX_IN$INDEX_OUT" ]] && collection="eval-${DATASET_LABEL}"
     local result_file="$LOG_DIR/${git7}.json"
     local result_base="${result_file%.json}"
     local prep_marker
@@ -306,6 +400,8 @@ run_version() {
         _log "[$label $git7] cached ($result_file)"
         return 0
     fi
+
+    [[ -n "$INDEX_IN" ]] && load_index "$ir_bin" "$collection"
 
     if [[ -f "$prep_marker" ]]; then
         _log "[$label $git7] resume: prepared marker found ($prep_marker)"
@@ -325,6 +421,8 @@ run_version() {
         bench_run_guarded "prepare $collection" "$ir_bin" python3 scripts/beir-eval.py "${prep_args[@]}"
         mark_prepared "$result_base" "$MODE"
     fi
+
+    [[ -n "$INDEX_OUT" ]] && save_index "$ir_bin" "$collection"
 
     if [[ "$MODE" != "bm25" ]]; then
         _log "[$label $git7] restarting benchmark daemon (tier-2=dedicated)"

@@ -27,6 +27,7 @@ Benchmark runner (drives the real `ir` binary; requires BEIR dataset):
 scripts/bench.sh fiqa              # bench current HEAD on FiQA
 scripts/bench.sh fiqa v0.9.0       # compare HEAD vs v0.9.0
 scripts/bench.sh miracl-ko         # Korean MIRACL benchmark
+gh workflow run eval-kaggle.yml -f dataset=scifact   # quality only, on a Kaggle GPU (research/kaggle-eval.md)
 ```
 Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
 

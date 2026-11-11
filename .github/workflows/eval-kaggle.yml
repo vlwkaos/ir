@@ -1,0 +1,107 @@
+name: Eval - Kaggle GPU
+
+# Retrieval quality (nDCG, recall) of scripts/bench.sh on a free Kaggle GPU.
+# Flow and one-time setup: research/kaggle-eval.md. Speed numbers from Kaggle
+# are not comparable with a local GPU; no preship speed floors apply here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: Dataset
+        type: choice
+        options: [scifact, nfcorpus, fiqa, miracl-ko, miracl-zh]
+        default: scifact
+      mode:
+        description: bench.sh --mode
+        type: choice
+        options: [all, bm25, vector, hybrid]
+        default: all
+      accelerator:
+        description: Kaggle machine shape
+        default: NvidiaTeslaT4
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-kaggle-${{ inputs.dataset }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: CUDA build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # ^ CUDA 12.x on Ubuntu 22.04 (glibc 2.35) runs on Kaggle's newer image.
+    #   llama-cpp-sys-2 links cudart/cublas statically on Linux; only the
+    #   driver's libcuda is needed at run time.
+    container: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    env:
+      CMAKE_CUDA_ARCHITECTURES: '75'   # ^ T4; Kaggle retired P100 (kaggle CLI 2.2.5 help)
+      CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: 'TRUE'
+    steps:
+      - name: System packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git curl ca-certificates cmake build-essential pkg-config libclang-dev python3
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: eval-kaggle-cuda
+      - name: Build
+        run: cargo build --release --bin ir --no-default-features --features llama-cuda,llama-openmp
+      - name: Bundle
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          scripts/kaggle/bundle.sh target/release/ir bundle
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ir-bundle
+          path: bundle/
+          retention-days: 7
+
+  kaggle:
+    name: Kaggle run (${{ inputs.dataset }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Kaggle CLI (pinned, hashed)
+        run: |
+          uv venv "$RUNNER_TEMP/kaggle-venv" --python 3.12
+          VIRTUAL_ENV="$RUNNER_TEMP/kaggle-venv" uv pip install --require-hashes -r scripts/kaggle/requirements.txt
+          echo "$RUNNER_TEMP/kaggle-venv/bin" >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ir-bundle
+          path: bundle
+      - name: Run on Kaggle
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          DATASET: ${{ inputs.dataset }}
+          MODE: ${{ inputs.mode }}
+          ACCEL: ${{ inputs.accelerator }}
+        run: scripts/kaggle/ci.sh "$DATASET" "$MODE" "$ACCEL" bundle kaggle-out
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: eval-${{ inputs.dataset }}
+          path: |
+            kaggle-out/**/*.json
+            kaggle-out/**/*.log
+            kaggle-out/**/*.txt
+            !kaggle-out/**/dataset-metadata.json
+          if-no-files-found: warn
