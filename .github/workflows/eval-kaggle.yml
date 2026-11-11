@@ -45,10 +45,8 @@ jobs:
     env:
       CMAKE_CUDA_ARCHITECTURES: '75'   # ^ T4; Kaggle retired P100 (kaggle CLI 2.2.5 help)
       CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: 'TRUE'
-      # ^ numkong 7.7.1 (usearch dep) probes AMX with -mamx-tile/-mamx-int8 only, which
-      #   GCC 11 passes, but its sapphireamx headers need target("avx512fp16") (GCC 12+):
-      #   "attribute 'avx512fp16' argument 'target' is unknown" (run 43019698386).
-      #   Its build.rs honors this override; only the AMX-tile kernels are left out.
+      # ^ numkong 7.7.1 (usearch dep) enables its sapphireamx kernels on GCC 11, but they
+      #   need target("avx512fp16") (GCC 12+). build.rs override; run 43019698386 failed on it.
       NK_TARGET_SAPPHIREAMX: '0'
     steps:
       - name: System packages
