@@ -82,7 +82,6 @@ def main() -> int:
         if d is None:
             sys.exit(f"[irk] model {meta[f'{kind}_file']} not attached")
         models[kind] = d / meta[f"{kind}_file"]
-    emb = models["embedding"]
     collection = f"eval-{DATASET}"
     index = one_dir("INDEX_KEY", "index", lambda d: (d / f"{collection}.sqlite").is_file())
 
@@ -108,12 +107,12 @@ def main() -> int:
     env_txt = "\n".join(sh(c) for c in (
         "cat /etc/os-release", "nvidia-smi", f"ldd {ir}", f"{ir} --version", f"ls -laR {INPUT}"))
     (WORKING / "env.txt").write_text(env_txt)
-    if shutil.which("ldd") and "=> not found" in sh(f"ldd {ir}"):
+    if "=> not found" in env_txt:
         print(env_txt)
         sys.exit("[irk] ir has unresolved shared libraries (see env.txt)")
 
-    log(f"hashing {emb.name}")
-    key = meta["index_key_src"] + f"dataset={DATASET}\nembedding_sha256={sha256(emb)}\n"
+    log(f"hashing {models['embedding'].name}")
+    key = meta["index_key_src"] + f"dataset={DATASET}\nembedding_sha256={sha256(models['embedding'])}\n"
     args = ["bash", str(repo / "scripts/bench.sh"), DATASET, "--mode", MODE,
             "--ir-bin", str(ir), "--git7", git7, "--data-dir", str(data)]
     out_index = WORKING / "index"
@@ -136,12 +135,10 @@ def main() -> int:
            if k not in ("XDG_CONFIG_HOME", "IR_CONFIG_DIR", "IR_CONFIG_FILE", "IR_MODEL_DIRS")}
     env.update({
         "HOME": str(ROOT / "home"),  # ^ no ambient ~/.config/ir to copy in
-        "IR_EMBEDDING_MODEL": str(emb),
-        "IR_RERANKER_MODEL": str(models["reranker"]),
-        "IR_EXPANDER_MODEL": str(models["expander"]),
         "HF_HUB_OFFLINE": "1",
-        "IR_BENCH_GUARD": "0",
+        "IR_BENCH_GUARD": "0",  # ^ only matters for a local dry run on macOS
     })
+    env.update({f"IR_{kind.upper()}_MODEL": str(path) for kind, path in models.items()})
     log("running: " + " ".join(args))
     with open(WORKING / "bench.log", "w", buffering=1) as bench_log:
         p = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)

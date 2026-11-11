@@ -10,7 +10,9 @@ on:
       dataset:
         description: Dataset
         type: choice
-        options: [scifact, nfcorpus, fiqa, miracl-ko, miracl-zh]
+        # ^ No miracl-ko/zh yet: they need a Linux lindera preprocessor in the kernel
+        #   (research/kaggle-eval.md, Not yet).
+        options: [scifact, nfcorpus, fiqa]
         default: scifact
       mode:
         description: bench.sh --mode

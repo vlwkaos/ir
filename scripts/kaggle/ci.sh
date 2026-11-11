@@ -31,7 +31,8 @@ done
 [[ -n "${KAGGLE_USERNAME:-}" ]] || { echo "KAGGLE_USERNAME is not set" >&2; exit 2; }
 [[ -n "${KAGGLE_API_TOKEN:-}${KAGGLE_KEY:-}" ]] || { echo "set KAGGLE_API_TOKEN or KAGGLE_KEY" >&2; exit 2; }
 U="$KAGGLE_USERNAME"
-GIT7="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["git7"])' "$BUNDLE/bundle.json")"
+git7_of() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["git7"])' "$1"; }
+GIT7="$(git7_of "$BUNDLE/bundle.json")"
 WORK="$(mktemp -d "${RUNNER_TEMP:-$REPO_ROOT/.ks}/irk.XXXXXX")"
 
 _log() { echo "[$(date +%H:%M:%S)] $*"; }
@@ -69,8 +70,6 @@ ensure_corpus() {
     local src
     case "$DATASET" in
         fiqa|nfcorpus|scifact|arguana) "$REPO_ROOT/scripts/download-beir.sh" "$DATASET" ;;
-        miracl-ko) "$REPO_ROOT/scripts/download-miracl-ko.sh" ;;
-        miracl-zh) "$REPO_ROOT/scripts/download-miracl-zh.sh" ;;
         *) echo "no download for dataset $DATASET" >&2; return 1 ;;
     esac
     src="$REPO_ROOT/test-data/$DATASET"
@@ -104,7 +103,7 @@ ensure_bundle() {
     if exists ir-bench-bin; then
         kaggle datasets download "$U/ir-bench-bin" -f bundle.json -p "$WORK/have" -q -o >/dev/null 2>&1 || true
         [[ -f "$WORK/have/bundle.json" ]] && \
-            have="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["git7"])' "$WORK/have/bundle.json")"
+            have="$(git7_of "$WORK/have/bundle.json")"
     fi
     if [[ "$have" == "$GIT7" ]]; then
         _log "ir-bench-bin already at $GIT7"
@@ -115,7 +114,10 @@ ensure_bundle() {
 }
 
 run_kernel() {
-    local slug="ir-bench-$DATASET" kdir="$WORK/kernel" sources
+    local slug="ir-bench-$DATASET" kdir="$WORK/kernel" sources gpu=true
+    local push=(kaggle kernels push -p "$kdir")
+    # ^ bm25 loads no model; do not spend GPU quota or wait for a GPU slot.
+    if [[ "$MODE" == bm25 ]]; then gpu=false; else push+=(--accelerator "$ACCEL"); fi
     sources="\"$U/ir-bench-bin\", \"$U/ir-models\", \"$U/ir-corpus-$DATASET\""
     exists "ir-index-$DATASET" && sources+=", \"$U/ir-index-$DATASET\""
     mkdir -p "$kdir"
@@ -130,7 +132,7 @@ run_kernel() {
   "language": "python",
   "kernel_type": "script",
   "is_private": true,
-  "enable_gpu": true,
+  "enable_gpu": $gpu,
   "enable_internet": false,
   "dataset_sources": [$sources],
   "competition_sources": [],
@@ -138,22 +140,22 @@ run_kernel() {
   "model_sources": []
 }
 EOF
-    _log "pushing $U/$slug ($ACCEL) with sources: $sources"
-    kaggle kernels push -p "$kdir" --accelerator "$ACCEL"
+    _log "pushing $U/$slug (gpu=$gpu) with sources: $sources"
+    "${push[@]}"
 
     local status=""
     for _ in $(seq 1 "$WAIT_MIN"); do
         sleep 60
-        status="$(kaggle kernels status "$U/$slug" 2>&1 || true)"
+        status="$(kaggle kernels status "$U/$slug" 2>&1 | tr '[:upper:]' '[:lower:]' || true)"
         echo "$status"
-        case "${status,,}" in
+        case "$status" in
             *complete*|*error*|*cancel*) break ;;
         esac
     done
 
     mkdir -p "$OUT"
     kaggle kernels output "$U/$slug" -p "$OUT" -o -q || true
-    [[ "${status,,}" == *complete* ]] || { echo "kernel did not complete: $status" >&2; return 1; }
+    [[ "$status" == *complete* ]] || { echo "kernel did not complete: $status" >&2; return 1; }
     # ^ Output layout is not documented; search instead of assuming subdirs survive.
     [[ -n "$(find "$OUT" -name "$GIT7.json" -print -quit)" ]] \
         || { echo "kernel output has no $GIT7.json" >&2; return 1; }

@@ -38,7 +38,7 @@ flowchart LR
 | What | Rule |
 |---|---|
 | Index reuse | `run.py` compares `INDEX_KEY`: `bundle.json` `index_key_src` (embedding file name, sha256 of `chunker.rs`, `embed.rs`, `embedding.rs`, `ann.rs`, `schema.rs`) + dataset + sha256 of the embedding GGUF. Any change rebuilds. |
-| bm25 runs | Never save an index (bm25 prepare skips embedding) |
+| bm25 runs | Never save an index (bm25 prepare skips embedding); the kernel runs without a GPU |
 | Collection name | `eval-<ds>` with `--index-in`/`--index-out`, `eval-<ds>-<git7>` otherwise |
 | Read-only inputs | Index files are copied to `/tmp/irk` (search opens the DB read-write); the corpus is symlinked |
 | No download | Kernel runs with `enable_internet: false`; models come from `ir-models` by path |
@@ -53,6 +53,11 @@ IRK_DATASET=scifact IRK_INPUT=<input> IRK_WORKING=<work> IRK_ROOT=<short-dir> py
 ```
 
 Move `<work>/index` under `<input>` and run again: the log shows `index: key match` and no `preparing collection`.
+
+## Not yet
+
+- MIRACL ko/zh: the kernel needs a Linux lindera preprocessor (`config.yml` aliases under
+  `HOME/.config/ir`), and its version must go into `INDEX_KEY`.
 
 ## Limits (sources checked 2026-11)
 

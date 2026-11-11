@@ -368,7 +368,7 @@ save_index() {
     [[ -f "$src.sqlite" ]] || { echo "--index-out: no index at $src.sqlite" >&2; return 1; }
     "$ir_bin" daemon stop >/dev/null 2>&1 || true
     mkdir -p "$INDEX_OUT"
-    rm -f "$out.sqlite"
+    rm -f "$out.sqlite" "$out.usearch"
     python3 - "$src.sqlite" "$out.sqlite" <<'PY'
 import sqlite3, sys
 src = sqlite3.connect(sys.argv[1])
@@ -377,11 +377,7 @@ src.backup(dst)
 dst.close()
 src.close()
 PY
-    if [[ -f "$src.usearch" ]]; then
-        cp "$src.usearch" "$out.usearch"
-    else
-        rm -f "$out.usearch"
-    fi
+    [[ -f "$src.usearch" ]] && cp "$src.usearch" "$out.usearch"
     _log "index: saved $collection to $INDEX_OUT"
 }
 
@@ -389,8 +385,8 @@ run_version() {
     local label="$1"
     local git7="$2"
     local ir_bin="$3"
-    local collection="eval-${DATASET_LABEL}-${git7}"
-    [[ -n "$INDEX_IN$INDEX_OUT" ]] && collection="eval-${DATASET_LABEL}"
+    local collection="eval-${DATASET_LABEL}"
+    [[ -z "$INDEX_IN$INDEX_OUT" ]] && collection+="-${git7}"
     local result_file="$LOG_DIR/${git7}.json"
     local result_base="${result_file%.json}"
     local prep_marker
