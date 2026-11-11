@@ -1,3 +1,10 @@
+## [Unreleased]
+
+### Dev / Benchmark Tooling
+
+- **Retrieval evaluations can run on a free Kaggle GPU** (`.github/workflows/eval-kaggle.yml`, `scripts/kaggle/`, flow in `research/kaggle-eval.md`). The workflow builds `ir` with CUDA, runs `scripts/bench.sh` in a Kaggle notebook against corpora, models and built indexes stored as Kaggle datasets, and returns the result JSON as a run artifact. It reports quality only; Kaggle speed numbers are not comparable with a local GPU.
+- **`scripts/bench.sh` accepts prebuilt inputs**: `--ir-bin PATH --git7 SHA` (use a built binary, skip cargo), `--data-dir DIR` (use a local corpus, skip the download), `--index-in DIR` (copy a built collection index, skip indexing and embedding) and `--index-out DIR` (save the built index). Without these flags `bench.sh` behaves as before.
+
 ## [0.19.2] - 2026-11-10
 
 ### Security
