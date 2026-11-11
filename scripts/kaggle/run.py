@@ -2,10 +2,11 @@
 """Kaggle kernel driver: run scripts/bench.sh on attached read-only datasets.
 
 See research/kaggle-eval.md. Stdlib only. The workflow prepends an
-os.environ.update({...}) line with IRK_DATASET and IRK_MODE.
+os.environ.update({...}) line with IRK_DATASET, IRK_MODE and IRK_GIT7 (the git7 the
+bundle must have: a dataset version that is still processing mounts the old one).
 
 Inputs, found by marker files anywhere under IRK_INPUT (default /kaggle/input):
-  bundle   bundle.json + ir + bench scripts      (scripts/kaggle/bundle.sh)
+  bundle   bundle.json + ir + bench scripts + libgomp.so.* (scripts/kaggle/bundle.sh)
   corpus   DATASET file naming the dataset, corpus.jsonl, queries.jsonl, test.tsv
   models   <embedding_file>, <reranker_file>, <expander_file> from bundle.json
            (expander stays off by the retrieval profile, but bench.sh names it and
@@ -28,6 +29,7 @@ from typing import Optional
 
 DATASET = os.environ.get("IRK_DATASET", "")
 MODE = os.environ.get("IRK_MODE", "all")
+EXPECT_GIT7 = os.environ.get("IRK_GIT7", "")
 INPUT = Path(os.environ.get("IRK_INPUT", "/kaggle/input"))
 WORKING = Path(os.environ.get("IRK_WORKING", "/kaggle/working"))
 # ^ Short root: the daemon socket path lives under it (sun_path limit ~104 bytes).
@@ -73,6 +75,8 @@ def main() -> int:
         sys.exit(f"[irk] no bundle (bundle.json) under {INPUT}")
     meta = json.loads((bundle / "bundle.json").read_text())
     git7 = meta["git7"]
+    if EXPECT_GIT7 and git7 != EXPECT_GIT7:
+        sys.exit(f"[irk] stale bundle: attached {git7}, expected {EXPECT_GIT7}")
     corpus = one_dir("DATASET", "corpus", lambda d: (d / "DATASET").read_text().strip() == DATASET)
     if corpus is None:
         sys.exit(f"[irk] no corpus dataset with DATASET={DATASET} under {INPUT}")
@@ -96,6 +100,27 @@ def main() -> int:
     ir = ROOT / "ir"
     shutil.copy(bundle / "ir", ir)
     ir.chmod(0o755)
+    # ^ The image may lack libgomp (llama-openmp links it dynamically): bundle.sh ships the
+    #   build host's copy. Flat copy, since Kaggle datasets skip directories on upload.
+    lib = ROOT / "lib"
+    lib.mkdir()
+    for so in bundle.glob("lib*.so*"):
+        shutil.copy(so, lib / so.name)
+    # ^ Run 43120474122: kernels pushed through the API got no GPU on this account (script or
+    #   notebook, internet on or off, machine_shape set or not). ir lists libcuda.so.1 as NEEDED
+    #   and cannot start without it, and ggml-cuda takes the address of cu* driver functions, so
+    #   the loader wants each one (run 43121732580: undefined symbol cuMemCreate). bm25 never
+    #   calls them: build a stub that defines every cu* symbol ir imports as "CUDA_ERROR_NO_DEVICE".
+    if MODE == "bm25" and subprocess.run("ldconfig -p | grep -q libcuda.so.1", shell=True).returncode != 0:
+        nm = subprocess.run(["nm", "-D", "--undefined-only", str(ir)], capture_output=True, text=True)
+        syms = sorted({f.split("@")[0] for l in nm.stdout.splitlines() for f in l.split()[-1:]
+                       if f.startswith("cu") and f[2:3].isupper()})
+        (lib / "stub.c").write_text("".join(f"int {n}(void) {{ return 100; }}\n" for n in syms))
+        stub = subprocess.run(["gcc", "-shared", "-o", str(lib / "libcuda.so.1"), "-Wl,-soname,libcuda.so.1",
+                               str(lib / "stub.c")], capture_output=True, text=True)
+        log(f"no libcuda.so.1 in this session; bm25 runs with a stub of {len(syms)} cu* symbols"
+            if stub.returncode == 0 and syms else f"stub failed: nm={nm.stderr.strip()} gcc={stub.stderr.strip()}")
+    ld_path = ":".join(p for p in (str(lib), os.environ.get("LD_LIBRARY_PATH", "")) if p)
     data = ROOT / "data" / DATASET
     (data / "qrels").mkdir(parents=True)
     for src, dst in (("corpus.jsonl", "corpus.jsonl"), ("queries.jsonl", "queries.jsonl"),
@@ -104,11 +129,18 @@ def main() -> int:
             sys.exit(f"[irk] corpus dataset lacks {src}")
         (data / dst).symlink_to(corpus / src)
 
+    os.environ["LD_LIBRARY_PATH"] = ld_path
     env_txt = "\n".join(sh(c) for c in (
-        "cat /etc/os-release", "nvidia-smi", f"ldd {ir}", f"{ir} --version", f"ls -laR {INPUT}"))
+        "cat /etc/os-release", "ldd --version | head -1", "which gcc cc", "nvidia-smi", f"ldd {ir}",
+        # ^ Run 43117637669: the session had no GPU. Show what the container does mount.
+        "ls -la /dev | grep -i nvidia", "cat /proc/driver/nvidia/version", "ls /usr/local/nvidia/lib64",
+        "env | grep -i -E 'nvidia|cuda'", "ldconfig -p | grep -i -E 'libcuda|nvidia'", "nproc; free -g; df -h /kaggle/working /tmp",
+        f"{ir} --version", f"ls -laR {INPUT}"))
     (WORKING / "env.txt").write_text(env_txt)
     if "=> not found" in env_txt:
         print(env_txt)
+        if "libcuda.so.1 => not found" in env_txt:
+            print("[irk] no NVIDIA driver in this session: the kernel was not given a GPU")
         sys.exit("[irk] ir has unresolved shared libraries (see env.txt)")
 
     log(f"hashing {models['embedding'].name}")
@@ -163,4 +195,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    except SystemExit as e:
+        code = e.code
+    # ^ Raise instead of sys.exit: a notebook cell that exits may still end the run as complete.
+    if code not in (0, None):
+        raise RuntimeError(f"[irk] failed: {code}")

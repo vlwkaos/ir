@@ -7,7 +7,7 @@ numbers from Kaggle are not comparable with a local GPU: preship floors do not a
 ```mermaid
 flowchart LR
   subgraph GH["GitHub Actions"]
-    B["build: nvidia/cuda 12.6 container<br/>llama-cuda, sm_75"] --> BU["bundle.sh<br/>ir + bench scripts + bundle.json"]
+    B["build.sh: nvidia/cuda 12.6 container<br/>llama-cuda, sm_75"] --> BU["bundle.sh<br/>ir + bench scripts + bundle.json"]
     BU --> CI["ci.sh"]
   end
   subgraph KD["Kaggle datasets (private, read-only in the kernel)"]
@@ -43,7 +43,21 @@ flowchart LR
 | Read-only inputs | Index files are copied to `/tmp/irk` (search opens the DB read-write); the corpus is symlinked |
 | No download | Kernel runs with `enable_internet: false`; models come from `ir-models` by path |
 | CUDA build env | `NK_TARGET_SAPPHIREAMX=0` (numkong AMX kernels need GCC 12+, run 43019698386); `CMAKE_DISABLE_FIND_PACKAGE_NCCL=TRUE` (ggml finds the image's NCCL but llama-cpp-sys-2 does not link it, run 43028557699). A CMAKE_* change does not rerun llama-cpp-sys-2's build.rs: change the rust-cache key |
+| CLI exit codes | `kaggle` 2.2.5 exits 0 after "Dataset creation error", "Dataset version creation error", "Kernel push error" and "not valid dataset sources" (`*_cli` in `kaggle_api_extended.py`). `ci.sh` `kcheck` fails on that text |
+| Dataset versions | `ci.sh` waits for `status=ready` and `current_version_number` above the old one (`datasets status --format json`); a kernel could mount the old files otherwise. `run.py` also checks `IRK_GIT7` against `bundle.json` |
+| Kernel status | `ci.sh` pins the pushed version (`kernels status <owner>/<slug>/<N>`), else a rerun can read the previous run's `complete` |
+| No GPU from the API | Kernels pushed by `kaggle kernels push` got a CPU session (4 vCPU, no `/dev/nvidia*`, no driver libraries), although the server stored `enable_gpu` true and `machine_shape` NvidiaTeslaT4 and the weekly quota was unused. Same for script and notebook, internet on or off, `machine_shape` set or not (probe run 43120474122). Cause not found; check the account (phone verification) and that a GPU session works in the Kaggle web UI. `ci.sh` prints `kaggle quota` and the stored settings, `env.txt` lists the mounted GPU files |
+| bm25 without a GPU | `ir` has `libcuda.so.1` in NEEDED and imports 11 `cu*` driver functions (ggml-cuda takes their address). `run.py` builds a stub that defines them when the session has no libcuda, so bm25 runs on a CPU kernel (run 43122638298). Other modes need a real GPU |
+| Kaggle image | Ubuntu 24.04, glibc 2.39, Python 3.13, `gcc` present; datasets mount at `/kaggle/input/datasets/<owner>/<slug>` (run 43115533477). The build container (Ubuntu 22.04, glibc 2.34 symbols) runs there |
+| libgomp | `bundle.sh` ships the build host's `libgomp.so.*` flat in the bundle (Kaggle datasets skip directories); `run.py` puts it on `LD_LIBRARY_PATH` |
 | Auth | `kaggle` 2.2.5 tries `KAGGLE_API_TOKEN` first, then `KAGGLE_USERNAME` + `KAGGLE_KEY` (`kaggle_api_extended.py` `authenticate`) |
+
+## Trying a change without the owner
+
+The build job runs `scripts/kaggle/build.sh` and the Kaggle job runs `ci.sh` and `run.py`.
+The `gh` token in wsx has no `workflow` scope: it cannot push `.github/workflows/`. A branch
+off `main` that changes `scripts/` and `research/` only can be pushed, and runs with
+`gh workflow run eval-kaggle.yml --ref <branch> -f dataset=scifact`. A workflow edit runs only after it lands on `main`.
 
 ## Local dry run (no Kaggle)
 
