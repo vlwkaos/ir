@@ -135,8 +135,33 @@ ensure_bundle() {
     fi
 }
 
+# live_session <slug> <header>: 0 when the latest session of <slug> still runs with this exact
+# run.py header (dataset, mode, git7); fails when it runs anything else.
+# ^ A CPU-only session can outlast the GitHub job (350 min) but not Kaggle's 12 h: dispatching
+#   the same commit, dataset and mode again attaches to it instead of pushing a new version.
+live_session() {
+    local status
+    status="$(kaggle kernels status "$U/$1" 2>&1 | tr '[:upper:]' '[:lower:]' || true)"
+    case "$status" in *running*|*queued*) ;; *) return 1 ;; esac
+    mkdir -p "$WORK/live"
+    kaggle kernels pull "$U/$1" -p "$WORK/live" >/dev/null 2>&1 || true
+    if python3 - "$WORK/live" "$2" <<'PY2'
+import json, pathlib, sys
+for f in pathlib.Path(sys.argv[1]).glob("*.ipynb"):
+    src = json.load(open(f))["cells"][0]["source"]
+    src = "".join(src) if isinstance(src, list) else src
+    sys.exit(0 if src.split("\n", 1)[0] == sys.argv[2] else 1)
+sys.exit(1)
+PY2
+    then
+        return 0
+    fi
+    echo "$U/$1 is still running another mode or build ($status). Wait for it, or cancel it in the Kaggle UI." >&2
+    exit 1
+}
+
 run_kernel() {
-    local slug="ir-bench-$DATASET" kdir="$WORK/kernel" sources ref gpu=true
+    local slug="ir-bench-$DATASET" kdir="$WORK/kernel" sources ref gpu=true header
     local push=(kaggle kernels push -p "$kdir")
     # ^ bm25 loads no model: no GPU quota, no wait for a GPU slot (run.py stubs libcuda.so.1
     #   when the session has none).
@@ -144,9 +169,9 @@ run_kernel() {
     sources="\"$U/ir-bench-bin\", \"$U/ir-models\", \"$U/ir-corpus-$DATASET\""
     exists "ir-index-$DATASET" && sources+=", \"$U/ir-index-$DATASET\""
     mkdir -p "$kdir"
-    printf 'import os; os.environ.update({"IRK_DATASET": "%s", "IRK_MODE": "%s", "IRK_GIT7": "%s"})\n' \
-        "$DATASET" "$MODE" "$GIT7" \
-        > "$kdir/run.py"
+    header="$(printf 'import os; os.environ.update({"IRK_DATASET": "%s", "IRK_MODE": "%s", "IRK_GIT7": "%s"})' \
+        "$DATASET" "$MODE" "$GIT7")"
+    printf '%s\n' "$header" > "$kdir/run.py"
     cat "$REPO_ROOT/scripts/kaggle/run.py" >> "$kdir/run.py"
     # ^ A "script" kernel got a CPU session although the server stored enable_gpu=true and
     #   machine_shape=NvidiaTeslaT4 (runs 43115533477, 43117637669, 43118549022; 30 h quota
@@ -177,21 +202,25 @@ PY
   "model_sources": []
 }
 EOF
-    _log "pushing $U/$slug (gpu=$gpu) with sources: $sources"
-    # ^ Run 43115533477: the session had no GPU (no nvidia-smi, libcuda.so.1 missing). Print the
-    #   weekly GPU quota and the settings the server stored, so a repeat shows the cause.
-    kaggle quota 2>&1 || true
-    kcheck "${push[@]}"
-    mkdir -p "$WORK/pulled"
-    kaggle kernels pull "$U/$slug" -p "$WORK/pulled" -m >/dev/null 2>&1 || true
-    grep -E '"(enable_gpu|machine_shape|enable_internet|is_private)"' "$WORK/pulled/kernel-metadata.json" 2>/dev/null \
-        | sed 's/^ */server: /' || true
-    # ^ Status of the unversioned slug is the latest *finished* session until the new one
-    #   starts, so a rerun could read the previous run's "complete". Pin the pushed version.
     ref="$U/$slug"
-    local ver
-    ver="$(sed -n 's/.*Kernel version \([0-9][0-9]*\) successfully.*/\1/p' <<<"$KOUT" | head -1)"
-    if [[ -n "$ver" ]]; then ref="$ref/$ver"; else _log "no version in push output; polling the latest session"; fi
+    if live_session "$slug" "$header"; then
+        _log "attaching to the running session of $U/$slug (same dataset, mode and git7)"
+    else
+        _log "pushing $U/$slug (gpu=$gpu) with sources: $sources"
+        # ^ Run 43115533477: the session had no GPU (no nvidia-smi, libcuda.so.1 missing). Print the
+        #   weekly GPU quota and the settings the server stored, so a repeat shows the cause.
+        kaggle quota 2>&1 || true
+        kcheck "${push[@]}"
+        mkdir -p "$WORK/pulled"
+        kaggle kernels pull "$U/$slug" -p "$WORK/pulled" -m >/dev/null 2>&1 || true
+        grep -E '"(enable_gpu|machine_shape|enable_internet|is_private)"' "$WORK/pulled/kernel-metadata.json" 2>/dev/null \
+            | sed 's/^ */server: /' || true
+        # ^ Status of the unversioned slug is the latest *finished* session until the new one
+        #   starts, so a rerun could read the previous run's "complete". Pin the pushed version.
+        local ver
+        ver="$(sed -n 's/.*Kernel version \([0-9][0-9]*\) successfully.*/\1/p' <<<"$KOUT" | head -1)"
+        if [[ -n "$ver" ]]; then ref="$ref/$ver"; else _log "no version in push output; polling the latest session"; fi
+    fi
 
     local status=""
     for _ in $(seq 1 "$WAIT_MIN"); do

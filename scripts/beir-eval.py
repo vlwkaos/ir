@@ -136,22 +136,29 @@ def collection_exists(ir_bin: str, name: str) -> bool:
         return False
 
 
+# ^ A tier-2 query on a CPU-only host (Kaggle without a GPU) can take minutes.
+QUERY_TIMEOUT_S = float(os.environ.get("IR_BENCH_QUERY_TIMEOUT", "60"))
+
+
 def search_one(ir_bin: str, collection: str, mode: str, query: str, limit: int,
                env: dict | None = None) -> tuple:
-    """Returns (ranked_doc_ids, elapsed_ms, signals). ranked_doc_ids from path field."""
+    """Returns (ranked_doc_ids, elapsed_ms, signals). ranked_doc_ids from path field.
+    A failed query scores as an empty ranking; signals then has "failed": True."""
     start = time.monotonic()
     try:
         result = run_ir(ir_bin, "search", "-c", collection,
                         "--mode", mode, "-n", str(limit),
-                        "--json", "-q", query, timeout=60, env=env)
+                        "--json", "-q", query, timeout=QUERY_TIMEOUT_S, env=env)
         elapsed_ms = (time.monotonic() - start) * 1000
         hits = json.loads(result.stdout) if result.stdout.strip() else []
         doc_ids = [h["path"].removesuffix(".txt") for h in hits]
         signals = _parse_signals(result.stderr)
         return doc_ids, elapsed_ms, signals
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
         elapsed_ms = (time.monotonic() - start) * 1000
-        return [], elapsed_ms, {}
+        print(f"\n  query failed ({type(e).__name__}, {elapsed_ms / 1000:.0f}s): {query[:60]!r}",
+              file=sys.stderr, flush=True)
+        return [], elapsed_ms, {"failed": True}
 
 
 def _search_one_signal_mode(
@@ -273,6 +280,8 @@ def _load_progress(path: Path) -> dict:
 def _aggregate_mode(mode: str, queries: list, qrels: dict, at_ks: list, records: dict) -> tuple[dict | None, int]:
     ranked_all = []
     latencies = []
+    total_ms = 0.0
+    failed = 0
 
     for idx, q in enumerate(queries):
         relevant = qrels.get(q["id"], {})
@@ -283,6 +292,8 @@ def _aggregate_mode(mode: str, queries: list, qrels: dict, at_ks: list, records:
             continue
         ranked = rec["ranked"]
         elapsed_ms = float(rec["elapsed_ms"])
+        total_ms += elapsed_ms
+        failed += bool(rec.get("failed"))
         ranked_all.append((q["id"], ranked, relevant))
         if idx >= WARMUP:
             latencies.append(elapsed_ms)
@@ -302,12 +313,13 @@ def _aggregate_mode(mode: str, queries: list, qrels: dict, at_ks: list, records:
         recall_1000 = sum(recall_at_k(r, rel, 1000) for _, r, rel in ranked_all) / n
         metrics["recall_1000"] = round(recall_1000, 4)
 
-    timing = {}
+    timing = {"total_s": round(total_ms / 1000, 1)}
     if latencies:
         timing["median_ms"] = round(percentile(latencies, 50), 1)
         timing["p95_ms"] = round(percentile(latencies, 95), 1)
 
-    return {"mode": mode, "metrics": metrics, "timing": timing}, n
+    # ^ A failed query counts as an empty ranking and lowers nDCG: report how many.
+    return {"mode": mode, "metrics": metrics, "timing": timing, "failed_queries": failed}, n
 
 
 def cmd_run(args):
@@ -367,13 +379,15 @@ def cmd_run(args):
                     if not relevant:
                         continue
 
-                    ranked, elapsed_ms, _ = _search_one_signal_mode(
+                    ranked, elapsed_ms, sig = _search_one_signal_mode(
                         ir_bin, collection, mode, q["text"], effective_k, os.environ.copy())
                     rec = {
                         "query_id": q["id"],
                         "ranked": ranked,
                         "elapsed_ms": round(elapsed_ms, 1),
                     }
+                    if sig.get("failed"):
+                        rec["failed"] = True
                     mode_records[q["id"]] = rec
                     if record_file is not None:
                         record_file.write(json.dumps(rec) + "\n")
@@ -402,8 +416,11 @@ def cmd_run(args):
               f"R@{ndcg_k}={metrics.get(f'recall_{ndcg_k}', '?'):.4f}", end="")
         if mode == "bm25":
             print(f"  R@1000={metrics.get('recall_1000', '?'):.4f}", end="")
-        if timing:
+        if "median_ms" in timing:
             print(f"  med={timing['median_ms']}ms", end="")
+        print(f"  total={timing['total_s']}s", end="")
+        if result["failed_queries"]:
+            print(f"  FAILED={result['failed_queries']}", end="")
         print()
 
     output = {

@@ -39,6 +39,10 @@ build() {
     #   GPU. build.rs passes CMAKE_* env to cmake but does not rerun when it changes: change
     #   the rust-cache key if a cached build predates a CMAKE_* edit.
     export CMAKE_DISABLE_FIND_PACKAGE_NCCL=TRUE
+    # ^ Without a target-cpu, llama-cpp-sys-2 builds ggml-cpu for SSE2 only (GGML_NATIVE OFF; AVX
+    #   flags come from CARGO_CFG_TARGET_FEATURE). Kaggle sessions without a GPU run every model
+    #   on that backend: build for AVX2/FMA/F16C. run.py checks the CPU flags before it starts.
+    export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=x86-64-v3"
     cd "$REPO_ROOT"
     cargo build --release --bin ir --no-default-features --features llama-cuda,llama-openmp
     # ^ A tarball checkout (no git in the image when checkout ran) has no .git: name the build

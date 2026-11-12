@@ -373,19 +373,25 @@ struct Tier2 {
 /// Longest a client waits for the daemon's reply. A tier-2 query on CPU, queued
 /// behind another client's, can take tens of seconds; a daemon that is silent
 /// for this long is hung, and the caller falls back to the results it has.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Research: `IR_DAEMON_REPLY_TIMEOUT` (seconds) raises it for benchmarks on CPU-only
+/// hosts, where a fallback would silently score as a tier-1 result.
+fn reply_timeout() -> Duration {
+    let secs = std::env::var("IR_DAEMON_REPLY_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(120);
+    Duration::from_secs(secs)
+}
 
 /// Send a search request to the daemon and return parsed results + pipeline log.
 pub fn query(req: &DaemonRequest) -> Result<QueryResponse> {
     let sock = config::daemon_socket_path();
     let stream =
         UnixStream::connect(&sock).map_err(|e| Error::Other(format!("daemon connect: {e}")))?;
-    stream
-        .set_read_timeout(Some(REPLY_TIMEOUT))
-        .map_err(Error::Io)?;
-    stream
-        .set_write_timeout(Some(REPLY_TIMEOUT))
-        .map_err(Error::Io)?;
+    let timeout = reply_timeout();
+    stream.set_read_timeout(Some(timeout)).map_err(Error::Io)?;
+    stream.set_write_timeout(Some(timeout)).map_err(Error::Io)?;
 
     let mut writer = stream.try_clone().map_err(Error::Io)?;
     let reader = BufReader::new(stream);
@@ -402,7 +408,7 @@ pub fn query(req: &DaemonRequest) -> Result<QueryResponse> {
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Error::Other(format!(
                 "daemon did not answer within {}s",
-                REPLY_TIMEOUT.as_secs()
+                timeout.as_secs()
             )),
             _ => Error::Io(e),
         })?;

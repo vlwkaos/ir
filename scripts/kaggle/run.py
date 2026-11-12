@@ -107,19 +107,32 @@ def main() -> int:
     for so in bundle.glob("lib*.so*"):
         shutil.copy(so, lib / so.name)
     # ^ Run 43120474122: kernels pushed through the API got no GPU on this account (script or
-    #   notebook, internet on or off, machine_shape set or not). ir lists libcuda.so.1 as NEEDED
-    #   and cannot start without it, and ggml-cuda takes the address of cu* driver functions, so
-    #   the loader wants each one (run 43121732580: undefined symbol cuMemCreate). bm25 never
-    #   calls them: build a stub that defines every cu* symbol ir imports as "CUDA_ERROR_NO_DEVICE".
-    if MODE == "bm25" and subprocess.run("ldconfig -p | grep -q libcuda.so.1", shell=True).returncode != 0:
-        nm = subprocess.run(["nm", "-D", "--undefined-only", str(ir)], capture_output=True, text=True)
-        syms = sorted({f.split("@")[0] for l in nm.stdout.splitlines() for f in l.split()[-1:]
-                       if f.startswith("cu") and f[2:3].isupper()})
-        (lib / "stub.c").write_text("".join(f"int {n}(void) {{ return 100; }}\n" for n in syms))
-        stub = subprocess.run(["gcc", "-shared", "-o", str(lib / "libcuda.so.1"), "-Wl,-soname,libcuda.so.1",
-                               str(lib / "stub.c")], capture_output=True, text=True)
-        log(f"no libcuda.so.1 in this session; bm25 runs with a stub of {len(syms)} cu* symbols"
-            if stub.returncode == 0 and syms else f"stub failed: nm={nm.stderr.strip()} gcc={stub.stderr.strip()}")
+    #   notebook, internet on or off, machine_shape set or not). Every mode then runs the same
+    #   CUDA build on the CPU backend. ir lists libcuda.so.1 as NEEDED and cannot start without
+    #   it, and ggml-cuda takes the address of cu* driver functions, so the loader wants each one
+    #   (run 43121732580: undefined symbol cuMemCreate). Build a stub that defines every cu*
+    #   symbol ir imports as "CUDA_ERROR_NO_DEVICE"; ggml-cuda then reports no device.
+    gpu = any(Path("/dev").glob("nvidia[0-9]*")) or \
+        subprocess.run("nvidia-smi -L", shell=True, capture_output=True).returncode == 0
+    cpu = not gpu and sys.platform.startswith("linux")  # ^ not on a macOS dry run
+    if gpu:
+        log("backend: GPU")
+    elif cpu:
+        # ^ build.sh compiles for x86-64-v3; without these flags ir dies on SIGILL.
+        flags = set(next((l.split(":", 1)[1].split() for l in open("/proc/cpuinfo") if l.startswith("flags")), []))
+        missing = {"avx2", "fma", "f16c", "bmi2"} - flags
+        if missing:
+            sys.exit(f"[irk] no GPU and the CPU lacks {sorted(missing)} (bundle is built for x86-64-v3)")
+        log(f"backend: CPU, no GPU in this session ({os.cpu_count()} CPUs)")
+        if subprocess.run("ldconfig -p | grep -q libcuda.so.1", shell=True).returncode != 0:
+            nm = subprocess.run(["nm", "-D", "--undefined-only", str(ir)], capture_output=True, text=True)
+            syms = sorted({f.split("@")[0] for l in nm.stdout.splitlines() for f in l.split()[-1:]
+                           if f.startswith("cu") and f[2:3].isupper()})
+            (lib / "stub.c").write_text("".join(f"int {n}(void) {{ return 100; }}\n" for n in syms))
+            stub = subprocess.run(["gcc", "-shared", "-o", str(lib / "libcuda.so.1"), "-Wl,-soname,libcuda.so.1",
+                                   str(lib / "stub.c")], capture_output=True, text=True)
+            log(f"no libcuda.so.1 in this session; using a stub of {len(syms)} cu* symbols"
+                if stub.returncode == 0 and syms else f"stub failed: nm={nm.stderr.strip()} gcc={stub.stderr.strip()}")
     ld_path = ":".join(p for p in (str(lib), os.environ.get("LD_LIBRARY_PATH", "")) if p)
     data = ROOT / "data" / DATASET
     (data / "qrels").mkdir(parents=True)
@@ -135,6 +148,7 @@ def main() -> int:
         # ^ Run 43117637669: the session had no GPU. Show what the container does mount.
         "ls -la /dev | grep -i nvidia", "cat /proc/driver/nvidia/version", "ls /usr/local/nvidia/lib64",
         "env | grep -i -E 'nvidia|cuda'", "ldconfig -p | grep -i -E 'libcuda|nvidia'", "nproc; free -g; df -h /kaggle/working /tmp",
+        "lscpu", f"objdump -d --no-show-raw-insn {ir} | grep -c vfmadd",  # ^ >0: built for x86-64-v3
         f"{ir} --version", f"ls -laR {INPUT}"))
     (WORKING / "env.txt").write_text(env_txt)
     if "=> not found" in env_txt:
@@ -170,6 +184,12 @@ def main() -> int:
         "HF_HUB_OFFLINE": "1",
         "IR_BENCH_GUARD": "0",  # ^ only matters for a local dry run on macOS
     })
+    if cpu:
+        # ^ Pin models to the CPU backend. A tier-2 query on 4 vCPU can take minutes: raise the
+        #   daemon reply limit (120 s, else ir falls back to BM25 without a word under -q) and
+        #   beir-eval.py's 60 s per query (else it scores an empty ranking).
+        env.update({"IR_FORCE_CPU_BACKEND": "1", "IR_GPU_LAYERS": "0",
+                    "IR_DAEMON_REPLY_TIMEOUT": "1800", "IR_BENCH_QUERY_TIMEOUT": "1900"})
     env.update({f"IR_{kind.upper()}_MODEL": str(path) for kind, path in models.items()})
     log("running: " + " ".join(args))
     with open(WORKING / "bench.log", "w", buffering=1) as bench_log:
