@@ -2,6 +2,10 @@
 # Kaggle side of .github/workflows/eval-kaggle.yml. See research/kaggle-eval.md.
 #
 # Usage: scripts/kaggle/ci.sh <dataset> <mode> <accelerator> <bundle-dir> <out-dir>
+#        scripts/kaggle/ci.sh fetch <kernel-slug>[/<version>] <out-dir>
+#
+# fetch only downloads the output of a session (no build, no push), e.g. one that the 12 h
+# limit stopped after the job that started it gave up (workflow input `fetch`).
 #
 # Auth comes from env only, never a file: KAGGLE_USERNAME plus KAGGLE_API_TOKEN
 # (new token) or KAGGLE_KEY (legacy key). Needs the pinned `kaggle` CLI on PATH
@@ -15,11 +19,18 @@
 
 set -euo pipefail
 
-DATASET="${1:?dataset}"
-MODE="${2:?mode}"
-ACCEL="${3:?accelerator}"
-BUNDLE="${4:?bundle dir}"
-OUT="${5:?out dir}"
+if [[ "${1:-}" == fetch ]]; then
+    FETCH="${2:?kernel slug[/version]}"
+    OUT="${3:?out dir}"
+    [[ "$FETCH" =~ ^[a-z0-9][a-z0-9-]*(/[0-9]+)?$ ]] || { echo "bad kernel '$FETCH': want <slug> or <slug>/<version>" >&2; exit 2; }
+else
+    FETCH=""
+    DATASET="${1:?dataset}"
+    MODE="${2:?mode}"
+    ACCEL="${3:?accelerator}"
+    BUNDLE="${4:?bundle dir}"
+    OUT="${5:?out dir}"
+fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WAIT_MIN="${IRK_WAIT_MIN:-320}"
 
@@ -32,7 +43,6 @@ done
 [[ -n "${KAGGLE_API_TOKEN:-}${KAGGLE_KEY:-}" ]] || { echo "set KAGGLE_API_TOKEN or KAGGLE_KEY" >&2; exit 2; }
 U="$KAGGLE_USERNAME"
 git7_of() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["git7"])' "$1"; }
-GIT7="$(git7_of "$BUNDLE/bundle.json")"
 WORK="$(mktemp -d "${RUNNER_TEMP:-$REPO_ROOT/.ks}/irk.XXXXXX")"
 
 _log() { echo "[$(date +%H:%M:%S)] $*"; }
@@ -135,17 +145,24 @@ ensure_bundle() {
     fi
 }
 
-# live_session <slug> <header>: 0 when the latest session of <slug> still runs with this exact
-# run.py header (dataset, mode, git7); fails when it runs anything else.
-# ^ A CPU-only session can outlast the GitHub job (350 min) but not Kaggle's 12 h: dispatching
-#   the same commit, dataset and mode again attaches to it instead of pushing a new version.
-live_session() {
-    local status
+# prior_session <slug> <header>: prints "running" or "complete" when the latest session of
+# <slug> has this exact run.py header (dataset, mode, git7), else nothing. Fails when another
+# header is still running.
+# ^ A CPU-only session can outlast the GitHub job (350 min) but not Kaggle's 12 h (scifact
+#   mode all, run 43168270510). Dispatching the same commit, dataset and mode again attaches
+#   to it while it runs, and collects its output once it is complete, instead of pushing a new
+#   version that would run it all again.
+prior_session() {
+    local status state
     status="$(kaggle kernels status "$U/$1" 2>&1 | tr '[:upper:]' '[:lower:]' || true)"
-    case "$status" in *running*|*queued*) ;; *) return 1 ;; esac
-    mkdir -p "$WORK/live"
-    kaggle kernels pull "$U/$1" -p "$WORK/live" >/dev/null 2>&1 || true
-    if python3 - "$WORK/live" "$2" <<'PY2'
+    case "$status" in
+        *running*|*queued*) state=running ;;
+        *complete*) state=complete ;;
+        *) return 0 ;;
+    esac
+    mkdir -p "$WORK/prior"
+    kaggle kernels pull "$U/$1" -p "$WORK/prior" >/dev/null 2>&1 || true
+    if python3 - "$WORK/prior" "$2" <<'PY2'
 import json, pathlib, sys
 for f in pathlib.Path(sys.argv[1]).glob("*.ipynb"):
     src = json.load(open(f))["cells"][0]["source"]
@@ -154,14 +171,15 @@ for f in pathlib.Path(sys.argv[1]).glob("*.ipynb"):
 sys.exit(1)
 PY2
     then
-        return 0
+        echo "$state"
+    elif [[ "$state" == running ]]; then
+        echo "$U/$1 is still running another mode or build ($status). Wait for it, or cancel it in the Kaggle UI." >&2
+        return 1
     fi
-    echo "$U/$1 is still running another mode or build ($status). Wait for it, or cancel it in the Kaggle UI." >&2
-    exit 1
 }
 
 run_kernel() {
-    local slug="ir-bench-$DATASET" kdir="$WORK/kernel" sources ref gpu=true header
+    local slug="$SLUG" kdir="$WORK/kernel" sources ref gpu=true
     local push=(kaggle kernels push -p "$kdir")
     # ^ bm25 loads no model: no GPU quota, no wait for a GPU slot (run.py stubs libcuda.so.1
     #   when the session has none).
@@ -169,9 +187,7 @@ run_kernel() {
     sources="\"$U/ir-bench-bin\", \"$U/ir-models\", \"$U/ir-corpus-$DATASET\""
     exists "ir-index-$DATASET" && sources+=", \"$U/ir-index-$DATASET\""
     mkdir -p "$kdir"
-    header="$(printf 'import os; os.environ.update({"IRK_DATASET": "%s", "IRK_MODE": "%s", "IRK_GIT7": "%s"})' \
-        "$DATASET" "$MODE" "$GIT7")"
-    printf '%s\n' "$header" > "$kdir/run.py"
+    printf '%s\n' "$HEADER" > "$kdir/run.py"
     cat "$REPO_ROOT/scripts/kaggle/run.py" >> "$kdir/run.py"
     # ^ A "script" kernel got a CPU session although the server stored enable_gpu=true and
     #   machine_shape=NvidiaTeslaT4 (runs 43115533477, 43117637669, 43118549022; 30 h quota
@@ -203,8 +219,8 @@ PY
 }
 EOF
     ref="$U/$slug"
-    if live_session "$slug" "$header"; then
-        _log "attaching to the running session of $U/$slug (same dataset, mode and git7)"
+    if [[ -n "$PRIOR" ]]; then
+        _log "using the $PRIOR session of $U/$slug (same dataset, mode and git7); no push"
     else
         _log "pushing $U/$slug (gpu=$gpu) with sources: $sources"
         # ^ Run 43115533477: the session had no GPU (no nvidia-smi, libcuda.so.1 missing). Print the
@@ -222,8 +238,8 @@ EOF
         if [[ -n "$ver" ]]; then ref="$ref/$ver"; else _log "no version in push output; polling the latest session"; fi
     fi
 
-    local status=""
-    for _ in $(seq 1 "$WAIT_MIN"); do
+    local status="$PRIOR"
+    [[ "$PRIOR" == complete ]] || for _ in $(seq 1 "$WAIT_MIN"); do
         sleep 60
         status="$(kaggle kernels status "$ref" 2>&1 | tr '[:upper:]' '[:lower:]' || true)"
         echo "$status"
@@ -241,6 +257,9 @@ EOF
     if [[ "$status" != *complete* ]]; then
         [[ -f "$OUT/$slug.log" ]] && tail -n 80 "$OUT/$slug.log"
         echo "kernel did not complete: $status" >&2
+        case "$status" in *running*|*queued*)
+            echo "it keeps running on Kaggle (12 h limit): dispatch again with the same ref, dataset and mode to wait for it and collect its output" >&2 ;;
+        esac
         return 1
     fi
     # ^ Output layout is not documented; search instead of assuming subdirs survive.
@@ -256,8 +275,33 @@ save_index() {
     publish "ir-index-$DATASET" "$(dirname "$key")" "rebuilt at $GIT7"
 }
 
-ensure_corpus
-ensure_models
-ensure_bundle
+# fetch_output: the session's status goes to <out>/status.txt; fails when nothing came back.
+fetch_output() {
+    local status
+    mkdir -p "$OUT"
+    status="$(kaggle kernels status "$U/$FETCH" 2>&1 || true)"
+    echo "$status" | tee "$OUT/status.txt"
+    kaggle kernels output "$U/$FETCH" -p "$OUT" -o -q || true
+    [[ -n "$(find "$OUT" -type f ! -name status.txt -print -quit)" ]] \
+        || { echo "no output for $U/$FETCH" >&2; return 1; }
+    find "$OUT" -type f | sed "s|^$OUT/||"
+}
+
+if [[ -n "$FETCH" ]]; then
+    fetch_output
+    exit
+fi
+GIT7="$(git7_of "$BUNDLE/bundle.json")"
+SLUG="ir-bench-$DATASET"
+HEADER="$(printf 'import os; os.environ.update({"IRK_DATASET": "%s", "IRK_MODE": "%s", "IRK_GIT7": "%s"})' \
+    "$DATASET" "$MODE" "$GIT7")"
+# ^ Before any upload: a session to reuse needs no new dataset version, and a new bundle
+#   version must not reach a queued session of another commit.
+PRIOR="$(prior_session "$SLUG" "$HEADER")"
+if [[ -z "$PRIOR" ]]; then
+    ensure_corpus
+    ensure_models
+    ensure_bundle
+fi
 run_kernel
 save_index
