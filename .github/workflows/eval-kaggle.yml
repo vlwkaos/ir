@@ -22,12 +22,15 @@ on:
       accelerator:
         description: Kaggle machine shape
         default: NvidiaTeslaT4
+      fetch:
+        description: Only download the output of this kernel (<slug> or <slug>/<version>); no build, no run
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: eval-kaggle-${{ inputs.dataset }}
+  group: eval-kaggle-${{ inputs.fetch || inputs.dataset }}
   cancel-in-progress: false
 
 env:
@@ -36,6 +39,7 @@ env:
 jobs:
   build:
     name: CUDA build
+    if: inputs.fetch == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     # ^ CUDA 12.x on Ubuntu 22.04 (glibc 2.35) runs on Kaggle's newer image.
@@ -97,6 +101,41 @@ jobs:
         if: always()
         with:
           name: eval-${{ inputs.dataset }}
+          path: |
+            kaggle-out/**/*.json
+            kaggle-out/**/*.log
+            kaggle-out/**/*.txt
+            !kaggle-out/**/dataset-metadata.json
+          if-no-files-found: warn
+
+  # ^ A CPU session can outlast the Kaggle job's wait (scifact mode all: 12 h, run 43168270510).
+  #   This collects whatever a finished or stopped session left (research/kaggle-eval.md).
+  fetch:
+    name: Fetch Kaggle output (${{ inputs.fetch }})
+    if: inputs.fetch != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Kaggle CLI (pinned, hashed)
+        run: |
+          uv venv "$RUNNER_TEMP/kaggle-venv" --python 3.12
+          VIRTUAL_ENV="$RUNNER_TEMP/kaggle-venv" uv pip install --require-hashes -r scripts/kaggle/requirements.txt
+          echo "$RUNNER_TEMP/kaggle-venv/bin" >> "$GITHUB_PATH"
+      - name: Fetch output
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          FETCH: ${{ inputs.fetch }}
+        run: scripts/kaggle/ci.sh fetch "$FETCH" kaggle-out
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: kaggle-output
           path: |
             kaggle-out/**/*.json
             kaggle-out/**/*.log
