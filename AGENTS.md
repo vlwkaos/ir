@@ -86,6 +86,8 @@ Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
 | `IR_ANN_EF_CONSTRUCTION` | `200` | Research: HNSW build-time expansion |
 | `IR_ANN_EF` | `200` | Research: HNSW search-time expansion (recall knob; 99.2% top-10 overlap, nDCG@10 = exact at default on 50k) |
 | `IR_BENCH_MAX_SWAPOUT_DELTA` | `65536` | Research: bench watchdog tolerance (pages, ~1 GiB) for benign system swapout drift before abort; `free_pct` floor still guards real exhaustion. Set `0` for strictest pristine-latency runs (bench-env.sh) |
+| `IR_DAEMON_REPLY_TIMEOUT` | `120` | Research: seconds a search client waits for the daemon's reply before it falls back to the results it has (silently under `-q`). Raised by `scripts/kaggle/run.py` on CPU-only Kaggle sessions |
+| `IR_BENCH_QUERY_TIMEOUT` | `60` | Research: `scripts/beir-eval.py` seconds per query; a failed query scores as an empty ranking and counts in `failed_queries` |
 
 Config dir precedence: `IR_CONFIG_DIR` → `XDG_CONFIG_HOME/ir` (deprecated) → `~/.config/ir`
 

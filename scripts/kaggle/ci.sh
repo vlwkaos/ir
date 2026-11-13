@@ -2,6 +2,10 @@
 # Kaggle side of .github/workflows/eval-kaggle.yml. See research/kaggle-eval.md.
 #
 # Usage: scripts/kaggle/ci.sh <dataset> <mode> <accelerator> <bundle-dir> <out-dir>
+#        scripts/kaggle/ci.sh fetch <kernel-slug>[/<version>] <out-dir>
+#
+# fetch only downloads the output of a session (no build, no push), e.g. one that the 12 h
+# limit stopped after the job that started it gave up (workflow input `fetch`).
 #
 # Auth comes from env only, never a file: KAGGLE_USERNAME plus KAGGLE_API_TOKEN
 # (new token) or KAGGLE_KEY (legacy key). Needs the pinned `kaggle` CLI on PATH
@@ -11,17 +15,40 @@
 #   ir-corpus-<dataset>  corpus.jsonl queries.jsonl test.tsv DATASET
 #   ir-models            embedding + reranker GGUF (HF revisions pinned below)
 #   ir-bench-bin         bundle.sh output; new version only when git7 changes
+#   ir-lindera-<alias>   Linux lindera + dictionary (ko, zh); new version when LINDERA_VERSION changes
 #   ir-index-<dataset>   built index; new version only when the kernel rebuilt it
 
 set -euo pipefail
 
-DATASET="${1:?dataset}"
-MODE="${2:?mode}"
-ACCEL="${3:?accelerator}"
-BUNDLE="${4:?bundle dir}"
-OUT="${5:?out dir}"
+if [[ "${1:-}" == fetch ]]; then
+    FETCH="${2:?kernel slug[/version]}"
+    OUT="${3:?out dir}"
+    [[ "$FETCH" =~ ^[a-z0-9][a-z0-9-]*(/[0-9]+)?$ ]] || { echo "bad kernel '$FETCH': want <slug> or <slug>/<version>" >&2; exit 2; }
+else
+    FETCH=""
+    DATASET="${1:?dataset}"
+    MODE="${2:?mode}"
+    ACCEL="${3:?accelerator}"
+    BUNDLE="${4:?bundle dir}"
+    OUT="${5:?out dir}"
+fi
+# TEST ONLY, drop before merge: this branch's workflow lists no miracl datasets.
+# accelerator "<shape>@<dataset>" picks the dataset.
+if [[ -z "$FETCH" && "$ACCEL" == *@* ]]; then DATASET="${ACCEL#*@}"; ACCEL="${ACCEL%@*}"; fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WAIT_MIN="${IRK_WAIT_MIN:-320}"
+
+# ^ bench.sh settings per dataset. fiqa and MIRACL run on a 10000-doc pool (seed 42, the
+#   same pool every run; bench.sh label <dataset>-s10000-p42): 10000 is the stable floor of
+#   the pool variance study (CLAUDE.md), and CPU embedding of a 50000-doc MIRACL pool took
+#   more than one GitHub job (run 43165547171). Scores compare only with the same pool.
+#   scifact and nfcorpus run on the full corpus. PRE is bench.sh's --preprocessor alias.
+SIZE="" PRE=""
+case "${DATASET:-}" in
+    fiqa) SIZE=10000 ;;
+    miracl-ko) SIZE=10000 PRE=ko ;;
+    miracl-zh) SIZE=10000 PRE=zh ;;
+esac
 
 # ^ kaggle reads every KAGGLE_* env var as config; an empty secret would still
 #   count as a credential, so drop empty ones.
@@ -32,7 +59,6 @@ done
 [[ -n "${KAGGLE_API_TOKEN:-}${KAGGLE_KEY:-}" ]] || { echo "set KAGGLE_API_TOKEN or KAGGLE_KEY" >&2; exit 2; }
 U="$KAGGLE_USERNAME"
 git7_of() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["git7"])' "$1"; }
-GIT7="$(git7_of "$BUNDLE/bundle.json")"
 WORK="$(mktemp -d "${RUNNER_TEMP:-$REPO_ROOT/.ks}/irk.XXXXXX")"
 
 _log() { echo "[$(date +%H:%M:%S)] $*"; }
@@ -92,6 +118,7 @@ ensure_corpus() {
     local src
     case "$DATASET" in
         fiqa|nfcorpus|scifact|arguana) "$REPO_ROOT/scripts/download-beir.sh" "$DATASET" ;;
+        miracl-ko|miracl-zh) "$REPO_ROOT/scripts/download-$DATASET.sh" ;;
         *) echo "no download for dataset $DATASET" >&2; return 1 ;;
     esac
     src="$REPO_ROOT/test-data/$DATASET"
@@ -101,6 +128,46 @@ ensure_corpus() {
     cp "$src/qrels/test.tsv" "$dir/test.tsv"
     echo "$DATASET" > "$dir/DATASET"
     publish "$slug" "$dir" "seed $DATASET"
+}
+
+# ^ The release assets `ir preprocessor install <alias>` downloads (src/main.rs LINDERA_VERSION),
+#   pinned by sha256. A LINDERA_VERSION bump fails here until its assets are pinned.
+LINDERA_SHA256="
+lindera-x86_64-unknown-linux-gnu-v3.0.5.zip fd5bbf12cfc0c910eeb3a58aec2c7694d15440053c5179f5b071e3dfec34f3ec
+lindera-ko-dic-3.0.5.zip 5253834b59ac8dd4f3d766c9b457b5d8e81a4dc59691f2abcfd2d2f463b20c75
+lindera-jieba-3.0.5.zip 5c5be0dc0f956db20ef1a630412965e652c011a0ccb2a27fd5569a0dea510c4b
+"
+
+# ensure_preprocessor: ir-lindera-<alias> holds the Linux lindera binary, the dictionary
+# files (flat, as the install extracts them) and a PREPROCESSOR marker. run.py installs
+# them offline. New version only when the marker (alias, lindera tag, dictionary) changes.
+ensure_preprocessor() {
+    [[ -n "$PRE" ]] || return 0
+    local slug="ir-lindera-$PRE" tag dict want have="" z pin
+    tag="$(sed -n 's/^const LINDERA_VERSION: &str = "\(v[^"]*\)";/\1/p' "$REPO_ROOT/src/main.rs")"
+    [[ -n "$tag" ]] || { echo "LINDERA_VERSION not found in src/main.rs" >&2; return 1; }
+    case "$PRE" in ko) dict=ko-dic ;; zh) dict=jieba ;; *) echo "no dictionary for $PRE" >&2; return 1 ;; esac
+    want="$(printf 'alias=%s\nlindera=%s\ndict=%s' "$PRE" "$tag" "$dict")"
+    if exists "$slug"; then
+        kaggle datasets download "$U/$slug" -f PREPROCESSOR -p "$WORK/have-$PRE" --unzip -q -o >/dev/null 2>&1 || true
+        [[ -f "$WORK/have-$PRE/PREPROCESSOR" ]] && have="$(cat "$WORK/have-$PRE/PREPROCESSOR")"
+    fi
+    if [[ "$have" == "$want" ]]; then
+        _log "$slug already at lindera $tag ($dict)"
+        return 0
+    fi
+    _log "uploading $slug: lindera $tag, $dict (was: ${have:-none})"
+    local zips="$WORK/zip-$PRE" dir="$WORK/$slug"
+    mkdir -p "$zips" "$dir"
+    for z in "lindera-x86_64-unknown-linux-gnu-$tag.zip" "lindera-$dict-${tag#v}.zip"; do
+        pin="$(awk -v f="$z" '$1 == f {print $2}' <<<"$LINDERA_SHA256")"
+        [[ -n "$pin" ]] || { echo "no pinned sha256 for $z: add it to LINDERA_SHA256" >&2; return 1; }
+        curl -fsSL -o "$zips/$z" "https://github.com/lindera/lindera/releases/download/$tag/$z"
+        echo "$pin  $zips/$z" | shasum -a 256 -c --quiet - || { echo "sha256 mismatch: $z" >&2; return 1; }
+        unzip -q -o -j "$zips/$z" -d "$dir"
+    done
+    printf '%s\n' "$want" > "$dir/PREPROCESSOR"
+    publish "$slug" "$dir" "lindera $tag $dict"
 }
 
 ensure_models() {
@@ -135,18 +202,50 @@ ensure_bundle() {
     fi
 }
 
+# prior_session <slug> <header>: prints "running" or "complete" when the latest session of
+# <slug> has this exact run.py header (dataset, mode, git7), else nothing. Fails when another
+# header is still running.
+# ^ A CPU-only session can outlast the GitHub job (350 min) but not Kaggle's 12 h (scifact
+#   mode all, run 43168270510). Dispatching the same commit, dataset and mode again attaches
+#   to it while it runs, and collects its output once it is complete, instead of pushing a new
+#   version that would run it all again.
+prior_session() {
+    local status state
+    status="$(kaggle kernels status "$U/$1" 2>&1 | tr '[:upper:]' '[:lower:]' || true)"
+    case "$status" in
+        *running*|*queued*) state=running ;;
+        *complete*) state=complete ;;
+        *) return 0 ;;
+    esac
+    mkdir -p "$WORK/prior"
+    kaggle kernels pull "$U/$1" -p "$WORK/prior" >/dev/null 2>&1 || true
+    if python3 - "$WORK/prior" "$2" <<'PY2'
+import json, pathlib, sys
+for f in pathlib.Path(sys.argv[1]).glob("*.ipynb"):
+    src = json.load(open(f))["cells"][0]["source"]
+    src = "".join(src) if isinstance(src, list) else src
+    sys.exit(0 if src.split("\n", 1)[0] == sys.argv[2] else 1)
+sys.exit(1)
+PY2
+    then
+        echo "$state"
+    elif [[ "$state" == running ]]; then
+        echo "$U/$1 is still running another mode or build ($status). Wait for it, or cancel it in the Kaggle UI." >&2
+        return 1
+    fi
+}
+
 run_kernel() {
-    local slug="ir-bench-$DATASET" kdir="$WORK/kernel" sources ref gpu=true
+    local slug="$SLUG" kdir="$WORK/kernel" sources ref gpu=true
     local push=(kaggle kernels push -p "$kdir")
     # ^ bm25 loads no model: no GPU quota, no wait for a GPU slot (run.py stubs libcuda.so.1
     #   when the session has none).
     if [[ "$MODE" == bm25 ]]; then gpu=false; else push+=(--accelerator "$ACCEL"); fi
     sources="\"$U/ir-bench-bin\", \"$U/ir-models\", \"$U/ir-corpus-$DATASET\""
+    [[ -n "$PRE" ]] && sources+=", \"$U/ir-lindera-$PRE\""
     exists "ir-index-$DATASET" && sources+=", \"$U/ir-index-$DATASET\""
     mkdir -p "$kdir"
-    printf 'import os; os.environ.update({"IRK_DATASET": "%s", "IRK_MODE": "%s", "IRK_GIT7": "%s"})\n' \
-        "$DATASET" "$MODE" "$GIT7" \
-        > "$kdir/run.py"
+    printf '%s\n' "$HEADER" > "$kdir/run.py"
     cat "$REPO_ROOT/scripts/kaggle/run.py" >> "$kdir/run.py"
     # ^ A "script" kernel got a CPU session although the server stored enable_gpu=true and
     #   machine_shape=NvidiaTeslaT4 (runs 43115533477, 43117637669, 43118549022; 30 h quota
@@ -177,24 +276,28 @@ PY
   "model_sources": []
 }
 EOF
-    _log "pushing $U/$slug (gpu=$gpu) with sources: $sources"
-    # ^ Run 43115533477: the session had no GPU (no nvidia-smi, libcuda.so.1 missing). Print the
-    #   weekly GPU quota and the settings the server stored, so a repeat shows the cause.
-    kaggle quota 2>&1 || true
-    kcheck "${push[@]}"
-    mkdir -p "$WORK/pulled"
-    kaggle kernels pull "$U/$slug" -p "$WORK/pulled" -m >/dev/null 2>&1 || true
-    grep -E '"(enable_gpu|machine_shape|enable_internet|is_private)"' "$WORK/pulled/kernel-metadata.json" 2>/dev/null \
-        | sed 's/^ */server: /' || true
-    # ^ Status of the unversioned slug is the latest *finished* session until the new one
-    #   starts, so a rerun could read the previous run's "complete". Pin the pushed version.
     ref="$U/$slug"
-    local ver
-    ver="$(sed -n 's/.*Kernel version \([0-9][0-9]*\) successfully.*/\1/p' <<<"$KOUT" | head -1)"
-    if [[ -n "$ver" ]]; then ref="$ref/$ver"; else _log "no version in push output; polling the latest session"; fi
+    if [[ -n "$PRIOR" ]]; then
+        _log "using the $PRIOR session of $U/$slug (same dataset, mode and git7); no push"
+    else
+        _log "pushing $U/$slug (gpu=$gpu) with sources: $sources"
+        # ^ Run 43115533477: the session had no GPU (no nvidia-smi, libcuda.so.1 missing). Print the
+        #   weekly GPU quota and the settings the server stored, so a repeat shows the cause.
+        kaggle quota 2>&1 || true
+        kcheck "${push[@]}"
+        mkdir -p "$WORK/pulled"
+        kaggle kernels pull "$U/$slug" -p "$WORK/pulled" -m >/dev/null 2>&1 || true
+        grep -E '"(enable_gpu|machine_shape|enable_internet|is_private)"' "$WORK/pulled/kernel-metadata.json" 2>/dev/null \
+            | sed 's/^ */server: /' || true
+        # ^ Status of the unversioned slug is the latest *finished* session until the new one
+        #   starts, so a rerun could read the previous run's "complete". Pin the pushed version.
+        local ver
+        ver="$(sed -n 's/.*Kernel version \([0-9][0-9]*\) successfully.*/\1/p' <<<"$KOUT" | head -1)"
+        if [[ -n "$ver" ]]; then ref="$ref/$ver"; else _log "no version in push output; polling the latest session"; fi
+    fi
 
-    local status=""
-    for _ in $(seq 1 "$WAIT_MIN"); do
+    local status="$PRIOR"
+    [[ "$PRIOR" == complete ]] || for _ in $(seq 1 "$WAIT_MIN"); do
         sleep 60
         status="$(kaggle kernels status "$ref" 2>&1 | tr '[:upper:]' '[:lower:]' || true)"
         echo "$status"
@@ -212,6 +315,9 @@ EOF
     if [[ "$status" != *complete* ]]; then
         [[ -f "$OUT/$slug.log" ]] && tail -n 80 "$OUT/$slug.log"
         echo "kernel did not complete: $status" >&2
+        case "$status" in *running*|*queued*)
+            echo "it keeps running on Kaggle (12 h limit): dispatch again with the same ref, dataset and mode to wait for it and collect its output" >&2 ;;
+        esac
         return 1
     fi
     # ^ Output layout is not documented; search instead of assuming subdirs survive.
@@ -227,8 +333,34 @@ save_index() {
     publish "ir-index-$DATASET" "$(dirname "$key")" "rebuilt at $GIT7"
 }
 
-ensure_corpus
-ensure_models
-ensure_bundle
+# fetch_output: the session's status goes to <out>/status.txt; fails when nothing came back.
+fetch_output() {
+    local status
+    mkdir -p "$OUT"
+    status="$(kaggle kernels status "$U/$FETCH" 2>&1 || true)"
+    echo "$status" | tee "$OUT/status.txt"
+    kaggle kernels output "$U/$FETCH" -p "$OUT" -o -q || true
+    [[ -n "$(find "$OUT" -type f ! -name status.txt -print -quit)" ]] \
+        || { echo "no output for $U/$FETCH" >&2; return 1; }
+    find "$OUT" -type f | sed "s|^$OUT/||"
+}
+
+if [[ -n "$FETCH" ]]; then
+    fetch_output
+    exit
+fi
+GIT7="$(git7_of "$BUNDLE/bundle.json")"
+SLUG="ir-bench-$DATASET"
+HEADER="$(printf 'import os; os.environ.update({"IRK_DATASET": "%s", "IRK_MODE": "%s", "IRK_GIT7": "%s", "IRK_SIZE": "%s", "IRK_PREPROCESSOR": "%s"})' \
+    "$DATASET" "$MODE" "$GIT7" "$SIZE" "$PRE")"
+# ^ Before any upload: a session to reuse needs no new dataset version, and a new bundle
+#   version must not reach a queued session of another commit.
+PRIOR="$(prior_session "$SLUG" "$HEADER")"
+if [[ -z "$PRIOR" ]]; then
+    ensure_corpus
+    ensure_models
+    ensure_preprocessor
+    ensure_bundle
+fi
 run_kernel
 save_index
