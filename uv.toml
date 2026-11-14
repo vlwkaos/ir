@@ -1,0 +1,4 @@
+# Python installs use a 7-day cool-down: uv skips package versions published less than 7 days ago.
+# uv discovers this file from the repo root (eval-kaggle.yml runs `uv pip install` there) and
+# applies it to `uv pip compile` too.
+exclude-newer = "7 days"
