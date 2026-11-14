@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Security
+
+- **rustix 1.1.6 (RUSTSEC-2026-0486).** Cargo.lock had rustix 1.1.4. Lockfile update only.
+
 ### Dev / Benchmark Tooling
 
 - **Retrieval evaluations can run on a free Kaggle GPU** (`.github/workflows/eval-kaggle.yml`, `scripts/kaggle/`, flow in `research/kaggle-eval.md`). The workflow builds `ir` with CUDA, runs `scripts/bench.sh` in a Kaggle notebook against corpora, models and built indexes stored as Kaggle datasets, and returns the result JSON as a run artifact. It reports quality only; Kaggle speed numbers are not comparable with a local GPU.
