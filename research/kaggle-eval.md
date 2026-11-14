@@ -98,7 +98,7 @@ bm25 scores must equal a local run on the same pool (`logs/results/<ds>-s<N>-p42
 | miracl-ko hybrid, 50000 | 2 jobs | 40,129 s (11.1 h) | 0.9611 (no local model files) | runs 43165547171, 43227274582 |
 
 - miracl-ko hybrid 50000: embedding 50,323 chunks 18,412 s (2.7 chunks/s), ANN 325 s, 213 queries 21,321 s (100 s per query).
-- The pool shrinks the embed (10000 docs: about 1 h at 2.7 chunks/s), not the queries. Each tier-2 query reranks 100 documents.
+- The pool shrinks the embed (a 10000-doc MIRACL pool: about 1 h at 2.7 chunks/s), not the queries. Each tier-2 query reranks 100 documents.
   On CPU, hybrid fits one 12 h session only for miracl-ko (213 queries, about 7 h); miracl-zh (393, about 12 h) and fiqa (648, about 18 h) do not.
 
 ## Trying a change without the owner
@@ -119,6 +119,10 @@ IRK_DATASET=scifact IRK_INPUT=<input> IRK_WORKING=<work> IRK_ROOT=<short-dir> py
 ```
 
 Move `<work>/index` under `<input>` and run again: the log shows `index: key match` and no `preparing collection`.
+
+## Not yet
+
+- Hybrid on CPU in hours, not days: shard queries on GitHub runners, reuse `llm_cache` ([eval-compute.md](eval-compute.md)).
 
 ## Limits (sources checked 2026-11)
 
