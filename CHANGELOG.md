@@ -6,6 +6,7 @@
 
 ### Dev / Benchmark Tooling
 
+- **Python installs use a 7-day cool-down.** `uv.toml` sets `exclude-newer = "7 days"`, which uv reads from the repo root for `uv pip install` and `uv pip compile`. `scripts/kaggle/requirements.txt` re-pinned to markdown-it-py 4.2.0 and mdit-py-plugins 0.6.1 because 4.3.0 and 0.7.0 were newer than 7 days.
 - **Retrieval evaluations can run on a free Kaggle GPU** (`.github/workflows/eval-kaggle.yml`, `scripts/kaggle/`, flow in `research/kaggle-eval.md`). The workflow builds `ir` with CUDA, runs `scripts/bench.sh` in a Kaggle notebook against corpora, models and built indexes stored as Kaggle datasets, and returns the result JSON as a run artifact. It reports quality only; Kaggle speed numbers are not comparable with a local GPU.
 - **`scripts/bench.sh` accepts prebuilt inputs**: `--ir-bin PATH --git7 SHA` (use a built binary, skip cargo), `--data-dir DIR` (use a local corpus, skip the download), `--index-in DIR` (copy a built collection index, skip indexing and embedding) and `--index-out DIR` (save the built index). Without these flags `bench.sh` behaves as before.
 
