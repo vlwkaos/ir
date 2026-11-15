@@ -28,6 +28,7 @@ scripts/bench.sh fiqa              # bench current HEAD on FiQA
 scripts/bench.sh fiqa v0.9.0       # compare HEAD vs v0.9.0
 scripts/bench.sh miracl-ko         # Korean MIRACL benchmark
 gh workflow run eval-kaggle.yml -f dataset=scifact   # quality only, on a Kaggle GPU (research/kaggle-eval.md)
+gh workflow run eval-matrix.yml -f dataset=scifact   # quality only, queries sharded over 20 x64 runners (research/eval-compute.md)
 ```
 Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
 
