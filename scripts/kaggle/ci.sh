@@ -7,14 +7,14 @@
 # fetch only downloads the output of a session (no build, no push), e.g. one that the 12 h
 # limit stopped after the job that started it gave up (workflow input `fetch`).
 #
-# Auth comes from env only, never a file: KAGGLE_USERNAME plus KAGGLE_API_TOKEN
-# (new token) or KAGGLE_KEY (legacy key). Needs the pinned `kaggle` CLI on PATH
-# (scripts/kaggle/requirements.txt).
+# Auth: KAGGLE_USERNAME plus KAGGLE_API_TOKEN (new token) or KAGGLE_KEY (legacy key), from
+# env only (lib.sh kaggle_auth). Needs the pinned `kaggle` CLI on PATH (scripts/kaggle/requirements.txt).
 #
 # Datasets (private, under $KAGGLE_USERNAME), each uploaded once:
 #   ir-corpus-<dataset>  corpus.jsonl queries.jsonl test.tsv DATASET
 #   ir-models            embedding + reranker GGUF (HF revisions pinned below)
 #   ir-bench-bin         bundle.sh output; new version only when git7 changes
+#   ir-lindera-<alias>   Linux lindera + dictionary (ko, zh); new version when LINDERA_VERSION changes
 #   ir-index-<dataset>   built index; new version only when the kernel rebuilt it
 
 set -euo pipefail
@@ -33,19 +33,12 @@ else
 fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WAIT_MIN="${IRK_WAIT_MIN:-320}"
-
-# ^ kaggle reads every KAGGLE_* env var as config; an empty secret would still
-#   count as a credential, so drop empty ones.
-for v in KAGGLE_API_TOKEN KAGGLE_KEY KAGGLE_USERNAME; do
-    [[ -n "${!v:-}" ]] || unset "$v"
-done
-[[ -n "${KAGGLE_USERNAME:-}" ]] || { echo "KAGGLE_USERNAME is not set" >&2; exit 2; }
-[[ -n "${KAGGLE_API_TOKEN:-}${KAGGLE_KEY:-}" ]] || { echo "set KAGGLE_API_TOKEN or KAGGLE_KEY" >&2; exit 2; }
+# shellcheck source=scripts/kaggle/lib.sh
+source "$REPO_ROOT/scripts/kaggle/lib.sh"
+[[ -n "$FETCH" ]] || dataset_spec "$DATASET" || exit 2
+kaggle_auth || exit 2
 U="$KAGGLE_USERNAME"
-git7_of() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["git7"])' "$1"; }
 WORK="$(mktemp -d "${RUNNER_TEMP:-$REPO_ROOT/.ks}/irk.XXXXXX")"
-
-_log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 # ^ kaggle 2.2.5 prints API errors from `datasets create|version` and `kernels push` but
 #   exits 0 (kaggle_api_extended.py *_cli: "Dataset creation error:", "Kernel push error:",
@@ -99,18 +92,56 @@ ensure_corpus() {
     local slug="ir-corpus-$DATASET"
     exists "$slug" && return 0
     _log "seeding $slug"
-    local src
+    local src="$REPO_ROOT/test-data/$DATASET"
     case "$DATASET" in
-        fiqa|nfcorpus|scifact|arguana) "$REPO_ROOT/scripts/download-beir.sh" "$DATASET" ;;
-        *) echo "no download for dataset $DATASET" >&2; return 1 ;;
+        miracl-*) "$REPO_ROOT/scripts/download-$DATASET.sh" ;;
+        *) "$REPO_ROOT/scripts/download-beir.sh" "$DATASET" ;;
     esac
-    src="$REPO_ROOT/test-data/$DATASET"
     local dir="$WORK/$slug"
     mkdir -p "$dir"
     cp "$src/corpus.jsonl" "$src/queries.jsonl" "$dir/"
     cp "$src/qrels/test.tsv" "$dir/test.tsv"
     echo "$DATASET" > "$dir/DATASET"
     publish "$slug" "$dir" "seed $DATASET"
+}
+
+# ^ The release assets `ir preprocessor install <alias>` downloads (src/main.rs LINDERA_VERSION),
+#   pinned by sha256. A LINDERA_VERSION bump fails here until its assets are pinned.
+LINDERA_SHA256="
+lindera-x86_64-unknown-linux-gnu-v3.0.5.zip fd5bbf12cfc0c910eeb3a58aec2c7694d15440053c5179f5b071e3dfec34f3ec
+lindera-ko-dic-3.0.5.zip 5253834b59ac8dd4f3d766c9b457b5d8e81a4dc59691f2abcfd2d2f463b20c75
+lindera-jieba-3.0.5.zip 5c5be0dc0f956db20ef1a630412965e652c011a0ccb2a27fd5569a0dea510c4b
+"
+
+# ensure_preprocessor: ir-lindera-<alias> holds the Linux lindera binary, the dictionary
+# files (flat, as the install extracts them) and a PREPROCESSOR marker. run.py installs
+# them offline. New version only when the marker (alias, lindera tag, dictionary) changes.
+ensure_preprocessor() {
+    [[ -n "$PRE" ]] || return 0
+    local slug="ir-lindera-$PRE" tag want have="" z pin
+    tag="$(sed -n 's/^const LINDERA_VERSION: &str = "\(v[^"]*\)";/\1/p' "$REPO_ROOT/src/main.rs")"
+    [[ -n "$tag" ]] || { echo "LINDERA_VERSION not found in src/main.rs" >&2; return 1; }
+    want="$(printf 'alias=%s\nlindera=%s\ndict=%s' "$PRE" "$tag" "$DICT")"
+    if exists "$slug"; then
+        kdl "$slug" "$WORK/have-$PRE" PREPROCESSOR >/dev/null 2>&1 || true
+        [[ -f "$WORK/have-$PRE/PREPROCESSOR" ]] && have="$(cat "$WORK/have-$PRE/PREPROCESSOR")"
+    fi
+    if [[ "$have" == "$want" ]]; then
+        _log "$slug already at lindera $tag ($DICT)"
+        return 0
+    fi
+    _log "uploading $slug: lindera $tag, $DICT (was: ${have:-none})"
+    local zips="$WORK/zip-$PRE" dir="$WORK/$slug"
+    mkdir -p "$zips" "$dir"
+    for z in "lindera-x86_64-unknown-linux-gnu-$tag.zip" "lindera-$DICT-${tag#v}.zip"; do
+        pin="$(awk -v f="$z" '$1 == f {print $2}' <<<"$LINDERA_SHA256")"
+        [[ -n "$pin" ]] || { echo "no pinned sha256 for $z: add it to LINDERA_SHA256" >&2; return 1; }
+        curl -fsSL -o "$zips/$z" "https://github.com/lindera/lindera/releases/download/$tag/$z"
+        echo "$pin  $zips/$z" | shasum -a 256 -c --quiet - || { echo "sha256 mismatch: $z" >&2; return 1; }
+        unzip -q -o -j "$zips/$z" -d "$dir"
+    done
+    printf '%s\n' "$want" > "$dir/PREPROCESSOR"
+    publish "$slug" "$dir" "lindera $tag $DICT"
 }
 
 ensure_models() {
@@ -133,9 +164,8 @@ ensure_models() {
 ensure_bundle() {
     local have=""
     if exists ir-bench-bin; then
-        kaggle datasets download "$U/ir-bench-bin" -f bundle.json -p "$WORK/have" --unzip -q -o >/dev/null 2>&1 || true
-        [[ -f "$WORK/have/bundle.json" ]] && \
-            have="$(git7_of "$WORK/have/bundle.json")"
+        kdl ir-bench-bin "$WORK/have" bundle.json >/dev/null 2>&1 || true
+        [[ -f "$WORK/have/bundle.json" ]] && have="$(bundle_field "$WORK/have" git7)"
     fi
     if [[ "$have" == "$GIT7" ]]; then
         _log "ir-bench-bin already at $GIT7"
@@ -185,6 +215,7 @@ run_kernel() {
     #   when the session has none).
     if [[ "$MODE" == bm25 ]]; then gpu=false; else push+=(--accelerator "$ACCEL"); fi
     sources="\"$U/ir-bench-bin\", \"$U/ir-models\", \"$U/ir-corpus-$DATASET\""
+    [[ -n "$PRE" ]] && sources+=", \"$U/ir-lindera-$PRE\""
     exists "ir-index-$DATASET" && sources+=", \"$U/ir-index-$DATASET\""
     mkdir -p "$kdir"
     printf '%s\n' "$HEADER" > "$kdir/run.py"
@@ -291,16 +322,17 @@ if [[ -n "$FETCH" ]]; then
     fetch_output
     exit
 fi
-GIT7="$(git7_of "$BUNDLE/bundle.json")"
+GIT7="$(bundle_field "$BUNDLE" git7)"
 SLUG="ir-bench-$DATASET"
-HEADER="$(printf 'import os; os.environ.update({"IRK_DATASET": "%s", "IRK_MODE": "%s", "IRK_GIT7": "%s"})' \
-    "$DATASET" "$MODE" "$GIT7")"
+HEADER="$(printf 'import os; os.environ.update({"IRK_DATASET": "%s", "IRK_MODE": "%s", "IRK_GIT7": "%s", "IRK_SIZE": "%s", "IRK_PREPROCESSOR": "%s"})' \
+    "$DATASET" "$MODE" "$GIT7" "$SIZE" "$PRE")"
 # ^ Before any upload: a session to reuse needs no new dataset version, and a new bundle
 #   version must not reach a queued session of another commit.
 PRIOR="$(prior_session "$SLUG" "$HEADER")"
 if [[ -z "$PRIOR" ]]; then
     ensure_corpus
     ensure_models
+    ensure_preprocessor
     ensure_bundle
 fi
 run_kernel

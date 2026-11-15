@@ -17,7 +17,8 @@ OUT="${2:?usage: bundle.sh <ir-binary> <out-dir>}"
 [[ -x "$IR_BIN" ]] || { echo "not an executable: $IR_BIN" >&2; exit 1; }
 cd "$REPO_ROOT"
 
-sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+# shellcheck source=scripts/kaggle/lib.sh
+source "$REPO_ROOT/scripts/kaggle/lib.sh"
 # ^ First `pub const NAME: &str = "file";` in src/llm/mod.rs (models::NAME).
 model_file() { sed -n "s/^ *pub const $1: &str = \"\(.*\)\";/\1/p" src/llm/mod.rs | head -1; }
 
@@ -26,13 +27,15 @@ RERANKER_FILE="$(model_file RERANKER)"
 EXPANDER_FILE="$(model_file EXPANDER)"
 [[ -n "$EMBEDDING_FILE" && -n "$RERANKER_FILE" && -n "$EXPANDER_FILE" ]] || { echo "model consts not found in src/llm/mod.rs" >&2; exit 1; }
 
-# ^ Embedding model name, chunking, embedding input format, HNSW build, schema.
+# ^ Embedding model name, chunking, embedding input format, HNSW build, schema, and the
+#   preprocessor protocol that writes the FTS text of ko/zh collections.
 KEY_SRC="embedding_file=$EMBEDDING_FILE
 chunker.rs=$(sha src/index/chunker.rs)
 embed.rs=$(sha src/index/embed.rs)
 embedding.rs=$(sha src/llm/embedding.rs)
 ann.rs=$(sha src/db/ann.rs)
 schema.rs=$(sha src/db/schema.rs)
+preprocess.rs=$(sha src/preprocess.rs)
 "
 
 mkdir -p "$OUT"

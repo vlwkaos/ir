@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# CUDA build of .github/workflows/eval-kaggle.yml (job "build"), as a script so a change
-# can be tried from a branch that touches scripts/ only. See research/kaggle-eval.md.
+# CUDA build of .github/workflows/eval-build.yml (used by eval-kaggle.yml and eval-matrix.yml).
+# See research/kaggle-eval.md.
 #
 # Usage (inside nvidia/cuda:12.6.3-devel-ubuntu22.04, as root):
 #   scripts/kaggle/build.sh deps             apt packages, with a mirror fallback

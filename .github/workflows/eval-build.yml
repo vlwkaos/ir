@@ -1,0 +1,43 @@
+name: Eval - CUDA build
+
+# The x64 ir bundle of eval-kaggle.yml and eval-matrix.yml (artifact ir-bundle). Kaggle runs it on
+# a T4 or, without a GPU, on the CPU backend; the matrix shards always run it on the CPU backend.
+# research/kaggle-eval.md.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: CUDA build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # ^ CUDA 12.x on Ubuntu 22.04 (glibc 2.35) runs on Kaggle's newer image.
+    #   llama-cpp-sys-2 links cudart/cublas statically on Linux; only the
+    #   driver's libcuda is needed at run time.
+    container: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    # ^ The build logic (apt with mirror fallback, CMAKE_*/NK_* env, cargo, bundle) is in
+    #   scripts/kaggle/build.sh. Checkout comes first, so it runs before git exists in the image:
+    #   it then downloads a tarball (no .git), and build.sh names the bundle from GITHUB_SHA.
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: System packages
+        run: bash scripts/kaggle/build.sh deps
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: eval-kaggle-cuda
+      - name: Build and bundle
+        run: bash scripts/kaggle/build.sh build bundle
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ir-bundle
+          path: bundle/
+          retention-days: 7
