@@ -1,0 +1,201 @@
+name: Eval - matrix
+
+# Retrieval quality of scripts/bench.sh with the queries sharded over free x64 runners
+# (research/eval-compute.md). Inputs are the Kaggle datasets of
+# eval-kaggle.yml; ir-index-<ds> must exist and match this build (seed fails otherwise).
+# The steps are scripts/eval-matrix.sh. Results: artifact eval-<dataset>,
+# logs/results/<label>/<git7>.json.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: Dataset
+        type: choice
+        options: [scifact, nfcorpus, fiqa, miracl-ko, miracl-zh]
+        default: scifact
+      mode:
+        description: bench.sh --mode
+        type: choice
+        options: [all, bm25, vector, hybrid]
+        default: all
+      shards:
+        # ^ Keep a shard under about 3 h (research/eval-compute.md): fiqa needs 40 (2 waves of 20).
+        description: Number of shards (1-256; 20 run at once)
+        default: '20'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-matrix-${{ inputs.dataset }}
+  cancel-in-progress: false
+
+env:
+  W: ${{ github.workspace }}/.em
+
+jobs:
+  build:
+    uses: ./.github/workflows/eval-build.yml
+
+  seed:
+    name: Seed inputs (${{ inputs.dataset }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      git7: ${{ steps.seed.outputs.git7 }}
+      rerank_key: ${{ steps.seed.outputs.rerank_key }}
+      llm_cache: ${{ steps.seed.outputs.llm_cache }}
+      models_key: ${{ steps.keys.outputs.models_key }}
+      data_key: ${{ steps.keys.outputs.data_key }}
+      shards: ${{ steps.shards.outputs.list }}
+    env:
+      DATASET: ${{ inputs.dataset }}
+      SHARDS: ${{ inputs.shards }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Shard list
+        id: shards
+        run: |
+          [[ "$SHARDS" =~ ^[1-9][0-9]*$ && "$SHARDS" -le 256 ]] || { echo "shards must be 1-256, got '$SHARDS'" >&2; exit 1; }
+          echo "list=[$(seq -s, 1 "$SHARDS")]" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/kaggle-cli
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ir-bundle
+          path: bundle
+      - name: Cache keys
+        id: keys
+        # ^ Secrets on the steps that call Kaggle only, not on the job: no other action sees them.
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: scripts/eval-matrix.sh keys "$DATASET" bundle "$W"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: models
+        with:
+          path: ${{ env.W }}/input/models
+          key: ${{ steps.keys.outputs.models_key }}
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: data
+        with:
+          path: ${{ env.W }}/input/data
+          key: ${{ steps.keys.outputs.data_key }}
+      - name: Seed and check INDEX_KEY
+        id: seed
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: scripts/eval-matrix.sh seed "$DATASET" bundle "$W"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.models.outputs.cache-hit != 'true'
+        with:
+          path: ${{ env.W }}/input/models
+          key: ${{ steps.keys.outputs.models_key }}
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.data.outputs.cache-hit != 'true'
+        with:
+          path: ${{ env.W }}/input/data
+          key: ${{ steps.keys.outputs.data_key }}
+
+  shard:
+    name: Shard ${{ matrix.shard }}/${{ inputs.shards }}
+    needs: seed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJSON(needs.seed.outputs.shards) }}
+    env:
+      DATASET: ${{ inputs.dataset }}
+      GIT7: ${{ needs.seed.outputs.git7 }}
+      RERANK_KEY: ${{ needs.seed.outputs.rerank_key }}
+      LLM_CACHE: ${{ needs.seed.outputs.llm_cache }}
+      MODE: ${{ inputs.mode }}
+      SHARD: ${{ matrix.shard }}/${{ inputs.shards }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ir-bundle
+          path: bundle
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.W }}/input/models
+          key: ${{ needs.seed.outputs.models_key }}
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.W }}/input/data
+          key: ${{ needs.seed.outputs.data_key }}
+          fail-on-cache-miss: true
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.W }}/llm-cache
+          key: ${{ env.LLM_CACHE }}-${{ github.run_id }}-${{ matrix.shard }}-${{ github.run_attempt }}
+          # ^ This shard's earlier attempts first, then the newest merged llm_cache.
+          restore-keys: |
+            ${{ env.LLM_CACHE }}-${{ github.run_id }}-${{ matrix.shard }}-
+            ${{ env.LLM_CACHE }}-merged-
+      - name: Run shard
+        # ^ Under the job limit, so the steps below still save what it did.
+        timeout-minutes: 330
+        run: scripts/eval-matrix.sh shard "$SHARD" "$MODE" bundle "$W"
+      - name: Collect
+        if: always()
+        run: scripts/eval-matrix.sh collect "$W" out
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: always()
+        with:
+          path: ${{ env.W }}/llm-cache
+          key: ${{ env.LLM_CACHE }}-${{ github.run_id }}-${{ matrix.shard }}-${{ github.run_attempt }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: shard-${{ matrix.shard }}
+          path: out/
+          overwrite: true
+          retention-days: 7
+
+  merge:
+    name: Merge (${{ inputs.dataset }})
+    needs: [seed, shard]
+    if: always() && needs.seed.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DATASET: ${{ inputs.dataset }}
+      GIT7: ${{ needs.seed.outputs.git7 }}
+      RERANK_KEY: ${{ needs.seed.outputs.rerank_key }}
+      LLM_CACHE: ${{ needs.seed.outputs.llm_cache }}
+      MODE: ${{ inputs.mode }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: shard-*
+          path: shards
+      - name: Merge
+        run: scripts/eval-matrix.sh merge "$MODE" "$W" out shards/*
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: always()
+        with:
+          path: ${{ env.W }}/llm-cache
+          key: ${{ env.LLM_CACHE }}-merged-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: eval-${{ inputs.dataset }}
+          path: out/
+          if-no-files-found: warn
