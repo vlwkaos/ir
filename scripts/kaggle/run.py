@@ -4,8 +4,9 @@
 See research/kaggle-eval.md. Stdlib only. The workflow prepends an
 os.environ.update({...}) line with IRK_DATASET, IRK_MODE, IRK_GIT7 (the git7 the
 bundle must have: a dataset version that is still processing mounts the old one),
-IRK_SIZE (bench.sh --size, seed 42) and IRK_PREPROCESSOR (alias, e.g. ko), both
-from scripts/kaggle/lib.sh dataset_spec.
+IRK_SIZE (bench.sh --size, seed 42) and IRK_PREPROCESSOR (alias, e.g. ko), all
+from scripts/kaggle/lib.sh dataset_spec. IRK_SHARD (i/N, bench.sh --shard) comes
+from scripts/eval-matrix.sh only.
 
 Inputs, found by marker files anywhere under IRK_INPUT (default /kaggle/input):
   bundle   bundle.json + ir + bench scripts + libgomp.so.* (scripts/kaggle/bundle.sh)
@@ -36,6 +37,7 @@ DATASET = os.environ.get("IRK_DATASET", "")
 MODE = os.environ.get("IRK_MODE", "all")
 SIZE = os.environ.get("IRK_SIZE", "")  # ^ bench.sh --size (seed 42); empty: full corpus
 PREPROCESSOR = os.environ.get("IRK_PREPROCESSOR", "")  # ^ bench.sh's alias for DATASET (ko, zh)
+SHARD = os.environ.get("IRK_SHARD", "")  # ^ bench.sh --shard i/N; empty: every query
 LABEL = f"{DATASET}-s{SIZE}-p42" if SIZE else DATASET  # ^ bench.sh DATASET_LABEL
 # ^ CLAUDE.md sentinel probes (input, output of the installed command). The output is the macOS
 #   lindera v3.0.5 one, so a match shows the Linux binary tokenizes alike. ko gives 2 lines for
@@ -247,6 +249,8 @@ def main() -> int:
             "--ir-bin", str(ir), "--git7", git7, "--data-dir", str(data)]
     if SIZE:
         args += ["--size", SIZE, "--seed", "42"]
+    if SHARD:
+        args += ["--shard", SHARD]
     out_index = WORKING / "index"
     if index is not None and (index / "INDEX_KEY").read_text() == key:
         log(f"index: key match, reusing {index}")
