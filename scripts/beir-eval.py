@@ -322,15 +322,39 @@ def _aggregate_mode(mode: str, queries: list, qrels: dict, at_ks: list, records:
     return {"mode": mode, "metrics": metrics, "timing": timing, "failed_queries": failed}, n
 
 
+def _parse_shard(text: str) -> tuple:
+    """`i/N` (1 <= i <= N) for --shard."""
+    try:
+        i, n = (int(x) for x in text.split("/"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected i/N, got {text!r}")
+    if not 1 <= i <= n:
+        raise argparse.ArgumentTypeError(f"expected 1 <= i <= N, got {text!r}")
+    return i, n
+
+
+def _shard_queries(queries: list, shard: tuple) -> list:
+    """Shard i of N: position k in the sorted query ids, kept when k mod N == i - 1.
+    Stable for a given query set, so N runs cover every query once."""
+    i, n = shard
+    keep = set(sorted(q["id"] for q in queries)[i - 1::n])
+    return [q for q in queries if q["id"] in keep]
+
+
+def _scored_queries(data_dir: Path) -> tuple:
+    """Queries that have qrels, in file order, and the qrels."""
+    qrels = load_qrels(data_dir / "qrels" / "test.tsv")
+    queries = [q for q in load_queries(data_dir / "queries.jsonl") if q["id"] in qrels]
+    return queries, qrels
+
+
 def cmd_run(args):
     data_dir = Path(args.data)
-    queries = load_queries(data_dir / "queries.jsonl")
-    qrels = load_qrels(data_dir / "qrels" / "test.tsv")
-
-    # Filter to queries that have qrels
-    queries = [q for q in queries if q["id"] in qrels]
+    queries, qrels = _scored_queries(data_dir)
     if args.max_queries:
         queries = queries[:args.max_queries]
+    if args.shard:
+        queries = _shard_queries(queries, args.shard)
 
     modes = args.mode.split(",") if "," in args.mode else (
         ["bm25", "vector", "hybrid"] if args.mode == "all" else [args.mode]
@@ -436,6 +460,33 @@ def cmd_run(args):
         print(f"\nResults written to {args.output}")
     else:
         print(json.dumps(output, indent=2))
+
+
+# ── Subcommand: merge ───────────────────────────────────────────────────────
+
+def cmd_merge(args):
+    """Join the per-query records of shard runs into <output>.partial/<mode>.jsonl.
+    `run` with the same --output then finds every query done and computes the metrics."""
+    queries, _ = _scored_queries(Path(args.data))
+    shard_dirs = [Path(d) for d in args.partials]
+    modes = sorted({p.stem for d in shard_dirs for p in d.glob("*.jsonl")})
+    if not modes:
+        sys.exit(f"merge: no <mode>.jsonl in {', '.join(map(str, shard_dirs))}")
+    out_dir = _progress_dir(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for mode in modes:
+        path = out_dir / f"{mode}.jsonl"
+        records = _load_progress(path)
+        for d in shard_dirs:
+            records.update(_load_progress(d / f"{mode}.jsonl"))
+        missing = [q["id"] for q in queries if q["id"] not in records]
+        if missing:
+            sys.exit(f"merge: mode {mode}: {len(missing)} of {len(queries)} queries have no record "
+                     f"(first: {', '.join(missing[:5])}); a shard is missing or incomplete")
+        with path.open("w") as f:
+            for q in queries:
+                f.write(json.dumps(records[q["id"]]) + "\n")
+        print(f"merge: {mode}: {len(queries)} queries from {len(shard_dirs)} shard(s) -> {path}")
 
 
 def _run_signals(args, queries, qrels, at_ks, fetch_k, ir_bin, collection, modes_to_run):
@@ -617,6 +668,8 @@ def main():
     run_p.add_argument("--mode", default="bm25", help="bm25, vector, tier1, hybrid, all (default: bm25)")
     run_p.add_argument("--at-k", default="10,20,100", help="Comma-separated k values (default: 10,20,100)")
     run_p.add_argument("--max-queries", type=int, help="Limit number of queries")
+    run_p.add_argument("--shard", type=_parse_shard, metavar="i/N",
+                       help="Run only shard i of N (sorted query ids, position mod N); join with merge")
     run_p.add_argument("--output", "-o", help="Write JSON results to file")
     run_p.add_argument("--signals", action="store_true",
                        help="Capture per-query signal data (bm25_top/gap, fused_top/gap). "
@@ -624,6 +677,13 @@ def main():
                             "Requires --signals-output.")
     run_p.add_argument("--signals-output", metavar="DIR",
                        help="Directory for per-query signal JSONL files (required with --signals)")
+
+    # merge
+    merge_p = sub.add_parser("merge", help="Join shard partials (<output>.partial/<mode>.jsonl) for run")
+    merge_p.add_argument("--data", required=True, help="BEIR dataset directory (queries, qrels)")
+    merge_p.add_argument("--output", "-o", required=True, help="Result JSON the following run writes")
+    merge_p.add_argument("partials", nargs="+", metavar="PARTIAL_DIR",
+                         help="Shard partial dirs (<shard output>.partial)")
 
     # sample
     samp = sub.add_parser("sample", help="Sample a large corpus to a target size")
@@ -640,6 +700,8 @@ def main():
         if args.signals and not args.signals_output:
             p.error("--signals requires --signals-output DIR")
         cmd_run(args)
+    elif args.cmd == "merge":
+        cmd_merge(args)
     elif args.cmd == "sample":
         cmd_sample(args)
 

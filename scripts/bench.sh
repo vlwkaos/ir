@@ -4,6 +4,11 @@
 # Usage:
 #   scripts/bench.sh <dataset> [baseline-ref] [--mode bm25|vector|hybrid|all] [--size N] [--seed N]
 #                    [--ir-bin PATH --git7 SHA] [--data-dir DIR] [--index-in DIR] [--index-out DIR]
+#                    [--shard i/N]
+#
+# Sharding (used by scripts/eval-matrix.sh; see research/eval-compute.md):
+#   --shard i/N     run only shard i of N of the queries. The result is <git7>.shard-i-of-N.json;
+#                   `beir-eval.py merge` joins the shard partials into <git7>.json.partial/.
 #
 # Prebuilt inputs (used by scripts/kaggle/run.py; see research/kaggle-eval.md):
 #   --ir-bin PATH   use this binary, skip cargo build (no baseline-ref); --git7 names the result
@@ -64,6 +69,7 @@ GIT7_ARG=""
 DATA_DIR_ARG=""
 INDEX_IN=""
 INDEX_OUT=""
+SHARD=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -75,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --data-dir) DATA_DIR_ARG="$2"; shift 2 ;;
         --index-in) INDEX_IN="$2"; shift 2 ;;
         --index-out) INDEX_OUT="$2"; shift 2 ;;
+        --shard) SHARD="$2"; shift 2 ;;
         --) shift; break ;;
         -*)  echo "unknown flag: $1" >&2; exit 1 ;;
         *)
@@ -169,6 +176,13 @@ if [[ -n "$DATA_DIR_ARG" ]]; then
         [[ -f "$DATA_DIR_ARG/$f" ]] || { echo "--data-dir: missing $DATA_DIR_ARG/$f" >&2; exit 1; }
     done
     DATA_PATH="$DATA_DIR_ARG"
+fi
+RESULT_SUFFIX=""
+if [[ -n "$SHARD" ]]; then
+    [[ "$SHARD" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] <= BASH_REMATCH[2] )) \
+        || { echo "invalid --shard '$SHARD' (expected i/N with 1 <= i <= N)" >&2; exit 1; }
+    # ^ Own result name: a shard's result must not count as the cached full result.
+    RESULT_SUFFIX=".shard-${BASH_REMATCH[1]}-of-${BASH_REMATCH[2]}"
 fi
 if [[ -n "$INDEX_IN" && ! -d "$INDEX_IN" ]]; then
     echo "--index-in '$INDEX_IN' is not a directory" >&2
@@ -387,7 +401,7 @@ run_version() {
     local ir_bin="$3"
     local collection="eval-${DATASET_LABEL}"
     [[ -z "$INDEX_IN$INDEX_OUT" ]] && collection+="-${git7}"
-    local result_file="$LOG_DIR/${git7}.json"
+    local result_file="$LOG_DIR/${git7}${RESULT_SUFFIX}.json"
     local result_base="${result_file%.json}"
     local prep_marker
     prep_marker=$(prepared_marker_for_mode "$result_base" "$MODE")
@@ -425,14 +439,17 @@ run_version() {
         "$ir_bin" daemon stop || true
     fi
 
-    _log "[$label $git7] running queries (mode=$MODE)..."
-    bench_run_guarded "query $collection ($MODE)" "$ir_bin" python3 scripts/beir-eval.py run \
-        --ir-bin "$ir_bin" \
-        --data "$DATA_PATH" \
-        --collection "$collection" \
-        --mode "$MODE" \
-        --at-k "10,20,100" \
+    local run_args=(
+        --ir-bin "$ir_bin"
+        --data "$DATA_PATH"
+        --collection "$collection"
+        --mode "$MODE"
+        --at-k "10,20,100"
         --output "$result_file"
+    )
+    [[ -n "$SHARD" ]] && run_args+=(--shard "$SHARD")
+    _log "[$label $git7] running queries (mode=$MODE${SHARD:+, shard $SHARD})..."
+    bench_run_guarded "query $collection ($MODE)" "$ir_bin" python3 scripts/beir-eval.py run "${run_args[@]}"
 
     _log "[$label $git7] done -> $result_file"
 }
@@ -445,7 +462,7 @@ run_version "HEAD" "$HEAD_HASH" "$HEAD_BIN"
 print_table_rows() {
     local label="$1"
     local git7="$2"
-    local result_file="$LOG_DIR/${git7}.json"
+    local result_file="$LOG_DIR/${git7}${RESULT_SUFFIX}.json"
 
     if [[ ! -f "$result_file" ]]; then
         printf "  %-22s  %-7s  %-7s  %8s  %8s  %8s  %8s  %8s  %9s  %8s\n" \
@@ -489,7 +506,7 @@ EOF
 
 echo ""
 echo "══════════════════════════════════════════════════════════════════════════════════════"
-echo "  Benchmark — $DATASET_LABEL  (mode=$MODE)"
+echo "  Benchmark — $DATASET_LABEL  (mode=$MODE${SHARD:+, shard $SHARD})"
 echo "══════════════════════════════════════════════════════════════════════════════════════"
 printf "  %-22s  %-7s  %-7s  %8s  %8s  %8s  %8s  %8s  %9s  %8s\n" \
        "run" "git" "mode" "nDCG@10" "nDCG@20" "R@10" "R@20" "R@100" "R@1000" "med ms"
