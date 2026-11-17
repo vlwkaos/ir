@@ -27,9 +27,16 @@ const INHERITED_MODEL_ENV_VARS: &[&str] = &[
     "QMD_MODEL_DIRS",
 ];
 
-// ^ Research switches (research/reranker-eval.md) that write a dump; removed for every
-//   scenario, also those with real models. A scenario sets them explicitly.
-const RESEARCH_ENV_VARS: &[&str] = &["IR_RERANK_DUMP"];
+// ^ Research switches (research/reranker-eval.md) that change the tier-2 scorer or write a dump;
+//   removed for every scenario, also those with real models. A scenario sets them explicitly.
+const RESEARCH_ENV_VARS: &[&str] = &[
+    "IR_LISTWISE_MODEL",
+    "IR_LISTWISE_N",
+    "IR_LISTWISE_TRUNC",
+    "IR_LISTWISE_SHUFFLES",
+    "IR_LISTWISE_STRIDE",
+    "IR_RERANK_DUMP",
+];
 
 /// One isolated ir installation: its own config dir, no reachable models.
 pub struct Env {

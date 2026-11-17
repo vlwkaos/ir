@@ -14,6 +14,7 @@ pub mod download;
 pub mod embedding;
 pub mod expander;
 pub mod generate;
+pub mod listwise;
 pub mod reranker;
 pub mod scoring;
 
@@ -234,6 +235,8 @@ pub mod env {
     pub const COMBINED_MODEL: &str = "IR_COMBINED_MODEL";
     /// Deprecated alias for IR_COMBINED_MODEL. Still accepted; emits a warning.
     pub const QWEN_MODEL: &str = "IR_QWEN_MODEL";
+    /// Research: listwise tier-2 scorer GGUF (src/llm/listwise.rs).
+    pub const LISTWISE_MODEL: &str = "IR_LISTWISE_MODEL";
 }
 
 /// Env vars that can override the full path for a known model filename.
@@ -316,9 +319,13 @@ fn push_unique(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
     }
 }
 
-/// The tier-2 scorer of the daemon and `ir rerank-eval`.
+/// The tier-2 scorer: listwise when IR_LISTWISE_MODEL is set (research, src/llm/listwise.rs),
+/// else the pointwise reranker.
 pub fn load_scorer() -> crate::error::Result<Box<dyn scoring::Scorer>> {
-    Ok(Box::new(reranker::Reranker::load_default()?))
+    match listwise::Listwise::from_env()? {
+        Some(l) => Ok(Box::new(l)),
+        None => Ok(Box::new(reranker::Reranker::load_default()?)),
+    }
 }
 
 /// Initialize the process-global llama.cpp backend. Safe to call from multiple models.

@@ -285,15 +285,19 @@ pub fn create_scoring_context<'a>(
     backend: &'static LlamaBackend,
     ctx_size: u32,
 ) -> Result<llama_cpp_2::context::LlamaContext<'a>> {
+    model
+        .new_context(backend, context_params(ctx_size))
+        .map_err(|e| Error::Other(format!("scoring context: {e}")))
+}
+
+/// Context parameters of a scoring model: `ctx_size` tokens, all cores.
+pub fn context_params(ctx_size: u32) -> LlamaContextParams {
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get() as i32)
         .unwrap_or(4);
-    let ctx_params = LlamaContextParams::default()
+    LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(ctx_size))
         .with_offload_kqv(false)
         .with_n_threads(n_threads)
-        .with_n_threads_batch(n_threads);
-    model
-        .new_context(backend, ctx_params)
-        .map_err(|e| Error::Other(format!("scoring context: {e}")))
+        .with_n_threads_batch(n_threads)
 }
