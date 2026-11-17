@@ -143,13 +143,21 @@ QUERY_TIMEOUT_S = float(os.environ.get("IR_BENCH_QUERY_TIMEOUT", "60"))
 def search_one(ir_bin: str, collection: str, mode: str, query: str, limit: int,
                env: dict | None = None) -> tuple:
     """Returns (ranked_doc_ids, elapsed_ms, signals). ranked_doc_ids from path field.
-    A failed query scores as an empty ranking; signals then has "failed": True."""
+    A failed query scores as an empty ranking; signals then has "failed": True.
+    A query ir answered from BM25 because the daemon was not ready also fails: it would
+    score as a vector or hybrid result."""
     start = time.monotonic()
     try:
+        # ^ No -q: ir prints the "note: daemon ..." lines of a fallback only without it.
         result = run_ir(ir_bin, "search", "-c", collection,
                         "--mode", mode, "-n", str(limit),
-                        "--json", "-q", query, timeout=QUERY_TIMEOUT_S, env=env)
+                        "--json", query, timeout=QUERY_TIMEOUT_S, env=env)
         elapsed_ms = (time.monotonic() - start) * 1000
+        fallback = next((l for l in result.stderr.splitlines() if "note:" in l and "daemon" in l), None)
+        if fallback:
+            print(f"\n  query answered by BM25, not {mode} ({fallback.strip()}): {query[:60]!r}",
+                  file=sys.stderr, flush=True)
+            return [], elapsed_ms, {"failed": True}
         hits = json.loads(result.stdout) if result.stdout.strip() else []
         doc_ids = [h["path"].removesuffix(".txt") for h in hits]
         signals = _parse_signals(result.stderr)
