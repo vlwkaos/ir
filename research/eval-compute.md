@@ -80,6 +80,15 @@ bm25 must equal a local run on the same pool (`logs/results/<ds>-s<N>-p42/`). Jo
 - The rerun took 85 s per query (cause not measured: Kaggle saves the index before the queries, so its
   `llm_cache` is empty). A first Kaggle hybrid run outlasts the job: dispatch it again to collect it.
 
+## Measured GitHub matrix runs (scifact, 20 shards, main 013aacd)
+
+Baseline for search experiments. Earlier matrix runs on 3f01c10 (vector 0.7446, hybrid 0.7547) and the Kaggle 0.7706 and local 0.7717 vector references predate the daemon wait in `scripts/bench.sh`: cold shards answered 5-7 queries from BM25.
+
+| Run | Wall | Shard job median (min-max) | nDCG@10 | Source |
+|---|---|---|---|---|
+| vector | 27 min (build 13 min; Seed rerun after a transient Kaggle 403) | 66.5 s (42-120 s) | 0.7774, 0 failed queries | run 43994765211 |
+| hybrid | 46 min 26 s | 908 s (321-1706 s) | 0.7806, 0 failed queries (recall_10 0.8977) | run 43998554870 |
+
 ## Not built
 
 - Quick runs on the first n queries (`--max-queries`): per-query nDCG@10 SD = 0.383 (bm25, scifact,
