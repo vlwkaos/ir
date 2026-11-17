@@ -42,6 +42,7 @@
 #   IR_BENCH_MIN_FREE_PCT=12      abort sooner on low free memory
 #   IR_BENCH_MAX_IR_CPU_PCT=600   abort sooner on CPU fallback
 #   IR_BENCH_CPU_STRIKES=2        require fewer hot samples before aborting
+#   IR_BENCH_DAEMON_WAIT=900      seconds to wait for the daemon before the queries (vector, hybrid)
 
 set -euo pipefail
 
@@ -373,6 +374,26 @@ load_index() {
     _log "index: loaded $collection from $INDEX_IN"
 }
 
+# Start the daemon and block until it can answer in $MODE. While the daemon loads, `ir search`
+# answers from BM25 (src/main.rs, "daemon warming"), and that would score as a vector or
+# hybrid result. One search starts it; `daemon status` reports when it is ready.
+wait_for_daemon() {
+    local ir_bin="$1" collection="$2" status
+    local want="^running" start=$SECONDS deadline=$((SECONDS + ${IR_BENCH_DAEMON_WAIT:-900}))
+    [[ "$MODE" == "hybrid" || "$MODE" == "all" ]] && want="^running .*tier-2 (ready|unavailable)"
+    "$ir_bin" search -c "$collection" --mode vector -n 1 -q warmup >/dev/null 2>&1 || true
+    # ^ Output captured, not piped into grep -q: SIGPIPE would fail the pipeline under pipefail.
+    until status="$("$ir_bin" daemon status 2>/dev/null || true)"; [[ "$status" =~ $want ]]; do
+        if (( SECONDS >= deadline )); then
+            echo "daemon not ready after ${IR_BENCH_DAEMON_WAIT:-900} s (status: ${status:-none}); daemon.log:" >&2
+            tail -n 5 "${IR_CONFIG_DIR:?}/daemon.log" >&2 || true
+            exit 1
+        fi
+        sleep 1
+    done
+    _log "daemon ready after $((SECONDS - start)) s"
+}
+
 # Save a consistent copy of the index (sqlite backup API folds in the WAL).
 save_index() {
     local ir_bin="$1"
@@ -437,6 +458,7 @@ run_version() {
     if [[ "$MODE" != "bm25" ]]; then
         _log "[$label $git7] restarting benchmark daemon (tier-2=dedicated)"
         "$ir_bin" daemon stop || true
+        wait_for_daemon "$ir_bin" "$collection"
     fi
 
     local run_args=(
