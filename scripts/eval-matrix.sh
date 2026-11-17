@@ -113,9 +113,34 @@ else:
 PY
 }
 
-# The config names of this run: CONFIGS in mode=rerank, else none (the dump list).
-rr_names() {
-    [[ "${MODE:-}" != rerank ]] || echo "${CONFIGS:-}"
+# fetch_models <dir>: the listwise GGUFs of CONFIGS from their pinned Hugging Face URL, sha256
+# checked. Not in actions/cache: 20 shards restoring GBs each pass the account's cache egress limit.
+fetch_models() {
+    local dir="$1" f want url
+    mkdir -p "$dir"
+    # shellcheck disable=SC2086  # ^ CONFIGS is a space-separated list of names
+    while read -r f want url; do
+        [[ ! -f "$dir/$f" ]] || continue
+        _log "downloading $f"
+        curl -fsSL --retry 5 --retry-all-errors -o "$dir/$f.part" "$url" || die "download $url"
+        [[ "$(sha "$dir/$f.part")" == "$want" ]] || die "$f: sha256 is not $want"
+        mv "$dir/$f.part" "$dir/$f"
+    done < <(rr_json models $CONFIGS)
+}
+
+# src_cat <pathspec>...: the bytes of the tracked files, in git order, for a cache key.
+src_cat() { (cd "$REPO_ROOT" && git ls-files -z -- "$@" | xargs -0 cat); }
+
+# rr_saved <i/N>: where W/llm-cache keeps a finished rerank shard's result partials, keyed by the
+# dump, the configs with their models and the code that ranks them. merge carries every shard's
+# into the merged cache, so a new dispatch runs only the shards that have none.
+rr_saved() {
+    local key
+    # shellcheck disable=SC2086  # ^ name list
+    key="$({ sha "$W/dump/dump.jsonl" "$W/dump/base.jsonl"; rr_json configs $CONFIGS; rr_json models $CONFIGS
+        src_cat src/llm src/search/rerank_eval.rs src/search/hybrid.rs Cargo.lock scripts/beir-eval.py scripts/kaggle/run.py; } \
+        | sha | cut -c1-24)"
+    echo "$W/llm-cache/rr/$key/${1/\//-of-}"
 }
 
 # run_py <mode> [<i/N>]: scripts/kaggle/run.py on W/input. Results in W/working, state in W/root.
@@ -146,10 +171,14 @@ keys() {
     rm -rf "$W/key"
     kdl "ir-index-$ds" "$W/key" INDEX_KEY || true
     [[ -f "$W/key/INDEX_KEY" ]] || die "no INDEX_KEY in Kaggle dataset ir-index-$ds: build it with eval-kaggle.yml dataset=$ds mode=vector"
-    local models
-    # shellcheck disable=SC2046  # ^ config names
-    models="$({ for f in embedding_file reranker_file expander_file; do bundle_field "$bundle" "$f"; done; rr_json models $(rr_names); } | sha)"
-    emit MODELS_KEY "eval-models-${models:0:16}"
+    local models f
+    if [[ "${MODE:-}" == rerank ]]; then
+        # ^ Nothing to restore: rerank shards fetch their GGUFs (fetch_models).
+        emit MODELS_KEY eval-models-none
+    else
+        models="$(for f in embedding_file reranker_file expander_file; do bundle_field "$bundle" "$f"; done | sha)"
+        emit MODELS_KEY "eval-models-${models:0:16}"
+    fi
     emit DATA_KEY "eval-data-$ds-$(sha "$W/key/INDEX_KEY" | cut -c1-16)"
 }
 
@@ -163,16 +192,7 @@ seed() {
     mkdir -p "$in"
     rm -rf "$in/bundle"
     cp -R "$bundle" "$in/bundle"
-    [[ -n "$(ls -A "$in/models" 2>/dev/null)" ]] || kdl ir-models "$in/models"
-    local f want url
-    # shellcheck disable=SC2046  # ^ config names
-    while read -r f want url; do
-        [[ ! -f "$in/models/$f" ]] || continue
-        _log "seed: downloading $f"
-        curl -fsSL --retry 3 -o "$in/models/$f.part" "$url" || die "download $url"
-        [[ "$(sha "$in/models/$f.part")" == "$want" ]] || die "$f: sha256 is not $want"
-        mv "$in/models/$f.part" "$in/models/$f"
-    done < <(rr_json models $(rr_names))
+    [[ -f "$in/models/$(bundle_field "$bundle" embedding_file)" ]] || kdl ir-models "$in/models"
     if [[ ! -f "$in/data/index/INDEX_KEY" ]]; then
         fresh=1
         rm -rf "$in/data"
@@ -192,18 +212,21 @@ seed() {
     emit LLM_CACHE "llm-cache-$LABEL-$RERANK_KEY"
     # ^ What a dump depends on: the index, the reranker, and the code and script that produce the
     #   windows (src/search/rerank_eval.rs only reads dumps).
-    local src
-    src="$(cd "$REPO_ROOT" && git ls-files src/search src/db src/config src/llm/embedding.rs src/llm/mod.rs \
-        src/daemon.rs src/main.rs scripts/bench.sh \
-        | grep -v '^src/search/rerank_eval.rs$')"
-    # shellcheck disable=SC2086  # ^ file list
-    emit DUMP_KEY "rr-dump-$LABEL-$({ cat "$in/data/index/INDEX_KEY"; echo "$RERANK_KEY"; (cd "$REPO_ROOT" && cat $src); } | sha | cut -c1-24)"
+    emit DUMP_KEY "rr-dump-$LABEL-$({ cat "$in/data/index/INDEX_KEY"; echo "$RERANK_KEY"
+        src_cat src/search src/db src/config src/llm/embedding.rs src/llm/mod.rs src/daemon.rs src/main.rs \
+            scripts/bench.sh ':!src/search/rerank_eval.rs'; } | sha | cut -c1-24)"
     _log "seed: $LABEL at $GIT7; bm25 run as the INDEX_KEY gate"
     run_py bm25
     if [[ "$fresh" == 1 && -n "$SIZE" ]]; then
         # ^ Cache the pool, not the full corpus (MIRACL is GBs). bench.sh --size on a pool of at
         #   most that size samples every doc again (beir-eval.py sample), so the label holds.
         cp "$W/root/repo/test-data/$LABEL/corpus.jsonl" "$in/data/corpus/corpus.jsonl"
+    fi
+    if [[ "${MODE:-}" == rerank ]]; then
+        # ^ The gate needed the bundle; the saved eval-models-none stays a marker.
+        rm -rf "$in/models"
+        mkdir -p "$in/models"
+        echo "rerank shards fetch their models: scripts/eval-matrix.sh fetch_models" > "$in/models/NONE"
     fi
 }
 
@@ -213,10 +236,26 @@ shard() {
     need_env
     rm -rf "$W/input/bundle"
     cp -R "$bundle" "$W/input/bundle"
-    # ^ Always: also drops the rows of an index saved without this key.
-    rerank_cache "$W/input/data/index/eval-$LABEL.sqlite" "$W/llm-cache/llm_cache.sqlite"
-    [[ "$mode" != rerank || -f "$W/dump/dump.jsonl" ]] || die "no dump in $W/dump: run mode=dump for $DATASET at this DUMP_KEY first"
-    run_py "$mode" "$s"
+    if [[ "$mode" != rerank ]]; then
+        # ^ Always: also drops the rows of an index saved without this key. rerank never reads it.
+        rerank_cache "$W/input/data/index/eval-$LABEL.sqlite" "$W/llm-cache/llm_cache.sqlite"
+        run_py "$mode" "$s"
+        return
+    fi
+    [[ -f "$W/dump/dump.jsonl" ]] || die "no dump in $W/dump: run mode=dump for $DATASET at this DUMP_KEY first"
+    local saved part="$W/root/repo/logs/results/$LABEL/$GIT7.shard-${s/\//-of-}.json.partial"
+    saved="$(rr_saved "$s")"
+    if [[ -f "$saved/DONE" ]]; then
+        _log "shard $s: reusing the partials of an earlier run ($saved)"
+        mkdir -p "$part"
+        cp "$saved"/*.jsonl "$part/"
+        return
+    fi
+    fetch_models "$W/input/models"
+    run_py rerank "$s"
+    mkdir -p "$saved"
+    cp "$part"/*.jsonl "$saved/"
+    touch "$saved/DONE"
 }
 
 collect() {
@@ -226,10 +265,10 @@ collect() {
     mkdir -p "$out/$LABEL/qrels" "$W/llm-cache"
     # ^ beir-eval.py names the result's dataset after this directory.
     state="$W/root/repo/.bench-state/bench/xdg/ir/collections/eval-$LABEL.sqlite"
-    if [[ -f "$state" ]]; then
-        rerank_cache "$W/llm-cache/llm_cache.sqlite" "$state"
-        cp "$W/llm-cache/llm_cache.sqlite" "$out/"
-    fi
+    [[ ! -f "$state" ]] || rerank_cache "$W/llm-cache/llm_cache.sqlite" "$state"
+    # ^ Also without a bench.sh run (mode=rerank): the merged cache keeps the restored rows.
+    [[ ! -f "$W/llm-cache/llm_cache.sqlite" ]] || cp "$W/llm-cache/llm_cache.sqlite" "$out/"
+    [[ ! -d "$W/llm-cache/rr" ]] || cp -R "$W/llm-cache/rr" "$out/"
     [[ ! -d "$W/root/repo/logs/results/$LABEL" ]] || cp -R "$W/root/repo/logs/results/$LABEL" "$out/results"
     cp "$W/input/data/corpus/queries.jsonl" "$out/$LABEL/"
     cp "$W/input/data/corpus/test.tsv" "$out/$LABEL/qrels/"
@@ -252,6 +291,7 @@ merge() {
     # ^ First, so the workflow saves the union even when a shard is missing.
     rerank_cache "$W/llm-cache/llm_cache.sqlite" ${caches[@]+"${caches[@]}"}
     cp "$W/llm-cache/llm_cache.sqlite" "$out/"
+    for s in "$@"; do [[ ! -d "$s/rr" ]] || { mkdir -p "$W/llm-cache/rr"; cp -R "$s/rr/." "$W/llm-cache/rr/"; }; done
     [[ -n "$data" && ${#parts[@]} -gt 0 ]] || die "no shard results in: $*"
     local result="$out/logs/results/$LABEL/$GIT7.json"
     python3 "$BEIR" merge --data "$data" --output "$result" "${parts[@]}"

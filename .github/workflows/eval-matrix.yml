@@ -5,6 +5,8 @@ name: Eval - matrix
 # eval-kaggle.yml; ir-index-<ds> must exist and match this build (seed fails otherwise).
 # The steps are scripts/eval-matrix.sh. Results: artifact eval-<dataset>,
 # logs/results/<label>/<git7>.json.
+# Reranker evaluation (research/reranker-eval.md): mode=dump is a hybrid run that also saves each
+# tier-2 window (actions/cache, DUMP_KEY); mode=rerank ranks the saved windows with `configs`.
 
 on:
   workflow_dispatch:
@@ -17,12 +19,15 @@ on:
       mode:
         description: bench.sh --mode
         type: choice
-        options: [all, bm25, vector, hybrid]
+        options: [all, bm25, vector, hybrid, dump, rerank]
         default: all
       shards:
         # ^ Keep a shard under about 3 h (research/eval-compute.md): fiqa needs 40 (2 waves of 20).
         description: Number of shards (1-256; 20 run at once)
         default: '20'
+      configs:
+        description: mode=rerank only. Space-separated config names of scripts/rerank-configs.json
+        default: ''
 
 permissions:
   contents: read
@@ -47,12 +52,14 @@ jobs:
       git7: ${{ steps.seed.outputs.git7 }}
       rerank_key: ${{ steps.seed.outputs.rerank_key }}
       llm_cache: ${{ steps.seed.outputs.llm_cache }}
+      dump_key: ${{ steps.seed.outputs.dump_key }}
       models_key: ${{ steps.keys.outputs.models_key }}
       data_key: ${{ steps.keys.outputs.data_key }}
       shards: ${{ steps.shards.outputs.list }}
     env:
       DATASET: ${{ inputs.dataset }}
       SHARDS: ${{ inputs.shards }}
+      MODE: ${{ inputs.mode }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -120,6 +127,7 @@ jobs:
       LLM_CACHE: ${{ needs.seed.outputs.llm_cache }}
       MODE: ${{ inputs.mode }}
       SHARD: ${{ matrix.shard }}/${{ inputs.shards }}
+      CONFIGS: ${{ inputs.configs }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -146,6 +154,12 @@ jobs:
           restore-keys: |
             ${{ env.LLM_CACHE }}-${{ github.run_id }}-${{ matrix.shard }}-
             ${{ env.LLM_CACHE }}-merged-
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: inputs.mode == 'rerank'
+        with:
+          path: ${{ env.W }}/dump
+          key: ${{ needs.seed.outputs.dump_key }}
+          fail-on-cache-miss: true
       - name: Run shard
         # ^ Under the job limit, so the steps below still save what it did.
         timeout-minutes: 330
@@ -188,6 +202,11 @@ jobs:
           path: shards
       - name: Merge
         run: scripts/eval-matrix.sh merge "$MODE" "$W" out shards/*
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: inputs.mode == 'dump'
+        with:
+          path: ${{ env.W }}/dump
+          key: ${{ needs.seed.outputs.dump_key }}
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: always()
         with:

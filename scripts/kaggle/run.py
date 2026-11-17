@@ -189,7 +189,8 @@ def main() -> int:
     if corpus is None:
         sys.exit(f"[irk] no corpus dataset with DATASET={DATASET} under {INPUT}")
     models = {}
-    for kind in ("embedding", "reranker", "expander"):
+    # ^ A rerank run loads only its listwise GGUFs (eval-matrix.sh fetch_models), not the bundle's.
+    for kind in () if MODE == "rerank" else ("embedding", "reranker", "expander"):
         d = one_dir(meta[f"{kind}_file"], f"{kind} model")
         if d is None:
             sys.exit(f"[irk] model {meta[f'{kind}_file']} not attached")
