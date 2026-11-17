@@ -89,7 +89,7 @@ impl Scorer for Reranker {
         models::RERANKER
     }
 
-    fn score_batch(&self, query: &str, docs: &[&str]) -> Result<Vec<f64>> {
+    fn score_batch_costed(&self, query: &str, docs: &[&str]) -> Result<scoring::Costed> {
         let mut guard = self.get_or_create_ctx()?;
         let ctx = guard.as_mut().unwrap();
         scoring::score_batch_with_ctx(

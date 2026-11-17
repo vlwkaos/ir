@@ -16,12 +16,17 @@
 # RERANK_KEY = sha256 of the reranker GGUF, src/llm/scoring.rs and src/llm/reranker.rs: the
 # llm_cache key in src/search/hybrid.rs (rerank) has only the GGUF file name, query and content
 # hash. llm_cache rows move between runs only under the same RERANK_KEY (rerank_cache).
+#
+# Reranker evaluation (research/reranker-eval.md): mode=dump is a hybrid run that also writes each
+# tier-2 window with its pointwise scores and costs; merge leaves it in W/dump (actions/cache under
+# DUMP_KEY). mode=rerank ranks W/dump with the CONFIGS names of scripts/rerank-configs.json.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_PY="$REPO_ROOT/scripts/kaggle/run.py"
 BEIR="$REPO_ROOT/scripts/beir-eval.py"
+RR_CONFIGS="$REPO_ROOT/scripts/rerank-configs.json"
 W=""
 # shellcheck source=scripts/kaggle/lib.sh
 source "$REPO_ROOT/scripts/kaggle/lib.sh"
@@ -86,12 +91,48 @@ print(f"rerank cache {dst}: {total} rows, added {added} (key {key[:12]})")
 PY
 }
 
+# rr_json models [<name>...]   "<file> <sha256> <url>" lines of the models the named configs use
+# rr_json configs [<name>...]  JSON list of the named configs, each with "name"
+# No names: the "dump" list of scripts/rerank-configs.json.
+rr_json() {
+    python3 - "$RR_CONFIGS" "$@" <<'PY'
+import json, sys
+spec = json.load(open(sys.argv[1]))
+what, names = sys.argv[2], sys.argv[3:] or spec["dump"]
+unknown = [n for n in names if n not in spec["configs"]]
+if unknown:
+    sys.exit(f"rerank configs: unknown {unknown} (known: {', '.join(spec['configs'])})")
+configs = [{"name": n, **spec["configs"][n]} for n in names]
+if what == "models":
+    # ^ Only these: every model in one cache would pass the 10 GB actions cache limit.
+    for f in sorted({c.get("env", {}).get("IR_LISTWISE_MODEL") for c in configs} - {None}):
+        m = spec["models"][f]
+        print(f, m["sha256"], m["url"])
+else:
+    print(json.dumps(configs))
+PY
+}
+
+# The config names of this run: CONFIGS in mode=rerank, else none (the dump list).
+rr_names() {
+    [[ "${MODE:-}" != rerank ]] || echo "${CONFIGS:-}"
+}
+
 # run_py <mode> [<i/N>]: scripts/kaggle/run.py on W/input. Results in W/working, state in W/root.
 run_py() {
     rm -rf "$W/working"
+    local configs=""
+    case "$1" in
+        dump) configs="$(rr_json configs)" ;;
+        rerank)
+            [[ -n "${CONFIGS:-}" ]] || die "mode=rerank needs configs (names in scripts/rerank-configs.json)"
+            # shellcheck disable=SC2086  # ^ CONFIGS is a space-separated list of names
+            configs="$(rr_json configs $CONFIGS)" ;;
+    esac
     IRK_INPUT="$W/input" IRK_WORKING="$W/working" IRK_ROOT="$W/root" \
         IRK_DATASET="$DATASET" IRK_MODE="$1" IRK_GIT7="$GIT7" IRK_SIZE="$SIZE" IRK_PREPROCESSOR="$PRE" \
-        IRK_SHARD="${2:-}" python3 "$RUN_PY"
+        IRK_SHARD="${2:-}" IRK_RERANK_CONFIGS="$configs" IRK_RERANK_DUMP_DIR="$W/dump" python3 "$RUN_PY"
+    [[ "$1" != rerank ]] || return 0
     # ^ run.py passes --index-in only when the attached INDEX_KEY matches this build.
     grep -q "index: loaded eval-$LABEL" "$W/working/bench.log" \
         || die "run.py did not reuse ir-index-$DATASET: its INDEX_KEY does not match this build (key diff above). Rebuild it: eval-kaggle.yml dataset=$DATASET mode=vector"
@@ -106,7 +147,8 @@ keys() {
     kdl "ir-index-$ds" "$W/key" INDEX_KEY || true
     [[ -f "$W/key/INDEX_KEY" ]] || die "no INDEX_KEY in Kaggle dataset ir-index-$ds: build it with eval-kaggle.yml dataset=$ds mode=vector"
     local models
-    models="$(for f in embedding_file reranker_file expander_file; do bundle_field "$bundle" "$f"; done | sha)"
+    # shellcheck disable=SC2046  # ^ config names
+    models="$({ for f in embedding_file reranker_file expander_file; do bundle_field "$bundle" "$f"; done; rr_json models $(rr_names); } | sha)"
     emit MODELS_KEY "eval-models-${models:0:16}"
     emit DATA_KEY "eval-data-$ds-$(sha "$W/key/INDEX_KEY" | cut -c1-16)"
 }
@@ -122,6 +164,15 @@ seed() {
     rm -rf "$in/bundle"
     cp -R "$bundle" "$in/bundle"
     [[ -n "$(ls -A "$in/models" 2>/dev/null)" ]] || kdl ir-models "$in/models"
+    local f want url
+    # shellcheck disable=SC2046  # ^ config names
+    while read -r f want url; do
+        [[ ! -f "$in/models/$f" ]] || continue
+        _log "seed: downloading $f"
+        curl -fsSL --retry 3 -o "$in/models/$f.part" "$url" || die "download $url"
+        [[ "$(sha "$in/models/$f.part")" == "$want" ]] || die "$f: sha256 is not $want"
+        mv "$in/models/$f.part" "$in/models/$f"
+    done < <(rr_json models $(rr_names))
     if [[ ! -f "$in/data/index/INDEX_KEY" ]]; then
         fresh=1
         rm -rf "$in/data"
@@ -139,6 +190,14 @@ seed() {
     emit RERANK_KEY "$(sha "$gguf" "$REPO_ROOT/src/llm/scoring.rs" "$REPO_ROOT/src/llm/reranker.rs" | sha)"
     # ^ actions/cache key prefix of the llm_cache: the shard and merge jobs save under it.
     emit LLM_CACHE "llm-cache-$LABEL-$RERANK_KEY"
+    # ^ What a dump depends on: the index, the reranker, and the code and script that produce the
+    #   windows (src/search/rerank_eval.rs only reads dumps).
+    local src
+    src="$(cd "$REPO_ROOT" && git ls-files src/search src/db src/config src/llm/embedding.rs src/llm/mod.rs \
+        src/daemon.rs src/main.rs scripts/bench.sh \
+        | grep -v '^src/search/rerank_eval.rs$')"
+    # shellcheck disable=SC2086  # ^ file list
+    emit DUMP_KEY "rr-dump-$LABEL-$({ cat "$in/data/index/INDEX_KEY"; echo "$RERANK_KEY"; (cd "$REPO_ROOT" && cat $src); } | sha | cut -c1-24)"
     _log "seed: $LABEL at $GIT7; bm25 run as the INDEX_KEY gate"
     run_py bm25
     if [[ "$fresh" == 1 && -n "$SIZE" ]]; then
@@ -156,6 +215,7 @@ shard() {
     cp -R "$bundle" "$W/input/bundle"
     # ^ Always: also drops the rows of an index saved without this key.
     rerank_cache "$W/input/data/index/eval-$LABEL.sqlite" "$W/llm-cache/llm_cache.sqlite"
+    [[ "$mode" != rerank || -f "$W/dump/dump.jsonl" ]] || die "no dump in $W/dump: run mode=dump for $DATASET at this DUMP_KEY first"
     run_py "$mode" "$s"
 }
 
@@ -174,7 +234,7 @@ collect() {
     cp "$W/input/data/corpus/queries.jsonl" "$out/$LABEL/"
     cp "$W/input/data/corpus/test.tsv" "$out/$LABEL/qrels/"
     local f
-    for f in bench.log daemon.log env.txt; do [[ ! -f "$W/working/$f" ]] || cp "$W/working/$f" "$out/"; done
+    for f in bench.log daemon.log env.txt rerank.log dump.jsonl; do [[ ! -f "$W/working/$f" ]] || cp "$W/working/$f" "$out/"; done
 }
 
 merge() {
@@ -195,6 +255,18 @@ merge() {
     [[ -n "$data" && ${#parts[@]} -gt 0 ]] || die "no shard results in: $*"
     local result="$out/logs/results/$LABEL/$GIT7.json"
     python3 "$BEIR" merge --data "$data" --output "$result" "${parts[@]}"
+    if [[ "$mode" == dump ]]; then
+        # ^ W/dump: the windows and the run's own rankings (base), for the rerank runs.
+        rm -rf "$W/dump"
+        mkdir -p "$W/dump"
+        for s in "$@"; do [[ ! -f "$s/dump.jsonl" ]] || cat "$s/dump.jsonl" >> "$W/dump/dump.jsonl"; done
+        cp "$result.partial/hybrid.jsonl" "$W/dump/base.jsonl"
+        gzip -c "$W/dump/dump.jsonl" > "$out/dump.jsonl.gz"
+        cp "$W/dump/base.jsonl" "$out/"
+    fi
+    if [[ "$mode" == dump || "$mode" == rerank ]]; then
+        mode="$(cd "$result.partial" && ls -- *.jsonl | sed 's/\.jsonl$//' | paste -sd, -)"
+    fi
     # ^ Every query has a record, so run only computes the metrics (it never calls ir).
     python3 "$BEIR" run --data "$data" --collection "eval-$LABEL" --mode "$mode" --output "$result"
 }

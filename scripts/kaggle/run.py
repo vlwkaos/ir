@@ -6,7 +6,11 @@ os.environ.update({...}) line with IRK_DATASET, IRK_MODE, IRK_GIT7 (the git7 the
 bundle must have: a dataset version that is still processing mounts the old one),
 IRK_SIZE (bench.sh --size, seed 42) and IRK_PREPROCESSOR (alias, e.g. ko), all
 from scripts/kaggle/lib.sh dataset_spec. IRK_SHARD (i/N, bench.sh --shard) comes
-from scripts/eval-matrix.sh only.
+from scripts/eval-matrix.sh only, as do the reranker modes (research/reranker-eval.md):
+  IRK_MODE=dump    a hybrid run that writes each tier-2 window to WORKING/dump.jsonl
+                   (IR_RERANK_DUMP), then ranks it with IRK_RERANK_CONFIGS
+  IRK_MODE=rerank  no bench.sh: ranks IRK_RERANK_DUMP_DIR/{dump,base}.jsonl with IRK_RERANK_CONFIGS
+  IRK_RERANK_CONFIGS  JSON list of scripts/rerank-configs.json configs, each with its name
 
 Inputs, found by marker files anywhere under IRK_INPUT (default /kaggle/input):
   bundle   bundle.json + ir + bench scripts + libgomp.so.* (scripts/kaggle/bundle.sh)
@@ -127,6 +131,46 @@ def sh(cmd: str) -> str:
     return f"$ {cmd}\n{r.stdout}{r.stderr}"
 
 
+def tee(args: "list[str]", env: "dict[str, str]", logpath: Path, mode: str) -> int:
+    """Run args, copy its output to stdout and logpath; return its exit status."""
+    with open(logpath, mode, buffering=1) as f:
+        p = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in p.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            f.write(line)
+        return p.wait()
+
+
+def rerank(repo: Path, ir: Path, env: "dict[str, str]", data: Path, dump: Path, base: Path,
+           output: Path) -> int:
+    """beir-eval.py rerank: the IRK_RERANK_CONFIGS rows over a dump. Result partials next to
+    bench.sh's (output.partial/), so eval-matrix.sh merge joins both."""
+    configs = json.loads(os.environ.get("IRK_RERANK_CONFIGS") or "[]")
+    if not configs:
+        sys.exit("[irk] IRK_RERANK_CONFIGS is empty")
+    for f in (dump, base):
+        if not f.is_file():
+            sys.exit(f"[irk] rerank: no {f}")
+    for c in configs:
+        cenv = c.get("env", {})
+        model = cenv.get("IR_LISTWISE_MODEL")
+        if model and not Path(model).is_absolute():
+            d = one_dir(model, f"listwise model {model}")
+            if d is None:
+                sys.exit(f"[irk] listwise model {model} is not in the models input")
+            cenv["IR_LISTWISE_MODEL"] = str(d / model)
+    args = [sys.executable, str(repo / "scripts/beir-eval.py"), "rerank", "--ir-bin", str(ir),
+            "--data", str(data), "--collection", f"eval-{LABEL}", "--dump", str(dump),
+            "--base", str(base), "--configs", json.dumps(configs), "--output", str(output)]
+    if SHARD:
+        args += ["--shard", SHARD]
+    log(f"rerank: {', '.join(c['name'] for c in configs)}")
+    status = tee(args, env, WORKING / "rerank.log", "a")
+    log(f"rerank exit {status}")
+    return status
+
+
 def main() -> int:
     if not DATASET:
         sys.exit("[irk] IRK_DATASET is not set")
@@ -241,11 +285,19 @@ def main() -> int:
         env.update({"IR_FORCE_CPU_BACKEND": "1", "IR_GPU_LAYERS": "0",
                     "IR_DAEMON_REPLY_TIMEOUT": "1800", "IR_BENCH_QUERY_TIMEOUT": "1900"})
     env.update({f"IR_{kind.upper()}_MODEL": str(path) for kind, path in models.items()})
+    result_dir = repo / "logs/results" / LABEL
+    result_name = git7 + (".shard-{}-of-{}".format(*SHARD.split("/")) if SHARD else "") + ".json"
+    if MODE == "rerank":
+        dump_dir = Path(os.environ.get("IRK_RERANK_DUMP_DIR", ""))
+        return rerank(repo, ir, env, data, dump_dir / "dump.jsonl", dump_dir / "base.jsonl",
+                      result_dir / result_name)
+    if MODE == "dump":
+        env["IR_RERANK_DUMP"] = str(WORKING / "dump.jsonl")
     log(f"hashing {models['embedding'].name}")
     key = meta["index_key_src"] + f"dataset={LABEL}\nembedding_sha256={sha256(models['embedding'])}\n"
     if lindera is not None:
         key += install_preprocessor(lindera, ir, env)
-    args = ["bash", str(repo / "scripts/bench.sh"), DATASET, "--mode", MODE,
+    args = ["bash", str(repo / "scripts/bench.sh"), DATASET, "--mode", "hybrid" if MODE == "dump" else MODE,
             "--ir-bin", str(ir), "--git7", git7, "--data-dir", str(data)]
     if SIZE:
         args += ["--size", SIZE, "--seed", "42"]
@@ -268,13 +320,7 @@ def main() -> int:
             args += ["--index-out", str(out_index)]
 
     log("running: " + " ".join(args))
-    with open(WORKING / "bench.log", "w", buffering=1) as bench_log:
-        p = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        for line in p.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            bench_log.write(line)
-        status = p.wait()
+    status = tee(args, env, WORKING / "bench.log", "w")
 
     state = repo / ".bench-state/bench/xdg/ir"
     if (state / "daemon.log").is_file():
@@ -287,6 +333,9 @@ def main() -> int:
         (out_index / "INDEX_KEY").write_text(key)
         log(f"index: saved to {out_index} (upload as a new index dataset version)")
     log(f"bench.sh exit {status}")
+    if status == 0 and MODE == "dump":
+        status = rerank(repo, ir, env, data, WORKING / "dump.jsonl",
+                        result_dir / (result_name + ".partial") / "hybrid.jsonl", result_dir / result_name)
     return status
 
 

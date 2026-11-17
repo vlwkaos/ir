@@ -1,0 +1,23 @@
+{
+  "_doc": "Reranker configs of eval-matrix mode=dump|rerank (research/reranker-eval.md). models: GGUFs the seed job adds to the models cache, pinned by HF revision and sha256. configs: name -> window, from_dump (the dump's own pointwise scores, no model) and research env; IR_LISTWISE_MODEL names a file of models. dump: the configs a dump run ranks.",
+  "models": {},
+  "configs": {
+    "pw100": {
+      "window": 100,
+      "from_dump": true
+    },
+    "pw50": {
+      "window": 50,
+      "from_dump": true
+    },
+    "pw20": {
+      "window": 20,
+      "from_dump": true
+    }
+  },
+  "dump": [
+    "pw100",
+    "pw50",
+    "pw20"
+  ]
+}

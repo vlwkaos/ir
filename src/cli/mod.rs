@@ -238,6 +238,23 @@ pub enum Command {
         #[arg(long, requires = "http")]
         cors: Option<String>,
     },
+    /// Research: rank frozen tier-2 windows (IR_RERANK_DUMP lines) with the configured
+    /// reranker and search's own blend (research/reranker-eval.md)
+    #[command(hide = true)]
+    RerankEval {
+        /// IR_RERANK_DUMP lines; an `id` field is copied to the output
+        #[arg(long)]
+        input: PathBuf,
+        /// One JSON line per input line: id, window, ms, tokens, scores, blend (ranked paths)
+        #[arg(long)]
+        output: PathBuf,
+        /// Rerank the first N documents of each window
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        window: u64,
+        /// Use the scores and costs stored in the input; load no model
+        #[arg(long)]
+        from_dump: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

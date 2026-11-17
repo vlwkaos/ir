@@ -316,6 +316,11 @@ fn push_unique(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
     }
 }
 
+/// The tier-2 scorer of the daemon and `ir rerank-eval`.
+pub fn load_scorer() -> crate::error::Result<Box<dyn scoring::Scorer>> {
+    Ok(Box::new(reranker::Reranker::load_default()?))
+}
+
 /// Initialize the process-global llama.cpp backend. Safe to call from multiple models.
 /// Returns a &'static reference; the backend lives for the lifetime of the process.
 pub fn init_backend() -> crate::error::Result<&'static LlamaBackend> {

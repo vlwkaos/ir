@@ -27,6 +27,10 @@ const INHERITED_MODEL_ENV_VARS: &[&str] = &[
     "QMD_MODEL_DIRS",
 ];
 
+// ^ Research switches (research/reranker-eval.md) that write a dump; removed for every
+//   scenario, also those with real models. A scenario sets them explicitly.
+const RESEARCH_ENV_VARS: &[&str] = &["IR_RERANK_DUMP"];
+
 /// One isolated ir installation: its own config dir, no reachable models.
 pub struct Env {
     root: TempDir,
@@ -117,6 +121,9 @@ impl Env {
             .env_remove("IR_GRAPH_BUILD")
             .env_remove("IR_ANN")
             .env("IR_CONFIG_DIR", &self.config_dir);
+        for key in RESEARCH_ENV_VARS {
+            command.env_remove(key);
+        }
         if !self.real_models {
             for key in INHERITED_MODEL_ENV_VARS {
                 command.env_remove(key);

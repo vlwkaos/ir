@@ -614,13 +614,10 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
                 eprintln!("  note: reranker disabled via research override");
                 None
             } else {
-                crate::llm::reranker::Reranker::load_default()
+                crate::llm::load_scorer()
                     .map_err(|e| eprintln!("  note: reranker unavailable ({e})"))
                     .ok()
-                    .map(|r| {
-                        eprintln!("  reranker ready ({})", crate::llm::models::RERANKER);
-                        Box::new(r) as ScoBox
-                    })
+                    .inspect(|r| eprintln!("  reranker ready ({})", r.model_id()))
             };
             let allow_expand_without_scorer = config::env_flag("IR_ALLOW_EXPANSION_WITHOUT_SCORER");
             match (&exp, &rer) {

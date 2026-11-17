@@ -131,6 +131,12 @@ fn run() -> Result<()> {
             DaemonCmd::Status => daemon::status(),
         },
         Command::Preprocessor { cmd } => handle_preprocessor(cmd),
+        Command::RerankEval {
+            input,
+            output,
+            window,
+            from_dump,
+        } => search::rerank_eval::run(&input, &output, window as usize, from_dump),
         Command::Mcp { http, cors } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -643,6 +649,7 @@ pub(crate) fn search_core(
                 )
                 && (filter.is_empty() || bm25_results.len() >= limit)
             {
+                search::hybrid::dump_gate(query, "bm25-strong");
                 return Ok(bm25_results);
             }
         }
@@ -745,6 +752,7 @@ pub(crate) fn search_core(
             strong_signal_product,
         )
     {
+        // ^ No dump_gate here: the daemon's hybrid search already wrote the gate line.
         if verbosity.show_progress() {
             eprintln!();
         }

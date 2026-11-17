@@ -11,20 +11,42 @@ use llama_cpp_2::{
 };
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Instant;
 
 const MAX_DOC_CHARS: usize = 6000;
 
+/// Scores with the cost of each document, for reranker evaluation
+/// (`IR_RERANK_DUMP`, `ir rerank-eval`; research/reranker-eval.md).
+/// The cost of a shared prompt prefix is counted on the first document,
+/// so the cost of the first k documents is the sum of the first k entries.
+pub struct Costed {
+    pub scores: Vec<f64>,
+    pub doc_ms: Vec<f64>,
+    pub doc_tokens: Vec<usize>,
+}
+
 pub trait Scorer: Send + Sync {
-    fn score_batch(&self, query: &str, docs: &[&str]) -> Result<Vec<f64>>;
     fn model_id(&self) -> &str;
+    fn score_batch_costed(&self, query: &str, docs: &[&str]) -> Result<Costed>;
+    fn score_batch(&self, query: &str, docs: &[&str]) -> Result<Vec<f64>> {
+        self.score_batch_costed(query, docs).map(|c| c.scores)
+    }
+    /// True when a score depends on the query and that one document only, so `llm_cache`
+    /// may keep it. A listwise score depends on the other documents of the window.
+    fn cacheable(&self) -> bool {
+        true
+    }
 }
 
 impl<T: Scorer> Scorer for Arc<T> {
-    fn score_batch(&self, query: &str, docs: &[&str]) -> Result<Vec<f64>> {
-        (**self).score_batch(query, docs)
-    }
     fn model_id(&self) -> &str {
         (**self).model_id()
+    }
+    fn score_batch_costed(&self, query: &str, docs: &[&str]) -> Result<Costed> {
+        (**self).score_batch_costed(query, docs)
+    }
+    fn cacheable(&self) -> bool {
+        (**self).cacheable()
     }
 }
 
@@ -41,7 +63,7 @@ pub fn resolve_yes_no_tokens(model: &LlamaModel) -> Result<(i32, i32)> {
     Ok((yes_id, no_id))
 }
 
-/// Score a single (query, doc) pair using an existing context.
+/// Score a single (query, doc) pair using an existing context: (P(yes), prompt tokens decoded).
 /// Caller is responsible for clearing KV cache between calls.
 pub fn score_yes_no(
     ctx: &mut llama_cpp_2::context::LlamaContext,
@@ -51,7 +73,7 @@ pub fn score_yes_no(
     query: &str,
     doc: &str,
     ctx_size: u32,
-) -> Result<f64> {
+) -> Result<(f64, usize)> {
     let doc_truncated = if doc.len() > MAX_DOC_CHARS {
         &doc[..doc.floor_char_boundary(MAX_DOC_CHARS)]
     } else {
@@ -76,7 +98,7 @@ pub fn score_yes_no(
         .map_err(|e| Error::Other(format!("tokenize: {e}")))?;
 
     if tokens.is_empty() {
-        return Ok(0.0);
+        return Ok((0.0, 0));
     }
 
     let n = tokens.len().min(ctx_size as usize - 1);
@@ -105,7 +127,7 @@ pub fn score_yes_no(
     let max_logit = yes_logit.max(no_logit);
     let yes_exp = (yes_logit - max_logit).exp() as f64;
     let no_exp = (no_logit - max_logit).exp() as f64;
-    Ok(yes_exp / (yes_exp + no_exp))
+    Ok((yes_exp / (yes_exp + no_exp), n))
 }
 
 /// Score all docs against query using a new context (convenience wrapper).
@@ -120,12 +142,12 @@ pub fn score_batch_yes_no(
     ctx_size: u32,
 ) -> Result<Vec<f64>> {
     let mut ctx = create_scoring_context(model, backend, ctx_size)?;
-    score_batch_with_ctx(&mut ctx, model, yes_id, no_id, query, docs, ctx_size)
+    score_batch_with_ctx(&mut ctx, model, yes_id, no_id, query, docs, ctx_size).map(|c| c.scores)
 }
 
 /// Score all docs against query using a caller-provided context (avoids context creation overhead).
 /// Uses prefix caching: shared prompt prefix (system+instruct+query) is decoded once,
-/// then only doc-specific suffix is decoded per document.
+/// then only doc-specific suffix is decoded per document. The prefix cost goes to the first document.
 pub fn score_batch_with_ctx(
     ctx: &mut llama_cpp_2::context::LlamaContext,
     model: &LlamaModel,
@@ -134,10 +156,16 @@ pub fn score_batch_with_ctx(
     query: &str,
     docs: &[&str],
     ctx_size: u32,
-) -> Result<Vec<f64>> {
+) -> Result<Costed> {
+    let mut costed = Costed {
+        scores: Vec::with_capacity(docs.len()),
+        doc_ms: Vec::with_capacity(docs.len()),
+        doc_tokens: Vec::with_capacity(docs.len()),
+    };
     if docs.is_empty() {
-        return Ok(vec![]);
+        return Ok(costed);
     }
+    let t_prefix = Instant::now();
 
     // Build and decode the shared prefix once
     let prefix = format!(
@@ -157,13 +185,15 @@ pub fn score_batch_with_ctx(
     let prefix_len = prefix_tokens.len();
     if prefix_len == 0 {
         // Fallback to non-prefixed scoring
-        return docs
-            .iter()
-            .map(|doc| {
-                ctx.clear_kv_cache();
-                score_yes_no(ctx, model, yes_id, no_id, query, doc, ctx_size)
-            })
-            .collect();
+        for doc in docs {
+            let t0 = Instant::now();
+            ctx.clear_kv_cache();
+            let (score, tokens) = score_yes_no(ctx, model, yes_id, no_id, query, doc, ctx_size)?;
+            costed.scores.push(score);
+            costed.doc_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            costed.doc_tokens.push(tokens);
+        }
+        return Ok(costed);
     }
 
     // Decode prefix
@@ -178,9 +208,13 @@ pub fn score_batch_with_ctx(
         .map_err(|e| Error::Other(format!("decode prefix: {e}")))?;
 
     let suffix_template = "<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n";
+    let mut prefix_ms = t_prefix.elapsed().as_secs_f64() * 1000.0;
+    let mut prefix_tokens_left = prefix_len;
 
-    docs.iter()
-        .map(|doc| {
+    for doc in docs {
+        let t0 = Instant::now();
+        let mut doc_tokens = std::mem::take(&mut prefix_tokens_left);
+        let score = (|| -> Result<f64> {
             // Clear KV cache after prefix, keeping prefix entries
             let _ = ctx.clear_kv_cache_seq(Some(0), Some(prefix_len as u32), None);
 
@@ -206,6 +240,7 @@ pub fn score_batch_with_ctx(
                 return Ok(0.0);
             }
 
+            doc_tokens += suffix_n;
             let mut suffix_batch = LlamaBatch::new(suffix_n, 1);
             for (i, &tok) in suffix_tokens[..suffix_n].iter().enumerate() {
                 let pos = (prefix_len + i) as i32;
@@ -234,8 +269,14 @@ pub fn score_batch_with_ctx(
             let yes_exp = (yes_logit - max_logit).exp() as f64;
             let no_exp = (no_logit - max_logit).exp() as f64;
             Ok(yes_exp / (yes_exp + no_exp))
-        })
-        .collect()
+        })()?;
+        costed.scores.push(score);
+        costed
+            .doc_ms
+            .push(std::mem::take(&mut prefix_ms) + t0.elapsed().as_secs_f64() * 1000.0);
+        costed.doc_tokens.push(doc_tokens);
+    }
+    Ok(costed)
 }
 
 /// Create a reusable scoring context.

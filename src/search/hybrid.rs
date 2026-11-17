@@ -278,6 +278,7 @@ impl HybridSearch {
             && is_strong_signal(&fused, strong_signal_floor, strong_signal_product)
             && (req.filter.is_empty() || fused.len() >= req.limit)
         {
+            dump_gate(req.query, "fused-strong");
             let top = fused[0].score;
             let gap = fused.get(1).map(|r| top - r.score).unwrap_or(top);
             log.info(format!(
@@ -876,14 +877,18 @@ fn apply_min_score(
 fn rerank(
     scorer: &dyn Scorer,
     query: &str,
-    mut candidates: Vec<SearchResult>,
+    candidates: Vec<SearchResult>,
     dbs: &[CollectionDb],
     limit: usize,
     profile: &super::profile::RetrievalProfile,
     log: &mut Logger,
 ) -> Result<Vec<SearchResult>> {
     let top_n = candidates.len().min(profile.rerank_window);
-    let (to_rerank, rest) = candidates.split_at_mut(top_n);
+    let to_rerank = &candidates[..top_n];
+    // Research (research/reranker-eval.md): IR_RERANK_DUMP=<file> appends this query's window,
+    // its texts, scores and per-document cost. It skips the cache read so every cost is measured.
+    let dump = std::env::var_os("IR_RERANK_DUMP");
+    let read_cache = scorer.cacheable() && dump.is_none();
 
     // Build cache keys: sha256(model_id + "\0" + query + "\0" + content_hash)
     let mid = scorer.model_id();
@@ -895,7 +900,7 @@ fn rerank(
 
     // Batch-lookup cached scores (one query per collection DB)
     let mut cached_scores: HashMap<String, f64> = HashMap::new();
-    for db in dbs {
+    for db in dbs.iter().filter(|_| read_cache) {
         let keys_for_db: Vec<String> = to_rerank
             .iter()
             .zip(&cache_keys)
@@ -926,13 +931,16 @@ fn rerank(
     }
 
     // Score only uncached candidates
+    let mut texts: Vec<Option<String>> = Vec::new();
+    let mut costed = None;
     if !uncached_indices.is_empty() {
-        let texts: Vec<Option<String>> = uncached_indices
+        texts = uncached_indices
             .iter()
             .map(|&i| fetch_doc_text(dbs, &to_rerank[i].hash, &to_rerank[i].collection))
             .collect();
         let doc_refs: Vec<&str> = texts.iter().map(|t| t.as_deref().unwrap_or("")).collect();
-        let scores = scorer.score_batch(query, &doc_refs).unwrap_or_default();
+        costed = scorer.score_batch_costed(query, &doc_refs).ok();
+        let scores = costed.as_ref().map_or(&[][..], |c| &c.scores[..]);
 
         // Collect new entries to write to cache, grouped by collection
         let mut new_entries: HashMap<&str, Vec<(String, f64)>> = HashMap::new();
@@ -950,22 +958,118 @@ fn rerank(
         }
 
         // Write new scores to cache
-        for db in dbs {
+        for db in dbs.iter().filter(|_| scorer.cacheable()) {
             if let Some(entries) = new_entries.get(db.name.as_str()) {
                 db::put_rerank_scores(db.conn(), entries);
             }
         }
     }
 
-    // Blend scores
-    for (i, result) in to_rerank.iter_mut().enumerate() {
-        if let Some(rerank_score) = rerank_scores[i] {
+    if let Some(path) = &dump {
+        // ^ No cache read above: uncached_indices is 0..top_n, so texts[i] is window doc i.
+        let line = dump_line(
+            query,
+            mid,
+            &candidates,
+            top_n,
+            &texts,
+            &rerank_scores,
+            costed,
+            limit,
+            profile,
+        );
+        if let Some(e) = dump_append(path, &line) {
+            log.info(e);
+        }
+    }
+
+    Ok(blend(
+        candidates,
+        &rerank_scores,
+        profile.rerank_keep_window,
+        limit,
+    ))
+}
+
+/// One IR_RERANK_DUMP line: the input of `ir rerank-eval` (src/search/rerank_eval.rs).
+#[allow(clippy::too_many_arguments)]
+fn dump_line(
+    query: &str,
+    model: &str,
+    candidates: &[SearchResult],
+    top_n: usize,
+    texts: &[Option<String>],
+    scores: &[Option<f64>],
+    costed: Option<crate::llm::scoring::Costed>,
+    limit: usize,
+    profile: &super::profile::RetrievalProfile,
+) -> serde_json::Value {
+    let (doc_ms, doc_tokens) = costed.map_or((vec![], vec![]), |c| (c.doc_ms, c.doc_tokens));
+    let doc = |r: &SearchResult| serde_json::json!({"collection": r.collection, "path": r.path, "hash": r.hash, "fused": r.score});
+    let window: Vec<serde_json::Value> = candidates[..top_n]
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let mut d = doc(r);
+            d["text"] = serde_json::json!(texts[i]);
+            d["score"] = serde_json::json!(scores[i]);
+            d["ms"] = serde_json::json!(doc_ms.get(i));
+            d["tokens"] = serde_json::json!(doc_tokens.get(i));
+            d
+        })
+        .collect();
+    serde_json::json!({
+        "gate": "t2",
+        "query": query,
+        "model": model,
+        "limit": limit,
+        "keep_window": profile.rerank_keep_window,
+        "window": window,
+        "rest": candidates[top_n..].iter().map(doc).collect::<Vec<_>>(),
+    })
+}
+
+/// Appends one line to the IR_RERANK_DUMP file. Returns the error text on failure.
+fn dump_append(path: &std::ffi::OsStr, line: &serde_json::Value) -> Option<String> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()))
+        .err()
+        .map(|e| format!("rerank dump {}: {e}", path.to_string_lossy()))
+}
+
+/// Records in the IR_RERANK_DUMP file that a strong-signal shortcut answered `query` without
+/// tier 2 (`gate` = "bm25-strong" or "fused-strong"). A hybrid query with no dump line was
+/// answered by a fallback (cold daemon, tier-2 timeout), and the eval refuses it.
+pub fn dump_gate(query: &str, gate: &str) {
+    let Some(path) = std::env::var_os("IR_RERANK_DUMP") else {
+        return;
+    };
+    if let Some(e) = dump_append(&path, &serde_json::json!({"gate": gate, "query": query})) {
+        eprintln!("{e}");
+    }
+}
+
+/// ir's final order after reranking: fused×0.4 + rerank×0.6 for each scored document of the
+/// window (the first `scores.len()` candidates), then `limit`. Shared with `ir rerank-eval`,
+/// so an offline reranker evaluation ranks exactly as search does.
+pub(crate) fn blend(
+    mut candidates: Vec<SearchResult>,
+    scores: &[Option<f64>],
+    keep_window: bool,
+    limit: usize,
+) -> Vec<SearchResult> {
+    let (to_rerank, rest) = candidates.split_at_mut(scores.len());
+    for (result, score) in to_rerank.iter_mut().zip(scores) {
+        if let Some(rerank_score) = score {
             result.score = result.score * 0.4 + rerank_score * 0.6;
         }
     }
 
     let mut all: Vec<SearchResult>;
-    if profile.rerank_keep_window {
+    if keep_window {
         // keep-window (profile; env override IR_RERANK_KEEP_WINDOW): judged docs
         // always outrank the un-judged tail; the blend only orders WITHIN the
         // window. Avoids
@@ -978,15 +1082,11 @@ fn rerank(
         all = win;
         all.extend(rest.iter().cloned());
     } else {
-        all = to_rerank
-            .iter()
-            .cloned()
-            .chain(rest.iter().cloned())
-            .collect();
+        all = candidates;
         SearchResult::sort_desc(&mut all);
     }
     all.truncate(limit);
-    Ok(all)
+    all
 }
 
 fn fetch_doc_text(dbs: &[CollectionDb], hash: &str, collection: &str) -> Option<String> {
