@@ -23,8 +23,14 @@ flowchart LR
 2. `gh workflow run eval-matrix.yml -f dataset=<ds> -f mode=hybrid -f shards=20`.
 3. A failed or timed-out shard: "Re-run failed jobs". Each shard saves its `llm_cache` to `actions/cache`
    even on failure and the rerun restores it; a new dispatch with the same `RERANK_KEY` restores the last merge.
+   A "Re-run failed jobs" can fail to start: attempt 2 of run 44118100411 ended `startup_failure`
+   with 0 jobs in 4 s, and after it `gh run rerun --job 134177104387` answers "cannot be rerun"
+   (GitHub documents no cause; the branch had been force-pushed past the run's SHA). So mode=rerank
+   does not rely on reruns: a new dispatch reuses each finished shard (`rr_saved`, below).
 4. Shard+merge check after a change to sharding: `mode=bm25 shards=3` must equal `eval-kaggle.yml mode=bm25`
    on all 7 metrics (scifact nDCG@10 0.6912).
+5. Reranker rows (research/reranker-eval.md): `mode=dump` once per index and code, then
+   `mode=rerank -f configs="<names>"` per new reranker config.
 
 ## How it works
 
@@ -34,6 +40,18 @@ flowchart LR
 - **Reuse.** The `llm_cache` key (`src/search/hybrid.rs`) misses the prompt template, `MAX_DOC_CHARS` and
   model bytes, so rows move between runs only under `RERANK_KEY` (sha256 of the reranker GGUF + `scoring.rs`
   + `reranker.rs`, computed once by seed); `rerank_cache` drops rows stamped with another key.
+- **Rerank shards** (mode=rerank). A finished shard saves its partials in `W/llm-cache/rr/<key>/i-of-N`
+  (key: dump, configs with their models, ranking code); merge carries all of them into the merged
+  `llm_cache` entry, and a new dispatch restores them and runs only shards without one.
+  Proof: run 44164412028 dispatched again the configs of fiqa run 44142388088. All 20 shards logged
+  "reusing the partials of an earlier run", ran no query and took 16-68 s each, against 57-82 min
+  per shard in the first run. The merged rows are equal.
+- **Cache egress.** The account has an undocumented `actions/cache` egress limit. Run 44118100411
+  restored 134.2 GB (20 shards × 6.39 GB: models 6.28 GB with three listwise GGUFs, data 81 MB, dump
+  27 MB, llm_cache 5 MB, plus seed); shard 18 (job 134177104387) hit "Egress is over the account
+  limit" and fail-on-cache-miss ended it before any query. Since then a rerank run caches no model
+  (`eval-models-none`): each shard downloads its pinned GGUFs from Hugging Face and checks the
+  sha256 (`fetch_models`), so a run restores about 2.3 GB (20 × 113 MB + seed).
 - **Proof** (run 43670392239, a one-time probe in the x64 Kaggle job): bm25 on 3 shards merged = unsharded
   on all 7 metrics (nDCG@10 0.6912); a rerun of hybrid shard 1/20 added 0 `llm_cache` rows (400 → 400),
   1187 s → 3 s.

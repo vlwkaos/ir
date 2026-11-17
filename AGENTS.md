@@ -39,7 +39,7 @@ Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
 - When a scenario covers what an in-crate test checks, delete the in-crate test in the same change.
 - Scenarios that need a real daemon go in `tests/e2e_daemon.rs`, are `#[ignore]`d, and use `Env::with_real_models`. Run them in your own terminal, never from a sandboxed shell.
 - The oracle for "indexed" is a real BM25 search (`Env::bm25_paths`), never a row count.
-- Scenarios must not load a model: `Env` points model lookups at an invalid path. The only exception is `tests/e2e_daemon.rs`.
+- Scenarios must not load a model: `Env` points model lookups at an invalid path. The only exceptions are `tests/e2e_daemon.rs` and `tests/e2e_listwise.rs` (research scorer: needs `IR_LISTWISE_MODEL`, and CI does not run it).
 
 ## Environment Variables
 
@@ -89,6 +89,9 @@ Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
 | `IR_BENCH_MAX_SWAPOUT_DELTA` | `65536` | Research: bench watchdog tolerance (pages, ~1 GiB) for benign system swapout drift before abort; `free_pct` floor still guards real exhaustion. Set `0` for strictest pristine-latency runs (bench-env.sh) |
 | `IR_DAEMON_REPLY_TIMEOUT` | `120` | Research: seconds a search client waits for the daemon's reply before it falls back to the results it has (silently under `-q`). Raised by `scripts/kaggle/run.py` on CPU-only Kaggle sessions |
 | `IR_BENCH_QUERY_TIMEOUT` | `60` | Research: `scripts/beir-eval.py` seconds per query; a failed query scores as an empty ranking and counts in `failed_queries` |
+| `IR_RERANK_DUMP` | unset | Research: file that every tier-2 query appends its window to (texts, fused and reranker scores, per-doc ms and tokens), and that a strong-signal shortcut appends a gate line to; skips the `llm_cache` read. Input of `ir rerank-eval` (research/reranker-eval.md) |
+| `IR_LISTWISE_MODEL` | unset | Research: instruct GGUF, or a `vllm-d3` / `lfm2-d1` decision GGUF (prompt picked from its `<arch>.decision.type`); wins over `IR_COMBINED_MODEL`; the daemon and `ir rerank-eval` use the listwise scorer (`src/llm/listwise.rs`) instead of the pointwise reranker |
+| `IR_LISTWISE_N` / `_TRUNC` / `_SHUFFLES` / `_STRIDE` | `20` / `160` / `1` / `N/2` | Research: listwise passages per prompt (2-26), tokens kept per passage, passage orders averaged, sliding-window step |
 
 Config dir precedence: `IR_CONFIG_DIR` → `XDG_CONFIG_HOME/ir` (deprecated) → `~/.config/ir`
 
