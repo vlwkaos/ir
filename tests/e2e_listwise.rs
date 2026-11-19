@@ -4,6 +4,10 @@
 // scenario also loads the real embedding model):
 //
 //   IR_LISTWISE_MODEL=<instruct.gguf> cargo test --test e2e_listwise -- --ignored
+//
+// The Laya scenarios need IR_LAYA_MODEL (ggml-org/Laya-GGUF, llama.cpp decision type `laya`):
+//
+//   IR_LAYA_MODEL=<Laya-Q8_0.gguf> cargo test --test e2e_listwise laya -- --ignored
 
 mod support;
 
@@ -15,36 +19,51 @@ use support::{Env, eventually, write};
 const QUERY: &str = "how does a rocket reach orbit";
 const ANSWER: &str = "e.md";
 
+fn model_from(var: &str, hint: &str) -> String {
+    std::env::var(var).unwrap_or_else(|_| panic!("set {var} to {hint}"))
+}
+
 fn model() -> String {
-    std::env::var("IR_LISTWISE_MODEL")
-        .expect("set IR_LISTWISE_MODEL to an instruct GGUF (for example Qwen3-0.6B-Q8_0.gguf)")
+    model_from(
+        "IR_LISTWISE_MODEL",
+        "an instruct GGUF (for example Qwen3-0.6B-Q8_0.gguf)",
+    )
+}
+
+fn laya_model() -> String {
+    model_from("IR_LAYA_MODEL", "Laya-Q8_0.gguf (ggml-org/Laya-GGUF)")
 }
 
 /// The answer is last in fused order, so a scorer that keeps the input order fails.
 fn window() -> Value {
-    let docs = [
-        (
-            "a.md",
-            "The cat purrs on the sofa and naps in the warm afternoon sun.",
-        ),
-        (
-            "b.md",
-            "Sourdough bread needs a starter, flour, water, salt and a long rise.",
-        ),
-        (
-            "c.md",
-            "The river floods the valley every spring after the mountain snow thaws.",
-        ),
-        (
-            "d.md",
-            "Tomatoes grow best in full sun with regular watering and stakes.",
-        ),
-        (
-            ANSWER,
-            "A rocket reaches orbit by burning its engines to climb above the atmosphere and then \
+    window_of(&DOCS)
+}
+
+const DOCS: [(&str, &str); 5] = [
+    (
+        "a.md",
+        "The cat purrs on the sofa and naps in the warm afternoon sun.",
+    ),
+    (
+        "b.md",
+        "Sourdough bread needs a starter, flour, water, salt and a long rise.",
+    ),
+    (
+        "c.md",
+        "The river floods the valley every spring after the mountain snow thaws.",
+    ),
+    (
+        "d.md",
+        "Tomatoes grow best in full sun with regular watering and stakes.",
+    ),
+    (
+        ANSWER,
+        "A rocket reaches orbit by burning its engines to climb above the atmosphere and then \
              accelerating sideways to about 7.8 km/s, fast enough that it keeps falling around Earth.",
-        ),
-    ];
+    ),
+];
+
+fn window_of(docs: &[(&str, &str)]) -> Value {
     let window: Vec<Value> = docs
         .iter()
         .enumerate()
@@ -53,21 +72,31 @@ fn window() -> Value {
                    "text": text, "score": null, "ms": null, "tokens": null})
         })
         .collect();
-    json!({"gate": "t2", "id": "q", "query": QUERY, "model": "m", "limit": 5,
+    json!({"gate": "t2", "id": "q", "query": QUERY, "model": "m", "limit": docs.len(),
            "keep_window": true, "window": window, "rest": []})
 }
 
 /// Runs `ir rerank-eval` with the listwise scorer; returns (ok, output row, stderr).
 fn rerank(env: &Env, vars: &[(&str, &str)]) -> (bool, Value, String) {
+    rerank_window(env, &model(), &window(), vars)
+}
+
+fn rerank_window(
+    env: &Env,
+    model: &str,
+    window: &Value,
+    vars: &[(&str, &str)],
+) -> (bool, Value, String) {
     let input = env.path("in.jsonl");
     let output = env.path("out.jsonl");
-    fs::write(&input, format!("{}\n", window())).unwrap();
+    fs::write(&input, format!("{window}\n")).unwrap();
     let _ = fs::remove_file(&output);
+    let size = window["window"].as_array().map_or(0, Vec::len).to_string();
     let mut command = env.ir();
-    command.env("IR_LISTWISE_MODEL", model()).args([
+    command.env("IR_LISTWISE_MODEL", model).args([
         "rerank-eval",
         "--window",
-        "5",
+        &size,
         "--input",
         input.to_str().unwrap(),
         "--output",
@@ -224,4 +253,68 @@ fn search_daemon_reranks_with_the_listwise_scorer_over_combined_mode() {
         .expect("the search dumped its tier-2 window");
     let scorer = line["model"].as_str().unwrap_or_default();
     assert!(scorer.starts_with("listwise:"), "tier 2 used {scorer}");
+}
+
+/// The prompts IR_LISTWISE_PROMPTS printed: (marker positions, text with special tokens).
+fn prompts(stderr: &str) -> Vec<(Vec<usize>, String)> {
+    stderr
+        .split("[listwise prompt] markers=")
+        .skip(1)
+        .map(|p| {
+            let (markers, rest) = p.split_once('\n').unwrap();
+            let text = rest.split("\n[/listwise prompt]").next().unwrap();
+            let markers = serde_json::from_str(markers).unwrap();
+            (markers, text.to_string())
+        })
+        .collect()
+}
+
+/// Laya reads llama.cpp's systemone layout (GGUF `tokenizer.chat_template.systemone`, d812350):
+/// `[CLS]choice question: Q[SEP]`, `[MASK] passage` per option, `[SEP]state[SEP]`, and one score
+/// per `[MASK]` from the decision head. The answer, last in fused order, scores highest. Five
+/// short passages fit the head whole, though the default N (20) would not.
+#[test]
+#[ignore = "loads IR_LAYA_MODEL"]
+fn laya_scores_each_passage_at_its_mask_marker() {
+    let env = Env::new("e2e-listwise-laya");
+    let vars = [("IR_LISTWISE_PROMPTS", "1")];
+    let (ok, row, stderr) = rerank_window(&env, &laya_model(), &window(), &vars);
+    assert!(ok, "{stderr}");
+    let options: String = DOCS
+        .iter()
+        .map(|(_, text)| format!("[MASK] {text}"))
+        .collect();
+    let expected = format!(
+        "[CLS]choice question: Which passage best answers the search query?[SEP]{options}\
+         [SEP]Search query: {QUERY}[SEP]"
+    );
+    let prompts = prompts(&stderr);
+    assert_eq!(prompts.len(), 1, "{stderr}");
+    assert_eq!(prompts[0].1, expected);
+    assert_eq!(prompts[0].0.len(), 5, "{stderr}");
+    assert_eq!(top(&row), ANSWER, "{row}");
+}
+
+/// Options that overflow Laya's head budget (GGUF `decision.max_head_tokens`, 192 for English
+/// Laya) are cut evenly, as llama.cpp's `fill_task_laya` does: 20 long passages keep
+/// (192 - 16) / 20 = 8 tokens each, the marker included.
+#[test]
+#[ignore = "loads IR_LAYA_MODEL"]
+fn laya_cuts_options_to_its_head_budget() {
+    let env = Env::new("e2e-listwise-laya-cut");
+    let long =
+        "Rockets burn fuel to climb and then accelerate sideways to orbital speed. ".repeat(8);
+    let docs: Vec<(String, &str)> = (0..20)
+        .map(|i| (format!("{i}.md"), long.as_str()))
+        .collect();
+    let docs: Vec<(&str, &str)> = docs.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+    let vars = [("IR_LISTWISE_PROMPTS", "1")];
+    let (ok, row, stderr) = rerank_window(&env, &laya_model(), &window_of(&docs), &vars);
+    assert!(ok, "{stderr}");
+    assert_eq!(row["scores"].as_array().map(Vec::len), Some(20), "{row}");
+    let prompts = prompts(&stderr);
+    assert_eq!(prompts.len(), 1, "{stderr}");
+    let markers = &prompts[0].0;
+    assert_eq!(markers.len(), 20, "{stderr}");
+    assert!(markers.windows(2).all(|w| w[1] - w[0] == 8), "{markers:?}");
 }

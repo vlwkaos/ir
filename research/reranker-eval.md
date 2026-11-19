@@ -54,26 +54,93 @@ IR_LISTWISE_MODEL=<gguf> ir rerank-eval --input dump.jsonl --output out.jsonl --
 
 ## Listwise scorer (`src/llm/listwise.rs`)
 
-N passages, labeled A..Z, go in one prompt. The scores come from the label-token logits at the
-answer position (FIRST, arXiv 2406.15657). A window longer than N slides from the tail
-(RankGPT). The score is 1 - rank/M. Pointwise stays the default. The prompt follows the GGUF's
-`<arch>.decision.type` (research/decision-models.md):
+N passages go in one prompt, and one forward pass scores them all (FIRST, arXiv 2406.15657). A
+window longer than N slides from the tail (RankGPT). The score is 1 - rank/M. Pointwise stays the
+default. The GGUF's `<arch>.decision.type` picks the model family (research/decision-models.md).
+A family is three parts: the prompt layout (`Layout`), how a score is read (`Readout`), and the
+limits it declares (`max_n`, and the default passage cut `Family::trunc`). The window, shuffle
+and context code reads only these, so a new family is one `Layout` variant and one `detect` arm,
+plus a `Readout` variant only when it reads scores a new way.
 
-| Type | Models | Prompt | Label logit |
-|---|---|---|---|
-| none | instruct (Qwen3) | the GGUF's chat template, `[A] passage` | `A` |
-| `vllm-d3` | d3-lite, d3-nano | d3_format.py: system prompt, `State:` query, `A: passage` | `A` |
-| `lfm2-d1` | d1-3B | prompt.py: no system, `QUESTION:`, `A passage` | max of `A`, ` A` |
+| Type | Models | Prompt | Readout | Max N |
+|---|---|---|---|---|
+| none | instruct (Qwen3) | the GGUF's chat template, `[A] passage` | logit of `A` at the last token | 26 |
+| `vllm-d3` | d3-lite, d3-nano | d3_format.py: system prompt, `State:` query, `A: passage` | logit of `A` | 26 |
+| `lfm2-d1` | d1-3B | prompt.py: no system, `QUESTION:`, `A passage` | max of `A`, ` A` | 26 |
+| `laya` | Laya (ModernBERT encoder) | `[CLS]choice question: Q[SEP]`, `[MASK] passage` per option, `[SEP]Search query: q[SEP]` | decision head column 0 at each `[MASK]`, softmax with the GGUF's temperature for that many options | 20 |
 
-d3's full-attention layers are non-causal (GGUF `attention.causal = false`), and libllama at
-the llama-cpp-2 0.1.145 commit applies that key itself. So every prompt decodes in one batch
-(`n_ubatch` = context): with `n_ubatch` 64, d3-lite hits llama.cpp's assert "non-causal
-attention requires n_ubatch >= n_tokens", and Qwen3 does not. Not in that commit: llama.cpp
-#28068 (Gated DeltaNet normalization), so qwen35 scores can differ slightly from the reference.
+The Laya prompt is a port of llama.cpp d812350: the GGUF template
+`tokenizer.chat_template.systemone` (written by `conversion/bert.py`) and
+`tools/server/server-decision.cpp` `fill_task_laya`. The question and all options share the head's
+`decision.max_head_tokens` (192 for English Laya, 256 for laya-multilingual). Each option keeps at
+most 48 tokens after its marker; when the options do not fit, each keeps
+max(4, (head - 16) / N) tokens with its marker. So at N = 20 an English option keeps 7 passage
+tokens and a multilingual one 11. Without `IR_LISTWISE_TRUNC`, Laya cuts passages to 48 tokens
+first, and the head budget then cuts them for the number of options in each prompt.
+The passage's own text replaces the option label: Laya needs no label, and the label would cost
+head tokens.
+
+llama-cpp-2 is 0.1.160, the first release that bundles llama.cpp d812350, which has the decision
+head (PR 29818). libllama applies the GGUF `attention.causal = false` key itself (d3's
+full-attention layers, ModernBERT). So every prompt decodes in one batch (`n_ubatch` = context):
+with `n_ubatch` 64, d3-lite hits llama.cpp's assert "non-causal attention requires n_ubatch >=
+n_tokens", and Qwen3 does not.
 
 Observed in development (Qwen3-0.6B Q8, Metal): the model favors label A strongly. With two
 passages it picks A in both orders (logit 34.5 vs 32.8), and `IR_LISTWISE_SHUFFLES=2` fixes
 that case. One 5-passage prompt takes about 80-200 ms.
+
+### llama-cpp-2 0.1.145 to 0.1.160: speed and scores
+
+20 frozen scifact tier-2 windows, N = 20, `IR_LISTWISE_TRUNC=160`, window 20, Mac Metal, 3
+interleaved runs per row. `before` = main's listwise.rs on 0.1.145; `refactor` = the family
+split on 0.1.145; `split + 0.1.160` = the family split on 0.1.160. Max |Δscore| and same order
+compare with the first `before` run. This table mixes the two changes; the next one separates them.
+
+| Model | Binary | Max \|Δscore\| | Same order | Median ms / window (min-max) |
+|---|---|---|---|---|
+| Qwen3-0.6B | before | 0 | 20/20 | 2069 (2001-2076) |
+| Qwen3-0.6B | refactor | 0 | 20/20 | 1872 (1843-2002) vs 1933 (1867-1968) |
+| Qwen3-0.6B | split + 0.1.160 | 0.05 | 17/20 | 2025 (1981-2154) |
+| d3-lite | before | 0 | 20/20 | 3622 (3018-3682) |
+| d3-lite | refactor | 0 | 20/20 | 2772 (2733-2807) vs 2748 (2651-2931) |
+| d3-lite | split + 0.1.160 | 0.05 | 18/20 | 2950 (2633-3510) |
+| d1-3B | before | 0 | 20/20 | 34780 (25229-36213) |
+| d1-3B | split + 0.1.160 | 0.05 | 19/20 | 30610 (28314-37551) |
+
+- 0.05 = 1/20 is one adjacent rank swap. It comes from the new llama.cpp kernels, not ir code.
+
+Family split alone on 0.1.160: 759b681 (the bump, main's listwise.rs) against bebe29a (the
+split), the same 20 windows and settings, 3 runs each, the two binaries interleaved and their
+order swapped per run. Max |Δscore| and same order compare with the first 759b681 run. d1-3B
+not run (about 9 min per run).
+
+| Model | Binary | Max \|Δscore\| | Same order | Median ms / window (min-max) | Tokens |
+|---|---|---|---|---|---|
+| Qwen3-0.6B | 759b681 | 0 | 20/20 ×3 | 1901 (1874-1943) | 65536 |
+| Qwen3-0.6B | bebe29a | 0 | 20/20 ×3 | 1891 (1866-1925) | 65536 |
+| d3-lite | 759b681 | 0 | 20/20 ×3 | 2591 (2548-2610) | 65965 |
+| d3-lite | bebe29a | 0 | 20/20 ×3 | 2614 (2563-2623) | 65965 |
+
+- The family split changes no score and no prompt token. Its speed is within the run spread:
+  -0.5% for Qwen3 and +0.9% for d3-lite, and the ranges overlap. The `refactor` rows show the
+  same on 0.1.145.
+- Laya (English, 449 MB) ranks one 20-passage scifact window in 327 ms with 183 tokens.
+
+### laya-multilingual conversion
+
+`convert_hf_to_gguf.py` at d812350 (its pinned transformers 4.57.6) fails on
+convaiinnovations/laya-multilingual rev 92d22143, after the tensors export:
+
+```
+conversion/base.py:1588 AutoTokenizer.from_pretrained(self.dir_model)
+transformers/tokenization_utils_base.py:1210
+AttributeError: 'list' object has no attribute 'keys'
+```
+
+First cause: `tokenizer/tokenizer_config.json:6` writes `extra_special_tokens` as a list, the
+transformers 5.0.0 format (`encoder/config.json:77`). Transformers 4.57.6 expects a dict. No
+GGUF, so no miracl-ko row for it.
 
 ## Results
 

@@ -186,6 +186,20 @@ pub fn tokenize(
     model.vocab().tokenize(text.as_bytes(), add_bos, true)
 }
 
+/// Text of `tokens`; `special` renders special tokens (`<|im_start|>`) instead of dropping them.
+pub fn detokenize(
+    model: &llama_cpp_2::model::LlamaModel,
+    tokens: &[llama_cpp_2::token::LlamaToken],
+    special: bool,
+) -> String {
+    let vocab = model.vocab();
+    let mut bytes = Vec::new();
+    for &t in tokens {
+        vocab.token_to_piece_into(t, &mut bytes, special, None);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Build model-load params with runtime defaults.
 ///
 /// If `IR_GPU_LAYERS=0` (or `IR_FORCE_CPU_BACKEND=1`), pin to CPU backend devices.

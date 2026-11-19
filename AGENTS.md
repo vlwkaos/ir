@@ -90,8 +90,9 @@ Results cached at `logs/results/{dataset}/{git7}.json` (gitignored).
 | `IR_DAEMON_REPLY_TIMEOUT` | `120` | Research: seconds a search client waits for the daemon's reply before it falls back to the results it has (silently under `-q`). Raised by `scripts/kaggle/run.py` on CPU-only Kaggle sessions |
 | `IR_BENCH_QUERY_TIMEOUT` | `60` | Research: `scripts/beir-eval.py` seconds per query; a failed query scores as an empty ranking and counts in `failed_queries` |
 | `IR_RERANK_DUMP` | unset | Research: file that every tier-2 query appends its window to (texts, fused and reranker scores, per-doc ms and tokens), and that a strong-signal shortcut appends a gate line to; skips the `llm_cache` read. Input of `ir rerank-eval` (research/reranker-eval.md) |
-| `IR_LISTWISE_MODEL` | unset | Research: instruct GGUF, or a `vllm-d3` / `lfm2-d1` decision GGUF (prompt picked from its `<arch>.decision.type`); wins over `IR_COMBINED_MODEL`; the daemon and `ir rerank-eval` use the listwise scorer (`src/llm/listwise.rs`) instead of the pointwise reranker |
-| `IR_LISTWISE_N` / `_TRUNC` / `_SHUFFLES` / `_STRIDE` | `20` / `160` / `1` / `N/2` | Research: listwise passages per prompt (2-26), tokens kept per passage, passage orders averaged, sliding-window step |
+| `IR_LISTWISE_MODEL` | unset | Research: instruct GGUF, or a `vllm-d3` / `lfm2-d1` / `laya` decision GGUF (family picked from its `<arch>.decision.type`); wins over `IR_COMBINED_MODEL`; the daemon and `ir rerank-eval` use the listwise scorer (`src/llm/listwise.rs`) instead of the pointwise reranker |
+| `IR_LISTWISE_N` / `_TRUNC` / `_SHUFFLES` / `_STRIDE` | `20` / `160` / `1` / `N/2` | Research: listwise passages per prompt (2 to the family's maximum: 26, Laya 20), tokens kept per passage (Laya default: 48, then cut to its head budget), passage orders averaged, sliding-window step |
+| `IR_LISTWISE_PROMPTS` | unset | Research: print each listwise prompt as the model reads it (special tokens shown) and its marker positions to stderr |
 
 Config dir precedence: `IR_CONFIG_DIR` → `XDG_CONFIG_HOME/ir` (deprecated) → `~/.config/ir`
 
