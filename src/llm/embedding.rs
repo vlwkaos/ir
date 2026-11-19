@@ -14,7 +14,7 @@ use llama_cpp_2::{
     context::LlamaContext,
     context::params::{LlamaContextParams, LlamaPoolingType},
     llama_batch::LlamaBatch,
-    model::{AddBos, LlamaModel},
+    model::LlamaModel,
 };
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -225,10 +225,7 @@ impl Embedder {
     fn embed_with_context(&self, ctx: &mut LlamaContext<'_>, text: &str) -> Result<Vec<f32>> {
         ctx.clear_kv_cache();
 
-        let tokens = self
-            .model
-            .str_to_token(text, AddBos::Always)
-            .map_err(|e| Error::Other(format!("tokenize: {e}")))?;
+        let tokens = crate::llm::tokenize(&self.model, text, true);
 
         let dim = self.embedding_dim();
         if tokens.is_empty() {

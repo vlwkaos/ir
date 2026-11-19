@@ -15,10 +15,9 @@
 use crate::error::{Error, Result};
 use crate::llm::scoring::{self, Costed, Scorer};
 use crate::llm::{LlamaBackend, model_load_params};
-use llama_cpp_2::TokenToStringError;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
+use llama_cpp_2::model::{LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -145,19 +144,14 @@ impl Listwise {
                 )));
             }
         };
-        let token = |text: &str| -> Result<Option<i32>> {
-            let toks = model
-                .str_to_token(text, AddBos::Never)
-                .map_err(|e| Error::Other(format!("tokenize label {text:?}: {e}")))?;
-            Ok(match toks[..] {
-                [t] => Some(t.0),
-                _ => None,
-            })
+        let token = |text: &str| match crate::llm::tokenize(&model, text, false)[..] {
+            [t] => Some(t.0),
+            _ => None,
         };
         let mut labels = Vec::with_capacity(cfg.n);
         for &l in &LABELS[..cfg.n] {
             let label = (l as char).to_string();
-            let Some(t) = token(&label)? else {
+            let Some(t) = token(&label) else {
                 return Err(Error::Other(format!(
                     "label {label} is not one token in {}; listwise needs one token per label",
                     path.display()
@@ -165,7 +159,7 @@ impl Listwise {
             };
             let mut ids = vec![t];
             if matches!(format, Format::D1) {
-                ids.extend(token(&format!(" {label}"))?);
+                ids.extend(token(&format!(" {label}")));
             }
             labels.push(ids);
         }
@@ -192,20 +186,11 @@ impl Listwise {
     fn truncate(&self, doc: &str, n: usize) -> Result<String> {
         // ^ Bound the tokenizer's work: tokens average far fewer than 16 bytes.
         let cut = &doc[..doc.floor_char_boundary(n * 16)];
-        let toks = self
-            .model
-            .str_to_token(cut, AddBos::Never)
-            .map_err(|e| Error::Other(format!("tokenize passage: {e}")))?;
+        let toks = crate::llm::tokenize(&self.model, cut, false);
+        let vocab = self.model.vocab();
         let mut bytes = Vec::new();
         for &t in toks.iter().take(n) {
-            // ^ A merged run of spaces or dashes can be longer than 64 bytes: retry at its size.
-            let piece = match self.model.token_to_piece_bytes(t, 64, false, None) {
-                Err(TokenToStringError::InsufficientBufferSpace(need)) => self
-                    .model
-                    .token_to_piece_bytes(t, need.unsigned_abs() as usize, false, None),
-                r => r,
-            };
-            bytes.extend(piece.map_err(|e| Error::Other(format!("detokenize passage: {e}")))?);
+            vocab.token_to_piece_into(t, &mut bytes, false, None);
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
@@ -279,10 +264,7 @@ impl Listwise {
         query: &str,
         passages: &[&str],
     ) -> Result<(Vec<f64>, usize)> {
-        let tokens = self
-            .model
-            .str_to_token(&self.prompt(query, passages)?, AddBos::Never)
-            .map_err(|e| Error::Other(format!("tokenize prompt: {e}")))?;
+        let tokens = crate::llm::tokenize(&self.model, &self.prompt(query, passages)?, false);
         if tokens.len() >= self.ctx_size as usize {
             return Err(Error::Other(format!(
                 "listwise prompt has {} tokens, context {}",

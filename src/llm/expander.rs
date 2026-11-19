@@ -9,7 +9,7 @@
 
 use crate::error::{Error, Result};
 use crate::llm::{LlamaBackend, env, model_load_params, models};
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 // Note: grammar-constrained sampling (GBNF) is intentionally not used here.
 // llama_grammar_reject_candidates has an assertion failure with this llama.cpp version
 // when applied to the qmd-query-expansion model. Free-form sampling + parse + fallback
@@ -82,7 +82,7 @@ impl Expander {
             &crate::llm::generate::GenerateParams {
                 ctx_size: CONTEXT_SIZE,
                 max_tokens: MAX_OUTPUT_TOKENS,
-                add_bos: AddBos::Always,
+                add_bos: true,
                 temp: 0.7,
                 top_k: 20,
                 top_p: 0.8,

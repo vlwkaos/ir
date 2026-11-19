@@ -5,9 +5,7 @@
 use crate::error::{Error, Result};
 use crate::llm::LlamaBackend;
 use llama_cpp_2::{
-    context::params::LlamaContextParams,
-    llama_batch::LlamaBatch,
-    model::{AddBos, LlamaModel},
+    context::params::LlamaContextParams, llama_batch::LlamaBatch, model::LlamaModel,
 };
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -52,12 +50,8 @@ impl<T: Scorer> Scorer for Arc<T> {
 
 /// Resolve yes/no token IDs from model vocabulary. Uses last subword token of each.
 pub fn resolve_yes_no_tokens(model: &LlamaModel) -> Result<(i32, i32)> {
-    let yes_tokens = model
-        .str_to_token("Yes", AddBos::Never)
-        .map_err(|e| Error::Other(format!("tokenize 'Yes': {e}")))?;
-    let no_tokens = model
-        .str_to_token("No", AddBos::Never)
-        .map_err(|e| Error::Other(format!("tokenize 'No': {e}")))?;
+    let yes_tokens = crate::llm::tokenize(model, "Yes", false);
+    let no_tokens = crate::llm::tokenize(model, "No", false);
     let yes_id = yes_tokens.last().map(|t| t.0).unwrap_or(0);
     let no_id = no_tokens.last().map(|t| t.0).unwrap_or(1);
     Ok((yes_id, no_id))
@@ -93,9 +87,8 @@ pub fn score_yes_no(
          </think>\n"
     );
 
-    let tokens = model
-        .str_to_token(&prompt, AddBos::Never) // ! ChatML starts with <|im_start|>; extra BOS confuses model
-        .map_err(|e| Error::Other(format!("tokenize: {e}")))?;
+    // ! ChatML starts with <|im_start|>; extra BOS confuses model
+    let tokens = crate::llm::tokenize(model, &prompt, false);
 
     if tokens.is_empty() {
         return Ok((0.0, 0));
@@ -178,9 +171,7 @@ pub fn score_batch_with_ctx(
          <Document>: "
     );
 
-    let prefix_tokens = model
-        .str_to_token(&prefix, AddBos::Never)
-        .map_err(|e| Error::Other(format!("tokenize prefix: {e}")))?;
+    let prefix_tokens = crate::llm::tokenize(model, &prefix, false);
 
     let prefix_len = prefix_tokens.len();
     if prefix_len == 0 {
@@ -225,9 +216,7 @@ pub fn score_batch_with_ctx(
             };
 
             let suffix = format!("{doc_truncated}{suffix_template}");
-            let suffix_tokens = model
-                .str_to_token(&suffix, AddBos::Never)
-                .map_err(|e| Error::Other(format!("tokenize suffix: {e}")))?;
+            let suffix_tokens = crate::llm::tokenize(model, &suffix, false);
 
             if suffix_tokens.is_empty() {
                 return Ok(0.0);

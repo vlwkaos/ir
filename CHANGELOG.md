@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Changed
+
+- **llama-cpp-2 0.1.160** (was 0.1.145). Its llama-cpp-sys-2 0.1.161 bundles llama.cpp d812350 instead of e21cdc1. It adds the decision-head graph that Laya needs (llama.cpp PR 29818) and the Gated DeltaNet fix for qwen35 models (PR 28068).
+
 ### Security
 
 - **rustix 1.1.6 (RUSTSEC-2026-0486).** Cargo.lock had rustix 1.1.4. Lockfile update only.

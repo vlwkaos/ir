@@ -176,6 +176,16 @@ pub fn model_load_cpu_params() -> LlamaModelParams {
     }
 }
 
+/// Tokens of `text`, with special tokens (`<|im_start|>`, `[MASK]`) parsed as one token each;
+/// `add_bos` adds the model's BOS. (llama-cpp-2 0.1.160 dropped `LlamaModel::str_to_token`.)
+pub fn tokenize(
+    model: &llama_cpp_2::model::LlamaModel,
+    text: &str,
+    add_bos: bool,
+) -> Vec<llama_cpp_2::token::LlamaToken> {
+    model.vocab().tokenize(text.as_bytes(), add_bos, true)
+}
+
 /// Build model-load params with runtime defaults.
 ///
 /// If `IR_GPU_LAYERS=0` (or `IR_FORCE_CPU_BACKEND=1`), pin to CPU backend devices.
