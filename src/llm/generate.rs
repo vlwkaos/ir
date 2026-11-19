@@ -5,9 +5,7 @@
 use crate::error::{Error, Result};
 use crate::llm::LlamaBackend;
 use llama_cpp_2::{
-    context::params::LlamaContextParams,
-    llama_batch::LlamaBatch,
-    model::{AddBos, LlamaModel},
+    context::params::LlamaContextParams, llama_batch::LlamaBatch, model::LlamaModel,
     sampling::LlamaSampler,
 };
 use std::num::NonZeroU32;
@@ -15,7 +13,7 @@ use std::num::NonZeroU32;
 pub struct GenerateParams {
     pub ctx_size: u32,
     pub max_tokens: usize,
-    pub add_bos: AddBos,
+    pub add_bos: bool,
     pub temp: f32,
     pub top_k: i32,
     pub top_p: f32,
@@ -40,9 +38,7 @@ pub fn generate(
         .new_context(backend, ctx_params)
         .map_err(|e| Error::Other(format!("generate context: {e}")))?;
 
-    let prompt_tokens = model
-        .str_to_token(prompt, params.add_bos)
-        .map_err(|e| Error::Other(format!("tokenize: {e}")))?;
+    let prompt_tokens = crate::llm::tokenize(model, prompt, params.add_bos);
     let n_prompt = prompt_tokens.len();
     if n_prompt == 0 {
         return Ok(String::new());
@@ -70,13 +66,11 @@ pub fn generate(
         let token = sampler.sample(&ctx, -1);
         sampler.accept(token);
 
-        if model.is_eog_token(token) {
+        if model.vocab().is_eog(token) {
             break;
         }
 
-        let bytes = model
-            .token_to_piece_bytes(token, 32, true, None)
-            .map_err(|e| Error::Other(format!("token_to_piece_bytes: {e}")))?;
+        let bytes = model.vocab().token_to_piece(token, true, None);
         output.push_str(&String::from_utf8_lossy(&bytes));
 
         let mut next = LlamaBatch::new(1, 1);

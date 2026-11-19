@@ -15,7 +15,7 @@ use crate::llm::generate::{self, GenerateParams};
 use crate::llm::scoring::{self, Scorer};
 use crate::llm::{LlamaBackend, model_load_params, models};
 use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -101,7 +101,7 @@ impl Combined {
             &GenerateParams {
                 ctx_size: EXPAND_CONTEXT_SIZE,
                 max_tokens: MAX_EXPAND_TOKENS,
-                add_bos: AddBos::Never, // ! ChatML prompt; no extra BOS
+                add_bos: false, // ! ChatML prompt; no extra BOS
                 temp: 0.7,
                 top_k: 20,
                 top_p: 0.8,
@@ -152,7 +152,7 @@ impl Scorer for Combined {
     }
 
     /// // ! DSPy-optimized prompt — do not edit manually; re-run research/dspy_optimize.py
-    fn score_batch(&self, query: &str, docs: &[&str]) -> Result<Vec<f64>> {
+    fn score_batch_costed(&self, query: &str, docs: &[&str]) -> Result<scoring::Costed> {
         let mut guard = self.get_or_create_rerank_ctx()?;
         let ctx = guard.as_mut().unwrap();
         scoring::score_batch_with_ctx(
@@ -204,10 +204,7 @@ mod tests {
 
         let q = Combined::load(&path).expect("load 0.8B");
 
-        let tokens = q
-            .model
-            .str_to_token("hello world", AddBos::Never)
-            .expect("tokenize");
+        let tokens = crate::llm::tokenize(&q.model, "hello world", false);
         assert!(!tokens.is_empty(), "tokenization returned empty");
 
         let result = q.expand("hello");
@@ -225,10 +222,7 @@ mod tests {
         assert!(path.exists(), "model not found: {}", path.display());
 
         let q = Combined::load(&path).expect("load 2B");
-        let tokens = q
-            .model
-            .str_to_token("hello world", AddBos::Never)
-            .expect("tokenize");
+        let tokens = crate::llm::tokenize(&q.model, "hello world", false);
         assert!(!tokens.is_empty());
         println!("2B vocab size: {}", q.model.n_vocab());
     }

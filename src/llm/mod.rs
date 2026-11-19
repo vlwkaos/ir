@@ -14,6 +14,7 @@ pub mod download;
 pub mod embedding;
 pub mod expander;
 pub mod generate;
+pub mod listwise;
 pub mod reranker;
 pub mod scoring;
 
@@ -175,6 +176,30 @@ pub fn model_load_cpu_params() -> LlamaModelParams {
     }
 }
 
+/// Tokens of `text`, with special tokens (`<|im_start|>`, `[MASK]`) parsed as one token each;
+/// `add_bos` adds the model's BOS. (llama-cpp-2 0.1.160 dropped `LlamaModel::str_to_token`.)
+pub fn tokenize(
+    model: &llama_cpp_2::model::LlamaModel,
+    text: &str,
+    add_bos: bool,
+) -> Vec<llama_cpp_2::token::LlamaToken> {
+    model.vocab().tokenize(text.as_bytes(), add_bos, true)
+}
+
+/// Text of `tokens`; `special` renders special tokens (`<|im_start|>`) instead of dropping them.
+pub fn detokenize(
+    model: &llama_cpp_2::model::LlamaModel,
+    tokens: &[llama_cpp_2::token::LlamaToken],
+    special: bool,
+) -> String {
+    let vocab = model.vocab();
+    let mut bytes = Vec::new();
+    for &t in tokens {
+        vocab.token_to_piece_into(t, &mut bytes, special, None);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Build model-load params with runtime defaults.
 ///
 /// If `IR_GPU_LAYERS=0` (or `IR_FORCE_CPU_BACKEND=1`), pin to CPU backend devices.
@@ -234,6 +259,8 @@ pub mod env {
     pub const COMBINED_MODEL: &str = "IR_COMBINED_MODEL";
     /// Deprecated alias for IR_COMBINED_MODEL. Still accepted; emits a warning.
     pub const QWEN_MODEL: &str = "IR_QWEN_MODEL";
+    /// Research: listwise tier-2 scorer GGUF (src/llm/listwise.rs).
+    pub const LISTWISE_MODEL: &str = "IR_LISTWISE_MODEL";
 }
 
 /// Env vars that can override the full path for a known model filename.
@@ -313,6 +340,15 @@ fn append_env_dirs(paths: &mut Vec<PathBuf>, key: &str) {
 fn push_unique(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
     if !paths.iter().any(|p| p == &candidate) {
         paths.push(candidate);
+    }
+}
+
+/// The tier-2 scorer: listwise when IR_LISTWISE_MODEL is set (research, src/llm/listwise.rs),
+/// else the pointwise reranker.
+pub fn load_scorer() -> crate::error::Result<Box<dyn scoring::Scorer>> {
+    match listwise::Listwise::from_env()? {
+        Some(l) => Ok(Box::new(l)),
+        None => Ok(Box::new(reranker::Reranker::load_default()?)),
     }
 }
 

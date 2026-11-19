@@ -265,13 +265,8 @@ fn ann_search_ignores_an_index_built_before_vectors_were_dropped() {
     );
 }
 
-/// The daemon caches rerank scores in the collection index. While another
-/// process holds that index's write lock (an `ir update` in progress), a
-/// reranked search must skip the cache write instead of waiting for the lock.
-#[test]
-#[ignore = "embeds and reranks with the real models"]
-fn reranked_search_does_not_wait_for_an_index_update_in_progress() {
-    let env = Env::with_real_models("e2e-daemon-rerank-lock");
+/// Collection `notes`: four short notes on unrelated topics, synced.
+fn add_rerank_notes(env: &Env) {
     let notes = env.add_collection("notes", &[]);
     for (name, body) in [
         (
@@ -294,6 +289,16 @@ fn reranked_search_does_not_wait_for_an_index_update_in_progress() {
         write(&notes, name, &format!("# {name}\n\n{body}\n"));
     }
     env.ok(&["sync", "notes"]);
+}
+
+/// The daemon caches rerank scores in the collection index. While another
+/// process holds that index's write lock (an `ir update` in progress), a
+/// reranked search must skip the cache write instead of waiting for the lock.
+#[test]
+#[ignore = "embeds and reranks with the real models"]
+fn reranked_search_does_not_wait_for_an_index_update_in_progress() {
+    let env = Env::with_real_models("e2e-daemon-rerank-lock");
+    add_rerank_notes(&env);
     // ^ Research switch: no shortcut, so every search reaches the reranker.
     let search = |query: &str| {
         let started = Instant::now();
@@ -355,6 +360,102 @@ fn reranked_search_does_not_wait_for_an_index_update_in_progress() {
         (true, true, true, true, true),
         "unlocked {unlocked_took:?}, locked {locked_took:?}"
     );
+}
+
+/// A dump run (scripts/bench.sh under scripts/kaggle/run.py mode=dump) gives the daemon
+/// and every search the same IR_RERANK_DUMP and searches once tier 2 is ready. A query
+/// the fused strong-signal shortcut answers gets exactly one `fused-strong` gate line,
+/// which beir-eval.py reads as "skipped tier 2". The research overrides make the fused
+/// gate fire and keep the BM25 gate from firing first.
+#[test]
+#[ignore = "embeds with the real models"]
+fn dump_run_records_one_gate_line_for_a_fused_strong_query() {
+    let env = Env::with_real_models("e2e-daemon-dump-gate");
+    add_rerank_notes(&env);
+    let dump = env.path("dump.jsonl");
+    let search = |query: &str| {
+        let output = env
+            .ir()
+            .env("IR_RERANK_DUMP", &dump)
+            .env("IR_BM25_STRONG_FLOOR_OVERRIDE", "2")
+            .env("IR_STRONG_SIGNAL_FLOOR_OVERRIDE", "0")
+            .env("IR_STRONG_SIGNAL_PRODUCT_OVERRIDE", "0")
+            .args(["search", "--json", "--quiet", "-c", "notes", query])
+            .output()
+            .unwrap();
+        let (ok, stdout, stderr) = snapshot(output);
+        assert!(ok, "{stdout}\n{stderr}");
+    };
+    search("warming up");
+    wait_for_daemon(&env, None).expect("search starts the daemon");
+    assert!(eventually(DAEMON_START, || {
+        env.ok(&["daemon", "status"]).contains("tier-2 ready")
+    }));
+    let _ = fs::remove_file(&dump);
+
+    let query = "how do rockets reach space";
+    search(query);
+    let lines: Vec<String> = fs::read_to_string(&dump)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let gates: Vec<&String> = lines
+        .iter()
+        .filter(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["query"] == query && v["gate"] == "fused-strong"
+        })
+        .collect();
+    assert_eq!(gates.len(), 1, "dump:\n{}", lines.join("\n"));
+    assert_eq!(lines.len(), 1, "dump:\n{}", lines.join("\n"));
+}
+
+/// With IR_RERANK_DUMP unset, a repeated query reads its rerank scores from the
+/// cache: the second search scores no document and returns the same order.
+#[test]
+#[ignore = "embeds and reranks with the real models"]
+fn repeated_reranked_search_reads_the_cached_scores() {
+    let env = Env::with_real_models("e2e-daemon-rerank-cache");
+    add_rerank_notes(&env);
+    // ^ Research switch: no shortcut, so every search reaches the reranker.
+    let search = |query: &str| {
+        let output = env
+            .ir()
+            .env("IR_DISABLE_SHORTCUTS", "1")
+            .args(["search", "--json", "-v", "-c", "notes", query])
+            .output()
+            .unwrap();
+        let (ok, stdout, stderr) = snapshot(output);
+        assert!(ok, "{stdout}\n{stderr}");
+        let hits = stderr
+            .lines()
+            .find_map(|l| l.split("rerank_cached").nth(1))
+            .map(|rest| rest.trim().trim_end_matches(" hits").to_string());
+        (
+            support::result_paths(&serde_json::from_str(&stdout).unwrap()),
+            hits,
+            stderr,
+        )
+    };
+    search("warming up");
+    wait_for_daemon(&env, None).expect("search starts the daemon");
+    assert!(eventually(DAEMON_START, || {
+        env.ok(&["daemon", "status"]).contains("tier-2 ready")
+    }));
+
+    let query = "how do rockets reach space";
+    let (first, first_hits, first_log) = search(query);
+    let (second, second_hits, second_log) = search(query);
+    let full = second_hits
+        .as_deref()
+        .and_then(|h| h.split_once('/'))
+        .is_some_and(|(hit, of)| hit == of && hit != "0");
+    assert!(
+        first_log.contains("[timing] rerank ") && first_hits.is_none(),
+        "{first_log}"
+    );
+    assert!(full && first == second, "{second_log}");
 }
 
 /// A daemon that accepts a query and never answers must not hang the search:
@@ -533,4 +634,87 @@ fn code_supported_note_ranks_first_in_hybrid_search() {
         Some("docs/cache.md"),
         "results: {paths:?}\nlog:\n{log}"
     );
+}
+
+/// A pointwise replay of a dumped tier-2 window (research/reranker-eval.md) gives
+/// the scores the daemon gave and the order the search returned.
+#[test]
+#[ignore = "embeds and reranks with the real models"]
+fn rerank_eval_replays_the_window_a_search_reranked() {
+    let env = Env::with_real_models("e2e-daemon-rerank-dump");
+    add_rerank_notes(&env);
+    let dump = env.path("dump.jsonl");
+    // ^ The daemon inherits IR_RERANK_DUMP from the search that starts it.
+    let search = |query: &str| {
+        let output = env
+            .ir()
+            .env("IR_DISABLE_SHORTCUTS", "1")
+            .env("IR_RERANK_DUMP", &dump)
+            .args(["search", "--json", "--quiet", "-c", "notes", query])
+            .output()
+            .unwrap();
+        let (ok, stdout, stderr) = snapshot(output);
+        assert!(ok, "{stdout}\n{stderr}");
+        support::result_paths(&serde_json::from_str(&stdout).unwrap())
+    };
+    search("warming up");
+    wait_for_daemon(&env, None).expect("search starts the daemon");
+    assert!(eventually(DAEMON_START, || {
+        env.ok(&["daemon", "status"]).contains("tier-2 ready")
+    }));
+    let _ = fs::remove_file(&dump);
+
+    let query = "how do rockets reach space";
+    let searched = search(query);
+    let line: serde_json::Value = fs::read_to_string(&dump)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|l| l["gate"] == "t2" && l["query"] == query)
+        .expect("the search dumped its tier-2 window");
+    let input = env.path("in.jsonl");
+    let mut with_id = line.clone();
+    with_id["id"] = "q".into();
+    fs::write(&input, format!("{with_id}\n")).unwrap();
+    let output = env.path("out.jsonl");
+    env.ok(&[
+        "rerank-eval",
+        "--window",
+        "100",
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    let row: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(&output).unwrap().trim()).unwrap();
+
+    let dumped: Vec<f64> = line["window"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["score"].as_f64().unwrap())
+        .collect();
+    let replayed: Vec<f64> = row["scores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_f64().unwrap())
+        .collect();
+    assert_eq!(dumped.len(), replayed.len());
+    assert!(
+        dumped
+            .iter()
+            .zip(&replayed)
+            .all(|(a, b)| (a - b).abs() < 1e-4),
+        "dumped {dumped:?}, replayed {replayed:?}"
+    );
+    let blend: Vec<String> = row["blend"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap().to_string())
+        .collect();
+    assert!(!searched.is_empty());
+    assert_eq!(blend, searched);
 }

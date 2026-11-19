@@ -614,13 +614,10 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
                 eprintln!("  note: reranker disabled via research override");
                 None
             } else {
-                crate::llm::reranker::Reranker::load_default()
+                crate::llm::load_scorer()
                     .map_err(|e| eprintln!("  note: reranker unavailable ({e})"))
                     .ok()
-                    .map(|r| {
-                        eprintln!("  reranker ready ({})", crate::llm::models::RERANKER);
-                        Box::new(r) as ScoBox
-                    })
+                    .inspect(|r| eprintln!("  reranker ready ({})", r.model_id()))
             };
             let allow_expand_without_scorer = config::env_flag("IR_ALLOW_EXPANSION_WITHOUT_SCORER");
             match (&exp, &rer) {
@@ -658,14 +655,22 @@ pub fn start_server(timeout_secs: u64) -> Result<()> {
                 .iter()
                 .any(|k| std::env::var_os(k).is_some());
 
-        if has_combined_env && has_dedicated_env {
+        // ^ A research run that names a listwise scorer must get it, never the combined scorer.
+        let has_listwise_env = std::env::var_os(crate::llm::env::LISTWISE_MODEL).is_some();
+
+        if has_combined_env && has_listwise_env {
+            eprintln!(
+                "  warn: IR_COMBINED_MODEL and IR_LISTWISE_MODEL are both set — \
+                       using dedicated mode with the listwise scorer"
+            );
+        } else if has_combined_env && has_dedicated_env {
             eprintln!(
                 "  warn: IR_COMBINED_MODEL and dedicated model env vars are both set — \
                        using combined mode; unset IR_COMBINED_MODEL to use dedicated models"
             );
         }
 
-        let (expander, scorer): Pair = if has_combined_env {
+        let (expander, scorer): Pair = if has_combined_env && !has_listwise_env {
             match crate::llm::combined::Combined::try_load_default() {
                 Ok(Some(c)) => from_combined(std::sync::Arc::new(c)),
                 Ok(None) => {

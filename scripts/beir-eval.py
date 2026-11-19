@@ -16,6 +16,7 @@ import random
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -159,7 +160,7 @@ def search_one(ir_bin: str, collection: str, mode: str, query: str, limit: int,
                   file=sys.stderr, flush=True)
             return [], elapsed_ms, {"failed": True}
         hits = json.loads(result.stdout) if result.stdout.strip() else []
-        doc_ids = [h["path"].removesuffix(".txt") for h in hits]
+        doc_ids = [_doc_id(h["path"]) for h in hits]
         signals = _parse_signals(result.stderr)
         return doc_ids, elapsed_ms, signals
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
@@ -326,6 +327,17 @@ def _aggregate_mode(mode: str, queries: list, qrels: dict, at_ks: list, records:
         timing["median_ms"] = round(percentile(latencies, 50), 1)
         timing["p95_ms"] = round(percentile(latencies, 95), 1)
 
+    # ^ rerank partials (cmd_rerank) mark the queries that reached tier 2: their own metrics and cost.
+    t2 = [(q["id"], records[q["id"]]) for q in queries
+          if q["id"] in records and records[q["id"]].get("t2") and qrels.get(q["id"])]
+    if t2:
+        k = at_ks[0]
+        metrics[f"ndcg_{k}_t2"] = round(sum(ndcg_at_k(r["ranked"], qrels[i], k) for i, r in t2) / len(t2), 4)
+        metrics[f"recall_{k}_t2"] = round(sum(recall_at_k(r["ranked"], qrels[i], k) for i, r in t2) / len(t2), 4)
+        timing["t2_queries"] = len(t2)
+        timing["t2_mean_ms"] = round(sum(float(r["elapsed_ms"]) for _, r in t2) / len(t2), 1)
+        timing["t2_mean_tokens"] = round(sum(r.get("prompt_tokens", 0) for _, r in t2) / len(t2), 1)
+
     # ^ A failed query counts as an empty ranking and lowers nDCG: report how many.
     return {"mode": mode, "metrics": metrics, "timing": timing, "failed_queries": failed}, n
 
@@ -468,6 +480,107 @@ def cmd_run(args):
         print(f"\nResults written to {args.output}")
     else:
         print(json.dumps(output, indent=2))
+
+
+# ── Subcommand: rerank ──────────────────────────────────────────────────────
+
+def _doc_id(path: str) -> str:
+    return path.removesuffix(".txt")
+
+
+def cmd_rerank(args):
+    """Rank the frozen tier-2 windows of a dump run (IR_RERANK_DUMP, research/reranker-eval.md)
+    with each config through `ir rerank-eval`, and write one partial per variant:
+      <name>.blend   ir's final order (search's blend)     <name>.rerank  rerank score order
+      fused          the window without reranking           oracle<w>      the best order of the
+                                                                           window's first w docs
+    A query a strong-signal shortcut answered (gate line) keeps the dump run's ranking in every
+    variant. It refuses the dump run when a query has no dump line (a fallback answered it: cold
+    daemon, tier-2 timeout, failed query) or when the dump's own scores do not give the dump
+    run's ranking. Then `run` computes the metrics, one result row per variant."""
+    queries, qrels = _scored_queries(Path(args.data))
+    if args.shard:
+        queries = _shard_queries(queries, args.shard)
+    base = _load_progress(Path(args.base))
+    missing = [q["id"] for q in queries if q["id"] not in base]
+    if missing:
+        sys.exit(f"rerank: {len(missing)} queries have no record in {args.base} (first: {missing[0]})")
+    dump, gated = {}, set()
+    with open(args.dump) as f:
+        for line in f:
+            if line.strip():
+                rec = json.loads(line)
+                if rec.get("gate", "t2") == "t2":
+                    dump[rec["query"]] = rec
+                else:
+                    gated.add(rec["query"])
+    t2 = [q for q in queries if q["text"] in dump]
+    refused = [q["id"] for q in queries if q["text"] not in dump and q["text"] not in gated]
+    if refused:
+        sys.exit(f"rerank: {len(refused)} of {len(queries)} queries have no dump line, so a fallback "
+                 f"answered them, or a daemon started without this IR_RERANK_DUMP did (`ir daemon stop`) "
+                 f"(first: {', '.join(refused[:5])})")
+    configs = json.loads(args.configs)
+    # ^ Every row exists even in a shard where no query reached tier 2: the merge needs each shard.
+    variants: dict = {n: {} for c in configs for n in (f"{c['name']}.blend", f"{c['name']}.rerank",
+                                                         f"oracle{int(c['window'])}")}
+    variants["fused"] = {}
+
+    def put(name, q, ranked, ms=0.0, tokens=0):
+        variants.setdefault(name, {})[q["id"]] = {
+            "query_id": q["id"], "ranked": ranked, "elapsed_ms": round(ms, 1),
+            "prompt_tokens": tokens, "t2": True}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        inp = Path(tmp) / "in.jsonl"
+        inp.write_text("".join(json.dumps({**dump[q["text"]], "id": q["id"]}) + "\n" for q in t2))
+
+        def rerank_eval(name, w, from_dump, env):
+            outp = Path(tmp) / f"{name}.jsonl"
+            cmd = [args.ir_bin, "rerank-eval", "--input", str(inp), "--output", str(outp),
+                   "--window", str(w)] + (["--from-dump"] if from_dump else [])
+            subprocess.run(cmd, env={**os.environ, **env}, check=True)
+            return {r["id"]: r for r in map(json.loads, outp.read_text().splitlines())}
+
+        # ^ The dump's own scores over the whole window must give the dump run's ranking; a
+        #   client that fell back after the daemon reranked (reply timeout) fails here.
+        check = rerank_eval("check", max((len(d["window"]) for d in dump.values()), default=1), True, {})
+        mismatches = [q["id"] for q in t2
+                      if [_doc_id(p) for p in check[q["id"]]["blend"]] != base[q["id"]]["ranked"]]
+        if mismatches:
+            sys.exit(f"rerank: replay of the dump's own scores differs from the dump run's ranking "
+                     f"on {len(mismatches)} of {len(t2)} queries (first: {', '.join(mismatches[:5])})")
+        ids = lambda docs: [_doc_id(x["path"]) for x in docs]
+        for q in t2:
+            d = dump[q["text"]]
+            put("fused", q, ids(d["window"] + d["rest"])[:d["limit"]])
+        for c in configs:
+            name, w = c["name"], int(c["window"])
+            print(f"==> {name}: {len(t2)} of {len(queries)} queries reached tier 2, window {w}", flush=True)
+            rows = rerank_eval(name, w, c.get("from_dump"), c.get("env", {}))
+            for q in t2:
+                r, d = rows[q["id"]], dump[q["text"]]
+                win = ids(d["window"][:r["window"]])
+                tail = ids(d["window"][r["window"]:] + d["rest"])
+                put(f"{name}.blend", q, [_doc_id(p) for p in r["blend"]], r["ms"], r["tokens"])
+                key = [-(s if s is not None else -math.inf) for s in r["scores"]]
+                put(f"{name}.rerank", q, ([win[i] for i in sorted(range(len(win)), key=key.__getitem__)]
+                                          + tail)[:d["limit"]], r["ms"], r["tokens"])
+                rel = qrels.get(q["id"], {})
+                put(f"oracle{w}", q, (sorted(win, key=lambda i: -rel.get(i, 0)) + tail)[:d["limit"]])
+
+    out_dir = _progress_dir(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, recs in sorted(variants.items()):
+        with (out_dir / f"{name}.jsonl").open("w") as f:
+            for q in queries:
+                rec = recs.get(q["id"]) or {**base[q["id"]], "elapsed_ms": 0.0, "prompt_tokens": 0, "t2": False}
+                f.write(json.dumps(rec) + "\n")
+    # ^ Every mode in the partial dir: also the dump run's own hybrid row next to the variants.
+    cmd_run(argparse.Namespace(
+        data=args.data, collection=args.collection, ir_bin=args.ir_bin,
+        mode=",".join(sorted(p.stem for p in out_dir.glob("*.jsonl"))),
+        at_k=args.at_k, max_queries=None, shard=args.shard, output=args.output, signals=False))
 
 
 # ── Subcommand: merge ───────────────────────────────────────────────────────
@@ -693,6 +806,17 @@ def main():
     merge_p.add_argument("partials", nargs="+", metavar="PARTIAL_DIR",
                          help="Shard partial dirs (<shard output>.partial)")
 
+    # rerank
+    rr = sub.add_parser("rerank", help="Rank dumped tier-2 windows (IR_RERANK_DUMP) per reranker config")
+    add_common(rr)
+    rr.add_argument("--dump", required=True, help="IR_RERANK_DUMP file of the dump run")
+    rr.add_argument("--base", required=True, help="The dump run's hybrid partial (<output>.partial/hybrid.jsonl)")
+    rr.add_argument("--configs", required=True,
+                    help='JSON list of {"name", "window", "from_dump"?, "env"?} (scripts/rerank-configs.json)')
+    rr.add_argument("--at-k", default="10,20,100", help="Comma-separated k values (default: 10,20,100)")
+    rr.add_argument("--shard", type=_parse_shard, metavar="i/N", help="Only shard i of N, as run --shard")
+    rr.add_argument("--output", "-o", required=True, help="Result JSON; partials go to <output>.partial/")
+
     # sample
     samp = sub.add_parser("sample", help="Sample a large corpus to a target size")
     samp.add_argument("--data", required=True, help="Source BEIR dataset directory")
@@ -710,6 +834,8 @@ def main():
         cmd_run(args)
     elif args.cmd == "merge":
         cmd_merge(args)
+    elif args.cmd == "rerank":
+        cmd_rerank(args)
     elif args.cmd == "sample":
         cmd_sample(args)
 
